@@ -2,15 +2,6 @@ from beanie import Document
 from beanie.odm.fields import Link
 from datetime import datetime
 from pymongo import IndexModel
-
-class Base(Document):
-  name: str
-  
-  class Settings:
-    name = "base"
-    indexes = [
-      IndexModel(["name"], unique=True),
-    ]
   
 class Role(Document):
   name: str
