@@ -7,7 +7,7 @@ from fastapi.security import OAuth2PasswordBearer
 
 from src.configs.configs import settings
 from src.modules.auth.model import User
-from src.utils.helpers import mongo_date_to_utc, utc_now, import_user_from_springboard
+from src.utils.helpers import utc_now, import_user_from_springboard
 from src.modules.auth import crud as user_crud
 from src.core.exception import CustomException, ErrorDesc
 from src.configs.consts import preset_permissions

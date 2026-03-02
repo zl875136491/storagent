@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from src.modules.auth import service as auth_service
 from src.modules.auth import schema as auth_schema
-from src.core.auth import get_current_user
+from src.core.auth import get_current_user, oauth2_scheme
 from src.modules.auth.model import User
 
 router = APIRouter()
@@ -30,12 +30,13 @@ async def get_user_profile(
   """
   return await auth_service.get_user_profile(user)
 
-# @router.get(
-#   path="/logout",
-#   summary="用户登出")
-# async def logout(
-#   user: User = Depends(get_current_user)) -> dict:
-#   """
-#   用户登出
-#   """
-#   return await auth_service.logout_user(user)
+@router.get(
+  path="/logout",
+  summary="用户登出")
+async def logout(
+  user: User = Depends(get_current_user),
+  token: str = Depends(oauth2_scheme)) -> dict:
+  """
+  用户登出
+  """
+  return await auth_service.logout_user(token)

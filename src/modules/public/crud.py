@@ -4,7 +4,7 @@ from src.modules.auth.model import User
 from typing import List, Type
 from src.core.exception import CustomException, ErrorDesc
 from beanie import Document
-from beanie.operators import Set
+from beanie.operators import Set, In
 
 async def get_document_fields(model: Type[Document]) -> list[str]:
   """
@@ -122,6 +122,12 @@ async def read_region_by_nickname(nickname: str) -> Region | None:
   """
   return await Region.find_one(Region.nickname == nickname)
 
+async def read_many_region_by_ids(region_ids: List[str | ObjectId]) -> List[Region]:
+  """
+  获取多个区域
+  """
+  return await Region.find(In(Region.id, region_ids)).to_list()
+
 async def delete_region_by_id(region_id: str | ObjectId) -> bool:
   """
   删除区域
@@ -150,6 +156,7 @@ async def read_application_by_name(name: str) -> Application | None:
 async def create_application(
   name: str,
   description: str,
+  regions: List[Region],
   author: User) -> Application:
   """
   创建应用
@@ -168,6 +175,7 @@ async def create_application(
   application = Application(
     name=name,
     description=description,
+    regions=regions,
     author=author
   )
   await application.save()

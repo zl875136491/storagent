@@ -4,6 +4,7 @@ from bson import ObjectId
 from pydantic_core import CoreSchema, core_schema
 from pydantic import GetCoreSchemaHandler, BaseModel, Field
 from src.core.exception import CustomException, ErrorDesc
+from datetime import datetime
 
 class PydanticObjectId(ObjectId):
   """
@@ -59,3 +60,27 @@ class RegionResponse(BaseModel):
 
 class RegionListResponse(BaseModel):
   data: List[RegionResponse]
+
+class ApplicationCreateRequest(BaseModel):
+  name: str
+  description: str
+  regions: List[PydanticObjectId]
+
+class SimpleUserResponse(BaseModel):
+  id: PydanticObjectId
+  username: str
+  name: str
+
+class ApplicationResponse(BaseModel):
+  id: PydanticObjectId
+  name: str
+  created_at: datetime
+  updated_at: datetime
+  description: str
+  enabled: bool
+  enabled_at: datetime | None
+  author: SimpleUserResponse
+  regions: List[RegionResponse]
+
+class ApplicationListResponse(BaseModel):
+  data: List[ApplicationResponse]

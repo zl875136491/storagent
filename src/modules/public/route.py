@@ -1,4 +1,6 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from src.core.auth import get_current_user
+from src.modules.auth.model import User
 from src.modules.public import service as public_service
 from src.modules.public import schema as public_schema
 
@@ -35,3 +37,36 @@ async def get_region_list() -> public_schema.RegionListResponse:
     RegionListResponse: 区域列表
   """
   return await public_service.get_region_list()
+
+@router.post(
+  path="/application",
+  response_model=public_schema.ApplicationResponse,
+  summary="创建应用")
+async def create_application(
+  payload: public_schema.ApplicationCreateRequest,
+  current_user: User = Depends(get_current_user)) -> public_schema.ApplicationResponse:
+  """
+  创建应用
+  """
+  name = payload.name.strip()
+  description = payload.description.strip()
+  regions = payload.regions
+  return await public_service.create_application(
+    name=name,
+    description=description,
+    regions=regions,
+    current_user=current_user
+  )
+
+@router.get(
+  path="/application",
+  response_model=public_schema.ApplicationListResponse,
+  summary="获取应用列表")
+async def get_application_list() -> public_schema.ApplicationListResponse:
+  """
+  获取应用列表
+
+  Returns:
+    ApplicationListResponse: 应用列表
+  """
+  return await public_service.get_application_list()

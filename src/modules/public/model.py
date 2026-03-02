@@ -5,6 +5,8 @@ from pymongo import IndexModel
 from pydantic import Field
 from src.utils.helpers import utc_now
 from src.modules.auth.model import User
+from typing import List
+
 class Region(Document):
   name: str
   nickname: str
@@ -20,9 +22,10 @@ class Application(Document):
   name: str
   description: str = Field(default="")
   enabled: bool = Field(default=False)
-  created_at: datetime = Field(default=utc_now)
-  updated_at: datetime = Field(default=utc_now)
-  enabled_at: datetime = Field(default=None)
+  created_at: datetime = Field(default_factory=utc_now)
+  updated_at: datetime = Field(default_factory=utc_now)
+  enabled_at: datetime | None = Field(default=None)
+  regions: List[Link[Region]] = Field(default=[])
   author: Link[User]
   
   class Settings:
