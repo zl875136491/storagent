@@ -43,6 +43,9 @@ class ErrorDesc(Enum):
   RES_NOT_BELONG_TO_USER = ("该资源不属于当前用户", 400015)
   DB_CONN_FAILED = ("数据库连接失败", 500016)
   DB_ERROR = ("数据库错误", 500017)
+  # minio
+  MINIO_CONN_FAILED = ("Minio 连接失败", 400018)
+  MINIO_ACCESS_FAILED = ("Minio 访问失败", 400019)
   
   # special resource
   STATUS_ERR = ("状态错误", 400020)
@@ -51,8 +54,11 @@ class ErrorDesc(Enum):
   OPERATION_NOT_ALLOWED = ("操作不允许", 400024)
   FIELD_NOT_FOUND = ("字段不存在", 400025)
   SEND_CODE_FAILED = ("发送登录代码失败", 400026)
+  
   # file
   INTERNAL_SERVER_ERROR = ("服务器内部错误", 500001)
+  
+
   
   @property
   def code(self) -> int:

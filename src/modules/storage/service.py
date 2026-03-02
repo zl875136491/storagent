@@ -6,6 +6,7 @@ from src.core.exception import CustomException, ErrorDesc
 from src.modules.public import crud as public_crud
 from src.modules.storage import crud as storage_crud
 from src.modules.storage.model import MinioServer
+from src.core.minio_op import connect_minio_server
 
 async def _connect_minio_server(
   host: str,
@@ -21,6 +22,7 @@ async def _connect_minio_server(
     access_key: 访问密钥
     secret_key: 密钥
   """
+  connect_minio_server(host, port, access_key, secret_key)
   return None
 
 async def create_minio_server(
