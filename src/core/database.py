@@ -9,11 +9,22 @@ _motor_client: Optional[AsyncIOMotorClient] = None
 
 # Models from each module
 from ..modules.auth.model import (
-  Base,
-  Role,
   User,
+  Role,
   TempCode,
   DestoryedToken,
+)
+
+from ..modules.public.model import (
+  Region,
+  APIKey,
+  Application,
+)
+
+from ..modules.storage.model import (
+  MinioEvent,
+  MinioServer,
+  MinioBucket,
 )
 
 async def init_db():
@@ -35,11 +46,16 @@ async def init_db():
   # 3. 初始化 Beanie
   # document_models 参数需要传入所有 Beanie Document 类的列表
   document_models = [
-    Base,
-    Role,
+    Region,
+    APIKey,
+    Application,
     User,
+    Role,
     TempCode,
     DestoryedToken,
+    MinioEvent,
+    MinioServer,
+    MinioBucket,
   ]
   await init_beanie(
     database=database,

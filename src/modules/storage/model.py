@@ -10,11 +10,11 @@ class MinioServer(Document):
   Minio 服务器
   """
   region: Link[Region]
-  name: str = Field(..., default="")
+  name: str = Field(default="")
   host: str
   port: int
-  access_key: str = Field(..., default="")
-  secret_key: str = Field(..., default="")
+  access_key: str = Field(default="")
+  secret_key: str = Field(default="")
   
   class Settings:
     name = "minio_server"
@@ -29,7 +29,7 @@ class MinioBucket(Document):
   """
   region: Link[Region]
   server: Link[MinioServer]
-  name: str = Field(..., default="")
+  name: str = Field(default="")
   
   class Settings:
     name = "minio_bucket"

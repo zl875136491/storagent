@@ -42,6 +42,7 @@ class ErrorDesc(Enum):
   RES_DATA_NOT_CHANGED = ("资源数据未改变", 400014)
   RES_NOT_BELONG_TO_USER = ("该资源不属于当前用户", 400015)
   DB_CONN_FAILED = ("数据库连接失败", 500016)
+  DB_ERROR = ("数据库错误", 500017)
   
   # special resource
   STATUS_ERR = ("状态错误", 400020)
