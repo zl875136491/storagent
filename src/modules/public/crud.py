@@ -1,9 +1,72 @@
 from bson import ObjectId
-from src.modules.public.model import Region
-from typing import List
+from src.modules.public.model import Region, Application
+from src.modules.auth.model import User
+from typing import List, Type
 from src.core.exception import CustomException, ErrorDesc
+from beanie import Document
+from beanie.operators import Set
 
-async def create_region(name: str) -> Region:
+async def get_document_fields(model: Type[Document]) -> list[str]:
+  """
+  获取文档的字段
+  
+  Args:
+    model: 文档类型
+
+  Returns:
+    list[str]: 文档的字段
+  """
+  fields = list[str](model.model_fields.keys())
+  if "id" in fields:
+    fields.remove("id")
+  if "created_at" in fields:
+    fields.remove("created_at")
+  if "updated_at" in fields:
+    fields.remove("updated_at")
+  return fields
+
+# async def name_exist_doc(obj: Document, doc: Type[Document], name: str) -> bool:
+#   """
+#   检查名称除当前对象外是否存在
+#   """
+#   return await doc.find_one(doc.name == name, doc.id != obj.id)
+
+async def update_document(
+  obj: Document,
+  doc: Type[Document],
+  alterations: dict = {}) -> Document:
+  """
+  更新文档
+  
+  Args:
+    obj: 文档对象
+    doc: 文档类型
+    alterations: 修改的字段
+
+  Returns:
+    Document: 文档对象
+  """
+  null_keys = []
+  doc_fields = await get_document_fields(doc)
+  for key, value in alterations.items():
+    if key not in doc_fields:
+      raise CustomException(ErrorDesc.INVALID_PARAMS, f"字段 {key} 不存在")
+    if value is None:
+      null_keys.append(key)
+  for key in null_keys:
+    alterations.pop(key)
+  # if "name" in alterations:
+  #   if await name_exist_doc(obj, doc, alterations["name"]):
+  #     raise CustomException(ErrorDesc.NAME_EXISTED, "名称已存在")
+  try:
+    await obj.update(Set(alterations))
+  except Exception as e:
+    raise CustomException(ErrorDesc.DB_UPDATE_FAILED, str(e))
+  return obj
+
+async def create_region(
+  name: str,
+  nickname: str) -> Region:
   """
   创建区域
 
@@ -13,10 +76,13 @@ async def create_region(name: str) -> Region:
   Returns:
     Region: 区域
   """
-  exist_name = await read_region_by_name(name)
-  if exist_name:
-    raise CustomException(ErrorDesc.NAME_EXISTED)
-  region = Region(name=name)
+  existed_name = await read_region_by_name(name)
+  if existed_name:
+    raise CustomException(ErrorDesc.NAME_EXISTED, "Region.name")
+  existed_nickname = await read_region_by_nickname(nickname)
+  if existed_nickname:
+    raise CustomException(ErrorDesc.NAME_EXISTED, "Region.nickname")
+  region = Region(name=name, nickname=nickname)
   await region.save()
   return region
 
@@ -47,6 +113,15 @@ async def read_region_by_name(name: str) -> Region | None:
   """
   return await Region.find_one(Region.name == name)
 
+async def read_region_by_nickname(nickname: str) -> Region | None:
+  """
+  获取区域
+
+  Returns:
+    Region | None: 区域
+  """
+  return await Region.find_one(Region.nickname == nickname)
+
 async def delete_region_by_id(region_id: str | ObjectId) -> bool:
   """
   删除区域
@@ -62,3 +137,56 @@ async def delete_region_by_id(region_id: str | ObjectId) -> bool:
     return False
   await region_obj.delete()
   return True
+
+async def read_application_by_name(name: str) -> Application | None:
+  """
+  获取应用
+
+  Returns:
+    Application | None: 应用
+  """
+  return await Application.find_one(Application.name == name)
+
+async def create_application(
+  name: str,
+  description: str,
+  author: User) -> Application:
+  """
+  创建应用
+
+  Args:
+    name: 应用名称
+    description: 应用描述
+    author: 作者
+
+  Returns:
+    Application: 应用
+  """
+  existed_name = await read_application_by_name(name)
+  if existed_name:
+    raise CustomException(ErrorDesc.NAME_EXISTED, "Application.name")
+  application = Application(
+    name=name,
+    description=description,
+    author=author
+  )
+  await application.save()
+  return application
+
+async def read_application_list() -> List[Application]:
+  """
+  获取应用列表
+
+  Returns:
+    List[Application]: 应用列表
+  """
+  return await Application.find_all(fetch_links=True).to_list()
+
+async def read_application_by_id(application_id: str | ObjectId) -> Application | None:
+  """
+  获取应用
+
+  Returns:
+    Application | None: 应用
+  """
+  return await Application.find_one(Application.id == application_id, fetch_links=True)

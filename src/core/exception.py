@@ -43,6 +43,8 @@ class ErrorDesc(Enum):
   RES_NOT_BELONG_TO_USER = ("该资源不属于当前用户", 400015)
   DB_CONN_FAILED = ("数据库连接失败", 500016)
   DB_ERROR = ("数据库错误", 500017)
+  DB_UPDATE_FAILED = ("数据库更新失败", 500018)
+  
   # minio
   MINIO_CONN_FAILED = ("Minio 连接失败", 400018)
   MINIO_ACCESS_FAILED = ("Minio 访问失败", 400019)

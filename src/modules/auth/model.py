@@ -2,9 +2,14 @@ from beanie import Document
 from beanie.odm.fields import Link
 from datetime import datetime
 from pymongo import IndexModel
+from typing import List
+from pydantic import Field
+from src.utils.helpers import utc_now
   
 class Role(Document):
   name: str
+  is_admin: bool = False
+  permissions: List[str] = Field(default=[])
   
   class Settings:
     name = "role"
@@ -13,16 +18,22 @@ class Role(Document):
     ]
   
 class User(Document):
-  itcode: str
+  username: str
+  name: str
+  hashed_password: str
+  roles: List[Link[Role]] = Field(default=[])
+  permissions: List[str] = Field(default=[])
+  created_at: datetime = Field(default_factory=utc_now)
+  updated_at: datetime = Field(default_factory=utc_now)
   
   class Settings:
     name = "user"
     indexes = [
-      IndexModel(["itcode"], unique=True),
+      IndexModel(["username"], unique=True),
     ]
   
 class TempCode(Document):
-  user: Link[User]
+  username: str
   code: str
   expired_at: datetime
   

@@ -2,7 +2,7 @@ from beanie import Document
 from beanie.odm.fields import Link
 from pydantic import Field
 from pymongo import IndexModel
-from src.modules.public.model import Region
+from src.modules.public.model import Region, Application
 from datetime import datetime
 
 class MinioServer(Document):
@@ -28,6 +28,7 @@ class MinioBucket(Document):
   Minio 存储桶
   """
   region: Link[Region]
+  app: Link[Application]
   server: Link[MinioServer]
   name: str = Field(default="")
   
@@ -36,7 +37,8 @@ class MinioBucket(Document):
     indexes = [
       IndexModel(["region", "name"], unique=True),
       IndexModel(["name"]),
-      IndexModel(["server"])
+      IndexModel(["server"]),
+      IndexModel(["app"]),
     ]
 
 class MinioEvent(Document):

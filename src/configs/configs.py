@@ -51,6 +51,9 @@ class Settings(BaseSettings):
   ALGORITHM: str = "HS256"
   ACCESS_TOKEN_EXPIRE_MINUTES: int = 15  # 15 minutes
   REFRESH_TOKEN_EXPIRE_DAYS: int = 30  # 30 days
+  
+  # 从已有系统中获取注册用户
+  USER_INFO_URL: str = "http://1.1.1.1:3000/api/v1/"
 
   @property
   def mongo_db_url(self) -> str:

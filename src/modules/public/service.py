@@ -5,7 +5,9 @@ from typing import List
 from src.modules.public.model import Region
 from src.modules.public import crud as public_crud
 
-async def create_region(name: str) -> Region:
+async def create_region(
+  name: str,
+  nickname: str) -> Region:
   """
   创建区域
 
@@ -15,7 +17,7 @@ async def create_region(name: str) -> Region:
   Returns:
     Region: 区域
   """
-  return await public_crud.create_region(name)
+  return await public_crud.create_region(name, nickname)
 
 async def get_region_list() -> dict[str, List[Region]]:
   """

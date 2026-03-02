@@ -50,10 +50,12 @@ class PydanticObjectId(ObjectId):
 
 class RegionCreateRequest(BaseModel):
   name: str
+  nickname: str
 
 class RegionResponse(BaseModel):
   id: PydanticObjectId
   name: str
+  nickname: str
 
 class RegionListResponse(BaseModel):
   data: List[RegionResponse]

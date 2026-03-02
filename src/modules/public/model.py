@@ -2,21 +2,28 @@ from beanie import Document
 from beanie.odm.fields import Link
 from datetime import datetime
 from pymongo import IndexModel
-
+from pydantic import Field
+from src.utils.helpers import utc_now
+from src.modules.auth.model import User
 class Region(Document):
   name: str
+  nickname: str
   
   class Settings:
     name = "region"
     indexes = [
       IndexModel(["name"], unique=True),
+      IndexModel(["nickname"], unique=True),
     ]
 
 class Application(Document):
   name: str
-  description: str
-  created_at: datetime
-  updated_at: datetime
+  description: str = Field(default="")
+  enabled: bool = Field(default=False)
+  created_at: datetime = Field(default=utc_now)
+  updated_at: datetime = Field(default=utc_now)
+  enabled_at: datetime = Field(default=None)
+  author: Link[User]
   
   class Settings:
     name = "application"

@@ -20,7 +20,8 @@ async def create_region(
     RegionResponse: 区域
   """
   name = payload.name.strip()
-  return await public_service.create_region(name)
+  nickname = payload.nickname.strip()
+  return await public_service.create_region(name, nickname)
 
 @router.get(
   path="/region",
