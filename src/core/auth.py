@@ -118,11 +118,12 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
     if user_info is None:
       raise CustomException(ErrorDesc.LOGIN_ERR, "用户不存在")
     hashed_password = get_password_hash(password)
+    basic_role = await user_crud.get_basic_role()
     user = await user_crud.create_user(
       username=username,
       name=user_info["user_info"]["l"],
       hashed_password=hashed_password,
-      roles=[]
+      roles=[basic_role]
     )
   if not verify_password(password, user.hashed_password):
     raise CustomException(ErrorDesc.LOGIN_ERR, "密码错误")

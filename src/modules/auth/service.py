@@ -57,6 +57,7 @@ async def get_user_profile(user: User) -> dict:
     username=user.username,
     name=user.name,
     roles=user_roles,
+    is_admin=is_admin,
     created_at=convert_utc_to_local_str(user.created_at),
     updated_at=convert_utc_to_local_str(user.updated_at),
     system_time=convert_utc_to_local_str(local_utc_now())

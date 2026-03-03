@@ -1,6 +1,7 @@
 from src.modules.auth.model import User, Role, DestoryedToken
 from typing import List
-from src.utils.helpers import utc_now
+from src.utils.helpers import utc_now, get_full_permissions
+from src.core.exception import CustomException, ErrorDesc
 
 async def read_user_by_username(username: str) -> User:
   """
@@ -31,14 +32,18 @@ async def create_user(
   Returns:
     User: 用户
   """
+  permissions = await get_all_permissions(roles)
   user = User(
     username=username,
     name=name,
     hashed_password=hashed_password,
     roles=roles,
-    permissions=[]
+    permissions=permissions
   )
-  await user.save()
+  try:
+    await user.save()
+  except Exception as e:
+    raise CustomException(ErrorDesc.CREATE_USER_FAILED, "创建用户失败")
   return user
 
 async def check_token_valid(token: str) -> bool:
@@ -50,14 +55,57 @@ async def check_token_valid(token: str) -> bool:
     return False
   return True
 
+async def create_role(name: str, is_admin: bool, permissions: List[str]) -> Role:
+  """
+  创建角色
+  
+  Args:
+    name: 角色名称
+    is_admin: 是否为管理员
+    permissions: 权限
+
+  Returns:
+    Role: 角色
+  """
+  role = Role(
+    name=name,
+    is_admin=is_admin,
+    permissions=permissions
+  )
+  await role.save()
+  return role
+
 async def get_admin_role() -> Role:
   """
   获取管理员角色
   """
   return await Role.find_one(Role.is_admin == True)
 
+async def get_basic_role() -> Role:
+  """
+  获取基础用户角色
+  """
+  return await Role.find_one(Role.is_admin == False)
+
 async def destroy_token(token: str) -> None:
   """
   销毁 token
   """
   await DestoryedToken(token=token, expired_at=utc_now()).save()
+
+async def get_all_permissions(roles: List[Role]) -> List[str]:
+  """
+  获取所有角色权限
+  
+  Args:
+    roles: 角色列表
+
+  Returns:
+    List[str]: 权限列表
+  """
+  permissions = []
+  for role in roles:
+    full_permissions = get_full_permissions(role.permissions)
+    permissions.extend(full_permissions)
+  permissions = list(set(permissions))
+  return permissions

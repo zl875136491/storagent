@@ -57,3 +57,31 @@ def convert_utc_to_local_str(dt: datetime) -> str:
   local_dt = utc_dt.astimezone(LOCAL_TIMEZONE)
 
   return local_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+def get_full_permissions(selected_permissions: list) -> list:
+  """
+  获取所有选中的权限及其子权限（包含去重处理）
+  """
+  from src.configs.consts import preset_permissions
+  full_set = set[str]()
+
+  def discover(perm_key):
+    if perm_key not in preset_permissions:
+      return
+    
+    # 如果已经处理过该权限，跳过以防止循环引用（虽然在权限树中较少见）
+    if perm_key in full_set:
+      return
+        
+    full_set.add(perm_key)
+    
+    # 递归获取子权限
+    children = preset_permissions[perm_key].get("children", [])
+    for child in children:
+      discover(child)
+
+  # 遍历输入的初始权限列表
+  for pmt in selected_permissions:
+    discover(pmt)
+      
+  return list[str](full_set)
