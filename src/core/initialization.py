@@ -13,4 +13,9 @@ async def init_project():
     await user_crud.create_role(name="用户", is_admin=False, permissions=basic_permissions)
   if not admin_role:
     await user_crud.create_role(name="管理员", is_admin=True, permissions=admin_permissions)
-  
+
+async def init_service():
+  """
+  初始化服务
+  """
+  # TODO: 检查 mc 命令是否可用

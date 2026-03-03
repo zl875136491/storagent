@@ -15,11 +15,12 @@ class MinioServer(Document):
   port: int
   access_key: str = Field(default="")
   secret_key: str = Field(default="")
+  master: bool = Field(default=False)
   
   class Settings:
     name = "minio_server"
     indexes = [
-      IndexModel(["region"]),
+      IndexModel(["region"], unique=True),
       IndexModel(["host", "port"], unique=True),
     ]
 

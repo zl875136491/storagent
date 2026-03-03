@@ -16,6 +16,20 @@ from src.configs.consts import preset_permissions
 # OAuth2 密码流（用于从请求中提取 token）
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
+def password_check(password: str) -> bool:
+  """
+  检查密码是否符合要求
+  """
+  if len(password) < 8:
+    return False
+  # 没有数字
+  if not any(char.isdigit() for char in password):
+    return False
+  # 没有字母
+  if not any(char.isalpha() for char in password):
+    return False
+  return True
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
   """
   验证密码是否匹配
@@ -117,6 +131,8 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
     user_info = await import_user_from_springboard(username)
     if user_info is None:
       raise CustomException(ErrorDesc.LOGIN_ERR, "用户不存在")
+    if not password_check(password):
+      raise CustomException(ErrorDesc.PASSWORD_UNSET, "密码不符合要求(至少8位，包含数字和字母)")
     hashed_password = get_password_hash(password)
     basic_role = await user_crud.get_basic_role()
     user = await user_crud.create_user(

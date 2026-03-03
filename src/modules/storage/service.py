@@ -6,7 +6,7 @@ from src.core.exception import CustomException, ErrorDesc
 from src.modules.public import crud as public_crud
 from src.modules.storage import crud as storage_crud
 from src.modules.storage.model import MinioServer
-from src.core.minio_op import test_minio_server
+from src.core.minio_op import test_minio_server, set_site_alias, add_new_site, remove_site_alias
 
 async def _connect_minio_server(
   host: str,
@@ -46,11 +46,42 @@ async def create_minio_server(
   Returns:
     MinioServer: Minio 服务器
   """
-  await _connect_minio_server(host, port, access_key, secret_key)
+  # 验证区域
   region_obj = await public_crud.read_region_by_id(region)
   if not region_obj:
     raise CustomException(ErrorDesc.RES_NOT_FOUND)
-  return await storage_crud.create_minio_server(
+  exister_minio_region = await storage_crud.read_minio_server_by_region(region_obj)
+  if exister_minio_region:
+    raise CustomException(ErrorDesc.RES_ALREADY_EXISTS, "MinioServer.region")
+  # 验证是否存在
+  existed_minio_server = await storage_crud.read_minio_server_by_fqdn(host, port)
+  if existed_minio_server:
+    raise CustomException(ErrorDesc.RES_ALREADY_EXISTS, "MinioServer.host:port")
+  # 验证连接性
+  await _connect_minio_server(host, port, access_key, secret_key)
+  # 创建别名
+  success, res = await set_site_alias(
+    site_name=region_obj.nickname,
+    endpoint=f"{host}:{port}",
+    admin_user=access_key,
+    admin_password=secret_key
+  )
+  if not success:
+    raise CustomException(ErrorDesc.MINIO_ALIAS_FAILED, res)
+  master_minio_server_obj = await storage_crud.read_master_minio_server()
+  if master_minio_server_obj:
+    master_region_obj: Region = master_minio_server_obj.region
+    # 已有主节点, 需要执行加入复制集的操作
+    set_success, set_res = await add_new_site(
+      master_name=master_region_obj.nickname,
+      site_name=region_obj.nickname
+    )
+    if not set_success:
+      # 加入复制集失败, 需要删除别名
+      remove_success, _ = await remove_site_alias(region_obj.nickname)
+      raise CustomException(ErrorDesc.MINIO_REPLICATE_FAILED, set_res)
+  # 创建 Minio 服务器数据
+  minio_server_obj = await storage_crud.create_minio_server(
     region=region_obj,
     name=name,
     host=host,
@@ -58,6 +89,7 @@ async def create_minio_server(
     access_key=access_key,
     secret_key=secret_key
   )
+  return minio_server_obj
 
 async def get_minio_server_list() -> dict[str, List[MinioServer]]:
   """

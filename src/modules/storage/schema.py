@@ -20,6 +20,7 @@ class MinioServerResponse(BaseModel):
   name: str
   host: str
   port: int
+  master: bool
   access_key: str
   secret_key: str
 
