@@ -1,12 +1,20 @@
 from bson import ObjectId
-from typing import List
+from typing import Any, List
 
 from src.modules.public.model import Region
 from src.core.exception import CustomException, ErrorDesc
 from src.modules.public import crud as public_crud
 from src.modules.storage import crud as storage_crud
 from src.modules.storage.model import MinioServer
-from src.core.minio_op import test_minio_server, set_site_alias, add_new_site, remove_site_alias
+from src.core.minio_op import (
+  test_minio_server,
+  set_site_alias,
+  add_new_site,
+  remove_site_alias,
+  get_buckets_info,
+  get_buckets_info_sdk,
+  get_minio_client
+)
 
 async def _connect_minio_server(
   host: str,
@@ -100,3 +108,19 @@ async def get_minio_server_list() -> dict[str, List[MinioServer]]:
   """
   minio_server_objs = await storage_crud.read_minio_server_list()
   return dict[str, List[MinioServer]](data=minio_server_objs)
+
+async def get_buckets(minio_server: ObjectId) -> List[str]:
+  """
+  获取存储桶列表
+  """
+  minio_server_obj = await storage_crud.read_minio_server_by_id(minio_server)
+  if not minio_server_obj:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
+  minio_client = get_minio_client(
+    host=minio_server_obj.host,
+    port=minio_server_obj.port,
+    access_key=minio_server_obj.access_key,
+    secret_key=minio_server_obj.secret_key
+  )
+  buckets = await get_buckets_info_sdk(minio_client)
+  return dict[str, list](data=buckets)

@@ -11,6 +11,17 @@ from minio.replicationconfig import (
 )
 from src.core.exception import CustomException, ErrorDesc
 
+async def _run_cmd(cmd):
+  """执行 shell 命令并返回结果"""
+  try:
+    result = subprocess.run(
+      cmd, shell=True, check=True, 
+      capture_output=True, text=True
+    )
+    return True, result.stdout
+  except subprocess.CalledProcessError as e:
+      return False, e.stderr
+
 def get_minio_client(host: str, port: int, access_key: str, secret_key: str) -> Minio:
   """
   获取 Minio 客户端
@@ -78,16 +89,47 @@ async def create_bucket(server_name: str, bucket_name: str):
   if not success:
     raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, str(err))
 
-async def _run_cmd(cmd):
-  """执行 shell 命令并返回结果"""
+async def get_buckets_info(server_name: str):
+  """
+  获取存储桶列表
+  """
+  cmd = f"mc ls {server_name} --json"
+  success, output = await _run_cmd(cmd)
+  if not success:
+    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(output))
   try:
-    result = subprocess.run(
-      cmd, shell=True, check=True, 
-      capture_output=True, text=True
-    )
-    return True, result.stdout
-  except subprocess.CalledProcessError as e:
-      return False, e.stderr
+    results = []
+    for line in output.strip().splitlines():
+      if line.strip():  # 确保行不为空
+        results.append(json.loads(line))
+    return results
+  except json.JSONDecodeError as e:
+      # 记录原始输出以便调试
+      raise CustomException(ErrorDesc.INTERNAL_SERVER_ERROR, f"JSON解析失败: {str(e)}")
+
+async def get_buckets_info_sdk(client: Minio):
+    # 获取所有桶列表
+    buckets = client.list_buckets()
+    results = []
+    for bucket in buckets:
+      # 获取桶内对象（递归列出所有对象以获取最新状态）
+      objects = client.list_objects(bucket.name, recursive=True)
+      total_size = 0
+      objects_list = []
+      for obj in objects:
+        total_size += obj.size
+        objects_list.append({
+          "name": obj.object_name,
+          "size": obj.size,
+          "last_modified": str(obj.last_modified)
+        })
+      results.append({
+        "name": bucket.name,
+        "total_size": total_size,
+        "created_at": str(bucket.creation_date),
+        "files": objects_list
+      })
+    return results
 
 async def set_site_alias(site_name, endpoint, admin_user, admin_password):
   """

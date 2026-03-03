@@ -44,6 +44,8 @@ async def create_application(
   """
   创建应用
   """
+  if len(nickname) < 3:
+    raise CustomException(ErrorDesc.INVALID_PARAMS, "别名用于存储桶创建, 长度不能小于3")
   region_objs = await public_crud.read_many_region_by_ids(regions)
   if len(region_objs) != len(regions):
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "Region.id")
@@ -80,6 +82,8 @@ async def enable_application(
   master_minio_server_obj = await storage_crud.read_master_minio_server()
   master_region : Region = master_minio_server_obj.region
   await create_bucket(master_region.nickname, application_obj.nickname)
+  # 批量创建 Minio 存储桶数据
+  await storage_crud.bulk_create_minio_bucket(application_obj)
   await application_obj.save()
   return dict[str, str](message="启用授权成功")
   

@@ -49,7 +49,7 @@ class Settings(BaseSettings):
   # 密码哈希轮数, 用于 bcrypt 加密, 数值应该介于 4 到 31 之间
   BCRYPT_ROUNDS: int = 4
   ALGORITHM: str = "HS256"
-  ACCESS_TOKEN_EXPIRE_MINUTES: int = 15  # 15 minutes
+  ACCESS_TOKEN_EXPIRE_MINUTES: int = 480 # 8 hours
   REFRESH_TOKEN_EXPIRE_DAYS: int = 30  # 30 days
   
   # 从已有系统中获取注册用户

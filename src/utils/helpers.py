@@ -85,3 +85,18 @@ def get_full_permissions(selected_permissions: list) -> list:
     discover(pmt)
       
   return list[str](full_set)
+
+def try_to_obj_id(obj_id: ObjectId | str | Document) -> ObjectId:
+  """
+  尝试将对象ID转换为ObjectId
+  """
+  from src.core.exception import CustomException, ErrorDesc
+  if isinstance(obj_id, Document):
+    obj_id = obj_id.id
+  if not isinstance(obj_id, ObjectId):
+    try:
+      obj_id = ObjectId(obj_id)
+    except Exception as e:
+      logger.error(f"🔍 [Try to Object ID] Error: {e}")
+      raise CustomException(ErrorDesc.OBJECT_ID_NOT_VALID, "尝试将对象转换为ObjectId失败")
+  return obj_id

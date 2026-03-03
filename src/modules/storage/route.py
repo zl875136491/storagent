@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 from src.modules.storage import service as storage_service
 from src.modules.storage import schema as storage_schema
+from src.modules.public import schema as public_schema
 router = APIRouter()
 
 @router.post(
@@ -36,3 +37,13 @@ async def get_minio_server_list() -> storage_schema.MinioServerListResponse:
   获取 Minio 服务器列表
   """
   return await storage_service.get_minio_server_list()
+
+@router.get(
+  path="/{minio_server_id}/buckets",
+  response_model=storage_schema.BucketsResponse,
+  summary="获取存储桶列表")
+async def get_buckets(minio_server_id: public_schema.PydanticObjectId) -> storage_schema.BucketsResponse:
+  """
+  获取存储桶列表
+  """
+  return await storage_service.get_buckets(minio_server_id)

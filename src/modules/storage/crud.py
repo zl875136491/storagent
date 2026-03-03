@@ -1,8 +1,12 @@
 from typing import List
+from bson import ObjectId
 from src.modules.storage.model import MinioServer
 from src.modules.public.model import Region
+from src.modules.public.model import Application
+from src.modules.storage.model import MinioBucket
 from src.core.exception import CustomException, ErrorDesc
 from loguru import logger
+from src.utils.helpers import try_to_obj_id
 
 async def create_minio_server(
   region: Region,
@@ -69,5 +73,48 @@ async def read_minio_server_by_fqdn(host: str, port: int) -> MinioServer | None:
     MinioServer.port == port
   )
 
+async def read_minio_server_by_id(id: str | ObjectId) -> MinioServer | None:
+  """
+  根据 ID 获取 Minio 服务器
+  """
+  id = try_to_obj_id(id)
+  return await MinioServer.find_one(MinioServer.id == id)
+
 async def read_minio_server_list() -> List[MinioServer]:
   return await MinioServer.find_all(fetch_links=True).to_list()
+
+async def create_minio_bucket(
+  region: Region,
+  app: Application,
+  server: MinioServer,
+  name: str) -> MinioBucket:
+  """
+  创建 Minio 存储桶
+  """
+  minio_bucket = MinioBucket(
+    region=region,
+    app=app,
+    server=server,
+    name=name
+  )
+  await minio_bucket.save()
+  return minio_bucket
+
+async def bulk_create_minio_bucket(
+  app: Application) -> List[MinioBucket]:
+  """
+  批量创建 Minio 存储桶
+  """
+  minio_server_objs = await read_minio_server_list()
+  for minio_server_obj in minio_server_objs:
+    minio_bucket = MinioBucket(
+      region=minio_server_obj.region,
+      app=app,
+      server=minio_server_obj,
+      name=app.nickname
+    )
+    try:
+      await minio_bucket.save()
+    except Exception as e:
+      raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, str(e))
+  

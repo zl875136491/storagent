@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from typing import List
 from src.modules.public.schema import PydanticObjectId
-
+from datetime import datetime
 class MinioServerCreateRequest(BaseModel):
   region: PydanticObjectId
   name: str
@@ -26,3 +26,17 @@ class MinioServerResponse(BaseModel):
 
 class MinioServerListResponse(BaseModel):
   data: List[MinioServerResponse]
+
+class BucketFileItem(BaseModel):
+  name: str
+  size: int
+  last_modified: datetime
+
+class BucketInfo(BaseModel):
+  name: str
+  total_size: int
+  created_at: datetime
+  files: List[BucketFileItem]
+
+class BucketsResponse(BaseModel):
+  data: List[BucketInfo]
