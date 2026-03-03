@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends
-from src.core.auth import get_current_user
+from src.core.auth import get_current_user, check_permissions
 from src.modules.auth.model import User
 from src.modules.public import service as public_service
 from src.modules.public import schema as public_schema
@@ -49,10 +49,12 @@ async def create_application(
   创建应用
   """
   name = payload.name.strip()
+  nickname = payload.nickname.strip().lower()
   description = payload.description.strip()
   regions = payload.regions
   return await public_service.create_application(
     name=name,
+    nickname=nickname,
     description=description,
     regions=regions,
     current_user=current_user
@@ -70,3 +72,16 @@ async def get_application_list() -> public_schema.ApplicationListResponse:
     ApplicationListResponse: 应用列表
   """
   return await public_service.get_application_list()
+
+@router.post(
+  path="/application/{application_id}/approval",
+  response_model=public_schema.SimpleMessageResponse,
+  summary="授权应用")
+async def approval_application(
+  application_id: public_schema.PydanticObjectId,
+  current_user: User = Depends(get_current_user)) -> public_schema.SimpleMessageResponse:
+  """
+  授权应用
+  """
+  await check_permissions(current_user, ["application_manage"])
+  return await public_service.enable_application(application_id, current_user)

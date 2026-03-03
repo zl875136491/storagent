@@ -20,6 +20,7 @@ class Region(Document):
 
 class Application(Document):
   name: str
+  nickname: str
   description: str = Field(default="")
   enabled: bool = Field(default=False)
   created_at: datetime = Field(default_factory=utc_now)
@@ -27,11 +28,13 @@ class Application(Document):
   enabled_at: datetime | None = Field(default=None)
   regions: List[Link[Region]] = Field(default=[])
   author: Link[User]
+  approver: Link[User] | None = Field(default=None)
   
   class Settings:
     name = "application"
     indexes = [
       IndexModel(["name"], unique=True),
+      IndexModel(["nickname"], unique=True),
     ]
 
 class APIKey(Document):

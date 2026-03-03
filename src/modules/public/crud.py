@@ -153,8 +153,15 @@ async def read_application_by_name(name: str) -> Application | None:
   """
   return await Application.find_one(Application.name == name)
 
+async def read_application_by_nickname(nickname: str) -> Application | None:
+  """
+  获取应用
+  """
+  return await Application.find_one(Application.nickname == nickname)
+
 async def create_application(
   name: str,
+  nickname: str,
   description: str,
   regions: List[Region],
   author: User) -> Application:
@@ -169,11 +176,10 @@ async def create_application(
   Returns:
     Application: 应用
   """
-  existed_name = await read_application_by_name(name)
-  if existed_name:
-    raise CustomException(ErrorDesc.NAME_EXISTED, "Application.name")
+
   application = Application(
     name=name,
+    nickname=nickname,
     description=description,
     regions=regions,
     author=author

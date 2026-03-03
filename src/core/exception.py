@@ -50,6 +50,7 @@ class ErrorDesc(Enum):
   MINIO_ACCESS_FAILED = ("Minio 访问失败", 400019)
   MINIO_ALIAS_FAILED = ("Minio 别名设置失败", 400020)
   MINIO_REPLICATE_FAILED = ("Minio 复制集设置失败", 400021)
+  MINIO_CREATE_BUCKET_FAILED = ("Minio 创建存储桶失败", 400022)
   
   # special resource
   STATUS_ERR = ("状态错误", 400020)

@@ -48,6 +48,9 @@ class PydanticObjectId(ObjectId):
     except Exception:
       raise CustomException(ErrorDesc.OBJECT_ID_NOT_VALID, f"请求传入对象ID: {value} 不合法")
 
+class SimpleMessageResponse(BaseModel):
+  message: str
+
 
 class RegionCreateRequest(BaseModel):
   name: str
@@ -63,6 +66,7 @@ class RegionListResponse(BaseModel):
 
 class ApplicationCreateRequest(BaseModel):
   name: str
+  nickname: str
   description: str
   regions: List[PydanticObjectId]
 
@@ -74,6 +78,7 @@ class SimpleUserResponse(BaseModel):
 class ApplicationResponse(BaseModel):
   id: PydanticObjectId
   name: str
+  nickname: str
   created_at: datetime
   updated_at: datetime
   description: str

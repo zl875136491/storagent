@@ -59,7 +59,7 @@ def test_minio_server(host: str, port: int, access_key: str, secret_key: str):
   except Exception as e:
     raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
 
-def create_bucket(minio_client: Minio, bucket_name: str):
+async def create_bucket(server_name: str, bucket_name: str):
   """
   创建存储桶
   
@@ -70,10 +70,13 @@ def create_bucket(minio_client: Minio, bucket_name: str):
   Returns:
     None: 无返回值
   """
-  try:
-    minio_client.make_bucket(bucket_name)
-  except Exception as e:
-    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
+  # try:
+  #   minio_client.make_bucket(bucket_name)
+  # except Exception as e:
+  #   raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
+  success, err = await _run_cmd(f"mc mb {server_name}/{bucket_name}")
+  if not success:
+    raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, str(err))
 
 async def _run_cmd(cmd):
   """执行 shell 命令并返回结果"""
