@@ -9,7 +9,9 @@ from minio.replicationconfig import (
   Destination,
   DeleteMarkerReplication
 )
+
 from src.core.exception import CustomException, ErrorDesc
+from src.utils.helpers import build_file_tree
 
 async def _run_cmd(cmd):
   """执行 shell 命令并返回结果"""
@@ -123,11 +125,12 @@ async def get_buckets_info_sdk(client: Minio):
           "size": obj.size,
           "last_modified": str(obj.last_modified)
         })
+      file_tree = build_file_tree(objects_list)
       results.append({
-        "name": bucket.name,
+        "name": "Bucket: " + bucket.name,
         "total_size": total_size,
         "created_at": str(bucket.creation_date),
-        "files": objects_list
+        "files": file_tree
       })
     return results
 

@@ -1,4 +1,4 @@
-import time
+import secrets
 from typing import Type
 from loguru import logger
 from beanie import Document
@@ -100,3 +100,78 @@ def try_to_obj_id(obj_id: ObjectId | str | Document) -> ObjectId:
       logger.error(f"🔍 [Try to Object ID] Error: {e}")
       raise CustomException(ErrorDesc.OBJECT_ID_NOT_VALID, "尝试将对象转换为ObjectId失败")
   return obj_id
+
+def file_tree_post_process(node_dict):
+  """
+  递归处理：将字典转为列表，并计算 size 和最新的 last_modified
+  """
+  result_list = []
+  for key, node in node_dict.items():
+    if not node.get("is_file", False):
+      # 递归处理子节点
+      children_list = file_tree_post_process(node.pop("children"))
+      node["children"] = children_list
+      
+      # 计算文件夹属性
+      total_size = sum(child["size"] for child in children_list)
+      # 获取子节点中最晚的时间
+      valid_times = [child["last_modified"] for child in children_list if child["last_modified"]]
+      latest_time = max(valid_times) if valid_times else node["last_modified"]
+      
+      node["size"] = total_size
+      node["last_modified"] = latest_time
+    
+    # 移除辅助标记并添加到结果
+    node.pop("is_file", None)
+    result_list.append(node)
+  
+  # 按照名称排序（可选）
+  return sorted(result_list, key=lambda x: x['name'])
+
+def build_file_tree(files):
+  """
+  构建文件树
+  """
+  root_nodes = {}
+
+  for file in files:
+    path_parts = file['name'].split('/')
+    current_level = root_nodes
+    
+    # 逐层构建/查找目录
+    for i, part in enumerate(path_parts):
+      is_file = (i == len(path_parts) - 1)
+      
+      if part not in current_level:
+        if is_file:
+          # 如果是具体文件
+          current_level[part] = {
+            "name": part,
+            "size": file.get('size', 0),
+            "last_modified": file.get('last_modified', ""),
+            "is_file": True
+          }
+        else:
+          # 如果是文件夹
+          current_level[part] = {
+            "name": part,
+            "size": 0,
+            "last_modified": "0001-01-01T00:00:00Z", # 初始占位时间
+            "children": {},
+            "is_file": False
+          }
+      
+      if not is_file:
+        current_level = current_level[part]["children"]
+
+  return file_tree_post_process(root_nodes)
+
+def generate_api_key():
+  """
+  生成 API 密钥
+  """
+  prefix="sk"
+  # 生成 36 字节的安全随机数，并转换为 Base64 风格字符串
+  # token_urlsafe 会生成包含 A-Z, a-z, 0-9, -, _ 的字符
+  random_str = secrets.token_urlsafe(36).replace('-', '').replace('_', '').lower()
+  return f"{prefix}-{random_str}"

@@ -85,3 +85,43 @@ async def approval_application(
   """
   await check_permissions(current_user, ["application_manage"])
   return await public_service.enable_application(application_id, current_user)
+
+@router.get(
+  path="/application/enabled",
+  response_model=public_schema.SimpleApplicationListResponse,
+  summary="用户启用的应用列表")
+async def get_users_enabled_application_list(
+  current_user: User = Depends(get_current_user)) -> public_schema.SimpleApplicationListResponse:
+  """
+  用户启用的应用列表
+  """
+  return await public_service.get_users_enabled_application_list(current_user)
+
+@router.post(
+  path="/api-key",
+  response_model=public_schema.APIKeyResponse,
+  summary="创建API密钥")
+async def create_api_key(
+  payload: public_schema.APIKeyCreateRequest,
+  current_user: User = Depends(get_current_user)) -> public_schema.APIKeyResponse:
+  """
+  创建API密钥
+  """
+  application_id = payload.application_id
+  expired_at = payload.expired_at
+  return await public_service.create_api_key(
+    application_id=application_id,
+    expired_at=expired_at,
+    current_user=current_user
+  )
+
+@router.get(
+  path="/api-key",
+  response_model=public_schema.APIKeyListResponse,
+  summary="获取API密钥列表")
+async def get_api_key_list(
+  current_user: User = Depends(get_current_user)) -> public_schema.APIKeyListResponse:
+  """
+  获取API密钥列表
+  """
+  return await public_service.get_api_key_list(current_user)

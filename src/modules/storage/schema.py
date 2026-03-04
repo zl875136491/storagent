@@ -31,6 +31,7 @@ class BucketFileItem(BaseModel):
   name: str
   size: int
   last_modified: datetime
+  children: List["BucketFileItem"] | None = None
 
 class BucketInfo(BaseModel):
   name: str

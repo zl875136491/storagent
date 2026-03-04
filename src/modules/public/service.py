@@ -1,15 +1,36 @@
 from typing import List
-from beanie import Link
 from bson import ObjectId
+from datetime import datetime, timedelta
 
-from src.utils.helpers import utc_now
 from src.modules.auth.model import User
 from src.modules.public.model import Region
+from src.core.minio_op import create_bucket
 from src.modules.public import crud as public_crud
 from src.modules.storage import crud as storage_crud
-from src.modules.public.model import Region, Application
 from src.core.exception import CustomException, ErrorDesc
-from src.core.minio_op import create_bucket
+from src.utils.helpers import (
+  utc_now,
+  generate_api_key
+)
+from src.modules.public.model import (
+  APIKey,
+  Region,
+  Application
+)
+
+async def _validate_application_nickname(nickname: str) -> None:
+  """
+  验证应用别名
+  """
+
+  if len(nickname) < 3 or len(nickname) > 32:
+    raise CustomException(ErrorDesc.INVALID_PARAMS, "应用别名长度不能小于3或大于32")
+  # 符号仅允许连字符, 其他 deny
+  for char in nickname:
+    if char.isalnum() or char == "-":
+      continue
+    else:
+      raise CustomException(ErrorDesc.INVALID_PARAMS, "应用别名只能包含连字符和字母数字")
 
 async def create_region(
   name: str,
@@ -44,8 +65,8 @@ async def create_application(
   """
   创建应用
   """
-  if len(nickname) < 3:
-    raise CustomException(ErrorDesc.INVALID_PARAMS, "别名用于存储桶创建, 长度不能小于3")
+  # 因为应用别名用于存储桶创建, 所以需要一定的约束条件
+  await _validate_application_nickname(nickname)
   region_objs = await public_crud.read_many_region_by_ids(regions)
   if len(region_objs) != len(regions):
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "Region.id")
@@ -86,4 +107,52 @@ async def enable_application(
   await storage_crud.bulk_create_minio_bucket(application_obj)
   await application_obj.save()
   return dict[str, str](message="启用授权成功")
+
+async def get_users_enabled_application_list(
+  current_user: User) -> List[Application]:
+  """
+  获取用户启用的应用列表
+  """
+  app_objs = await public_crud.read_users_enabled_application_list(current_user)
+  return dict[str, List[Application]](data=app_objs)
   
+async def create_api_key(
+  application_id: ObjectId,
+  expired_at: datetime | None,
+  current_user: User) -> APIKey:
+  """
+  创建API密钥
+  """
+  application_obj = await public_crud.read_application_by_id(application_id)
+  if not application_obj:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
+  if not application_obj.enabled:
+    raise CustomException(ErrorDesc.STATUS_ERR, "应用未启用")
+  if application_obj.author != current_user:
+    raise CustomException(ErrorDesc.RES_NOT_BELONG_TO_USER, "应用不属于当前用户")
+  if expired_at:
+    if expired_at.replace(tzinfo=utc_now().tzinfo) < utc_now():
+      raise CustomException(ErrorDesc.INVALID_PARAMS, "过期时间不能小于当前时间")
+  else:
+    expired_at = utc_now() + timedelta(days=36500) # 100年, 设置一个特别大的时间, 视同为永久有效
+  key = generate_api_key()
+  # 生成一个唯一的API密钥
+  while await public_crud.read_api_key_by_key(key):
+    key = generate_api_key()
+  return await public_crud.create_api_key(application_obj, key, expired_at)
+
+async def get_api_key_list(
+  current_user: User) -> List[APIKey]:
+  """
+  获取API密钥列表
+  """
+  users_app_objs = await public_crud.read_users_enabled_application_list(current_user)
+  api_key_objs = await public_crud.read_api_key_by_app(users_app_objs)
+  data = []
+  for api_key_obj in api_key_objs:
+    data.append({
+      "id": api_key_obj.id,
+      "key": f"{api_key_obj.key[:7]}************{api_key_obj.key[-4:]}",
+      "expired_at": api_key_obj.expired_at
+    })
+  return dict[str, List[APIKey]](data=data)

@@ -42,7 +42,7 @@ async def get_minio_server_list() -> storage_schema.MinioServerListResponse:
   path="/{minio_server_id}/buckets",
   response_model=storage_schema.BucketsResponse,
   summary="获取存储桶列表")
-async def get_buckets(minio_server_id: public_schema.PydanticObjectId) -> storage_schema.BucketsResponse:
+async def get_buckets(minio_server_id: public_schema.PydanticObjectId):# -> storage_schema.BucketsResponse:
   """
   获取存储桶列表
   """

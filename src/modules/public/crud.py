@@ -1,10 +1,14 @@
+import uuid
 from bson import ObjectId
-from src.modules.public.model import Region, Application
-from src.modules.auth.model import User
-from typing import List, Type
-from src.core.exception import CustomException, ErrorDesc
 from beanie import Document
+from typing import List, Type
+from datetime import datetime
 from beanie.operators import Set, In
+
+from src.modules.auth.model import User
+from src.utils.helpers import try_to_obj_id, utc_now
+from src.core.exception import CustomException, ErrorDesc
+from src.modules.public.model import Region, Application, APIKey, APIKeyUsage
 
 async def get_document_fields(model: Type[Document]) -> list[str]:
   """
@@ -159,6 +163,15 @@ async def read_application_by_nickname(nickname: str) -> Application | None:
   """
   return await Application.find_one(Application.nickname == nickname)
 
+async def read_users_enabled_application_list(current_user: User) -> List[Application]:
+  """
+  获取用户启用的应用列表
+  """
+  return await Application.find(
+    Application.enabled == True,
+    Application.author.id == current_user.id
+  ).to_list()
+
 async def create_application(
   name: str,
   nickname: str,
@@ -204,3 +217,53 @@ async def read_application_by_id(application_id: str | ObjectId) -> Application 
     Application | None: 应用
   """
   return await Application.find_one(Application.id == application_id, fetch_links=True)
+
+async def create_api_key(
+  application: Application,
+  key: str,
+  expired_at: datetime) -> APIKey:
+  """
+  创建API密钥
+  """
+  api_key = APIKey(
+    application=application,
+    key=key,
+    expired_at=expired_at
+  )
+  await api_key.save()
+  return api_key
+
+async def read_api_key_by_app(applications: List[Application]) -> List[APIKey]:
+  """
+  获取API密钥
+  """
+  application_ids = [app.id for app in applications]
+  return await APIKey.find(
+    In(APIKey.application.id, application_ids),
+    APIKey.deleted == False
+  ).to_list()
+
+async def read_api_key_by_id(api_key_id: str | ObjectId) -> APIKey | None:
+  """
+  获取API密钥
+  """
+  api_key_id = try_to_obj_id(api_key_id)
+  return await APIKey.find_one(APIKey.id == api_key_id)
+
+async def read_api_key_by_key(key: str) -> APIKey | None:
+  """
+  获取API密钥
+  """
+  return await APIKey.find_one(APIKey.key == key)
+
+async def delete_api_key_by_id(api_key_id: str | ObjectId) -> bool:
+  """
+  删除API密钥
+  """
+  api_key = await read_api_key_by_id(api_key_id)
+  if not api_key:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "API密钥不存在")
+  api_key.deleted = True
+  api_key.deleted_at = utc_now()
+  await api_key.save()
+  return True

@@ -89,3 +89,23 @@ class ApplicationResponse(BaseModel):
 
 class ApplicationListResponse(BaseModel):
   data: List[ApplicationResponse]
+
+class SimpleApplicationResponse(BaseModel):
+  id: PydanticObjectId
+  name: str
+  nickname: str
+
+class SimpleApplicationListResponse(BaseModel):
+  data: List[SimpleApplicationResponse]
+
+class APIKeyCreateRequest(BaseModel):
+  application_id: PydanticObjectId
+  expired_at: datetime | None = None
+
+class APIKeyResponse(BaseModel):
+  id: PydanticObjectId
+  key: str
+  expired_at: datetime
+
+class APIKeyListResponse(BaseModel):
+  data: List[APIKeyResponse]

@@ -6,6 +6,7 @@ from pydantic import Field
 from src.utils.helpers import utc_now
 from src.modules.auth.model import User
 from typing import List
+from pydantic import BaseModel
 
 class Region(Document):
   name: str
@@ -38,9 +39,11 @@ class Application(Document):
     ]
 
 class APIKey(Document):
+  application: Link[Application]
   key: str
-  app: Link[Application]
-  expired_at: datetime
+  expired_at: datetime # 过期时间
+  deleted: bool = Field(default=False)
+  deleted_at: datetime | None = Field(default=None)
   
   class Settings:
     name = "api_key"
@@ -49,4 +52,16 @@ class APIKey(Document):
       IndexModel(["app"]),
       IndexModel(["expired_at"]),
     ]
+
+class APIKeyUsageData(BaseModel):
+  date: datetime
+  server: str
+  type: str
+  size: int
+
+class APIKeyUsage(Document):
+  api_key: Link[APIKey]
+  is_full: bool = Field(default=False)
+  data: List[APIKeyUsageData] = Field(default=[]) # 最大3000条数据
+  full_at: datetime | None = Field(default=None) # 满3000条数据的时间
 
