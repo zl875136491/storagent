@@ -12,7 +12,6 @@ from src.core.minio_op import (
   add_new_site,
   remove_site_alias,
   get_buckets_info,
-  get_buckets_info_sdk,
   get_minio_client
 )
 
@@ -122,5 +121,5 @@ async def get_buckets(minio_server: ObjectId) -> List[str]:
     access_key=minio_server_obj.access_key,
     secret_key=minio_server_obj.secret_key
   )
-  buckets = await get_buckets_info_sdk(minio_client)
+  buckets = await get_buckets_info(minio_client)
   return dict[str, list](data=buckets)

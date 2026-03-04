@@ -1,20 +1,23 @@
 import json
 import subprocess
 from minio import Minio
-from minio.commonconfig import ENABLED
-from minio.versioningconfig import VersioningConfig
-from minio.replicationconfig import (
-  ReplicationConfig,
-  Rule,
-  Destination,
-  DeleteMarkerReplication
-)
 
 from src.core.exception import CustomException, ErrorDesc
 from src.utils.helpers import build_file_tree
 
 async def _run_cmd(cmd):
-  """执行 shell 命令并返回结果"""
+  """
+  执行 shell 命令并返回结果
+  
+  Args:
+    cmd: 命令
+
+  Returns:
+    Tuple[bool, str]: 执行结果
+    True: 执行成功
+    False: 执行失败
+    str: 执行结果
+  """
   try:
     result = subprocess.run(
       cmd, shell=True, check=True, 
@@ -91,52 +94,55 @@ async def create_bucket(server_name: str, bucket_name: str):
   if not success:
     raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, str(err))
 
-async def get_buckets_info(server_name: str):
+async def get_buckets_info(client: Minio):
   """
-  获取存储桶列表
-  """
-  cmd = f"mc ls {server_name} --json"
-  success, output = await _run_cmd(cmd)
-  if not success:
-    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(output))
-  try:
-    results = []
-    for line in output.strip().splitlines():
-      if line.strip():  # 确保行不为空
-        results.append(json.loads(line))
-    return results
-  except json.JSONDecodeError as e:
-      # 记录原始输出以便调试
-      raise CustomException(ErrorDesc.INTERNAL_SERVER_ERROR, f"JSON解析失败: {str(e)}")
+  获取存储桶文件列表
+  
+  Args:
+    client: Minio 客户端
 
-async def get_buckets_info_sdk(client: Minio):
-    # 获取所有桶列表
-    buckets = client.list_buckets()
-    results = []
-    for bucket in buckets:
-      # 获取桶内对象（递归列出所有对象以获取最新状态）
-      objects = client.list_objects(bucket.name, recursive=True)
-      total_size = 0
-      objects_list = []
-      for obj in objects:
-        total_size += obj.size
-        objects_list.append({
-          "name": obj.object_name,
-          "size": obj.size,
-          "last_modified": str(obj.last_modified)
-        })
-      file_tree = build_file_tree(objects_list)
-      results.append({
-        "name": "Bucket: " + bucket.name,
-        "total_size": total_size,
-        "created_at": str(bucket.creation_date),
-        "files": file_tree
+  Returns:
+    List[dict]: 存储桶文件列表
+  """
+  # 获取所有桶列表
+  buckets = client.list_buckets()
+  results = []
+  for bucket in buckets:
+    # 获取桶内对象（递归列出所有对象以获取最新状态）
+    objects = client.list_objects(bucket.name, recursive=True)
+    total_size = 0
+    objects_list = []
+    for obj in objects:
+      total_size += obj.size
+      objects_list.append({
+        "name": obj.object_name,
+        "size": obj.size,
+        "last_modified": str(obj.last_modified)
       })
-    return results
+    file_tree = build_file_tree(objects_list)
+    results.append({
+      "name": "Bucket: " + bucket.name,
+      "total_size": total_size,
+      "created_at": str(bucket.creation_date),
+      "files": file_tree
+    })
+  return results
 
 async def set_site_alias(site_name, endpoint, admin_user, admin_password):
   """
   设置站点别名
+  
+  Args:
+    site_name: 站点名称
+    endpoint: 站点地址
+    admin_user: 管理员用户名
+    admin_password: 管理员密码
+
+  Returns:
+    Tuple[bool, str]: 设置结果
+    True: 设置成功
+    False: 设置失败
+    str: 设置结果
   """
   alias_cmd = f"mc alias set {site_name} http://{endpoint} {admin_user} {admin_password}"
   success, _ = await _run_cmd(alias_cmd)
@@ -146,6 +152,15 @@ async def set_site_alias(site_name, endpoint, admin_user, admin_password):
 async def remove_site_alias(site_name):
   """
   删除站点别名
+  
+  Args:
+    site_name: 站点名称
+
+  Returns:
+    Tuple[bool, str]: 删除结果
+    True: 删除成功
+    False: 删除失败
+    str: 删除结果
   """
   alias_cmd = f"mc alias rm {site_name}"
   success, _ = await _run_cmd(alias_cmd)
@@ -155,6 +170,16 @@ async def remove_site_alias(site_name):
 async def add_new_site(master_name, site_name):
   """
   新增 MinIO 节点加入当前的复制集
+  
+  Args:
+    master_name: 主站点名称
+    site_name: 新站点名称
+
+  Returns:
+    Tuple[bool, str]: 加入结果
+    True: 加入成功
+    False: 加入失败
+    str: 加入结果
   """
   # 将新站点加入复制集
   # 注意：Site Replication 要求所有站点在加入前必须是“空”的（或具有相同的初始状态）
@@ -164,7 +189,16 @@ async def add_new_site(master_name, site_name):
   return success, output
 
 async def get_site_replication_status(master):
-  """获取当前复制集状态"""
+  """
+  获取当前复制集状态
+  
+  Args:
+    master: 主站点名称
+
+  Returns:
+    dict: 复制集状态
+    None: 获取失败
+  """
   # 使用 --json 参数便于 Python 解析
   cmd = f"mc admin replicate info {master} --json"
   success, output = await _run_cmd(cmd)

@@ -240,7 +240,8 @@ async def read_api_key_by_app(applications: List[Application]) -> List[APIKey]:
   application_ids = [app.id for app in applications]
   return await APIKey.find(
     In(APIKey.application.id, application_ids),
-    APIKey.deleted == False
+    APIKey.deleted == False,
+    fetch_links=True
   ).to_list()
 
 async def read_api_key_by_id(api_key_id: str | ObjectId) -> APIKey | None:

@@ -139,6 +139,7 @@ async def create_api_key(
   # 生成一个唯一的API密钥
   while await public_crud.read_api_key_by_key(key):
     key = generate_api_key()
+  # TODO: 将 API Key 数据同步到 Agent 中
   return await public_crud.create_api_key(application_obj, key, expired_at)
 
 async def get_api_key_list(
@@ -153,6 +154,11 @@ async def get_api_key_list(
     data.append({
       "id": api_key_obj.id,
       "key": f"{api_key_obj.key[:7]}************{api_key_obj.key[-4:]}",
+      "application": {
+        "id": api_key_obj.application.id,
+        "name": api_key_obj.application.name,
+        "nickname": api_key_obj.application.nickname
+      },
       "expired_at": api_key_obj.expired_at
     })
   return dict[str, List[APIKey]](data=data)

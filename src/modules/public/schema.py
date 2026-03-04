@@ -107,5 +107,11 @@ class APIKeyResponse(BaseModel):
   key: str
   expired_at: datetime
 
+class APIKeyDetailResponse(BaseModel):
+  id: PydanticObjectId
+  key: str
+  application: SimpleApplicationResponse
+  expired_at: datetime
+
 class APIKeyListResponse(BaseModel):
-  data: List[APIKeyResponse]
+  data: List[APIKeyDetailResponse]
