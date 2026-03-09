@@ -38,6 +38,14 @@ class Settings(BaseSettings):
   MONGO_DB_PASSWD: str = "passwd"
   MONGO_DB_NAME: str = "manufacture-mgmt"
   MONGO_DB_AUTH_SOURCE: str = "admin"
+  
+  # Redis 
+  REDIS_HOST: str = "localhost"
+  REDIS_PORT: int = 6379
+  REDIS_DB: int = 0
+  REDIS_PASSWORD: str = "passwd"
+  REDIS_API_KEY_CHANNEL: str = "api_key_channel"
+  
 
   LOG_PATH: str = "/var/log/cross_storage"
   LOG_STD_LEVEL: str = "INFO"
