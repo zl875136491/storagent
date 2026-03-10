@@ -44,8 +44,9 @@ class Settings(BaseSettings):
   REDIS_PORT: int = 6379
   REDIS_DB: int = 0
   REDIS_PASSWORD: str = "passwd"
-  REDIS_API_KEY_CHANNEL: str = "api_key_channel"
-  
+  # 频道命名基本不会变
+  REDIS_API_KEY_CHANNEL: str = "api_key_patch"
+  REDIS_FILE_CHANNEL: str = "file_patch" 
 
   LOG_PATH: str = "/var/log/cross_storage"
   LOG_STD_LEVEL: str = "INFO"

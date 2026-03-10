@@ -132,10 +132,13 @@ async def create_api_key(
   if application_obj.author != current_user:
     raise CustomException(ErrorDesc.RES_NOT_BELONG_TO_USER, "应用不属于当前用户")
   if expired_at:
-    if expired_at.replace(tzinfo=utc_now().tzinfo) < utc_now():
+    expired_at = expired_at.replace(tzinfo=utc_now().tzinfo)
+    if expired_at < utc_now():
       raise CustomException(ErrorDesc.INVALID_PARAMS, "过期时间不能小于当前时间")
   else:
     expired_at = utc_now() + timedelta(days=36500) # 100年, 设置一个特别大的时间, 视同为永久有效
+    # 只精确到秒, 与用户设置时间保持一致
+    expired_at = expired_at.replace(second=0, microsecond=0)
   key = generate_api_key()
   # 生成一个唯一的API密钥
   while await public_crud.read_api_key_by_key(key):
@@ -143,7 +146,11 @@ async def create_api_key(
   api_key_obj = await public_crud.create_api_key(application_obj, key, expired_at)
   # 将 API Key 数据同步到 Agent 中
   async with RedisOp() as redis_op:
-    await redis_op.publish_api_key(api_key_obj.key)
+    await redis_op.publish_api_key_create_patch(
+      api_key=api_key_obj.key,
+      app_name=application_obj.nickname,
+      expired_at=expired_at,
+    )
   return api_key_obj
 
 async def get_api_key_list(
