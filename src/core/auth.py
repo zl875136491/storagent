@@ -194,7 +194,8 @@ async def check_permissions(user: User = Depends(get_current_user), permissions:
   """
   admin_role = await user_crud.get_admin_role()
   if admin_role:
-    
+    print(user.roles)
+    print(admin_role)
     for role in user.roles:
       if role.to_ref().id == admin_role.id:
         return True

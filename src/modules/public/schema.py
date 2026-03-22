@@ -115,3 +115,14 @@ class APIKeyDetailResponse(BaseModel):
 
 class APIKeyListResponse(BaseModel):
   data: List[APIKeyDetailResponse]
+
+class Endpoint(BaseModel):
+  region_id: PydanticObjectId
+  server_id: PydanticObjectId
+  name: str
+  shown_name: str
+  master: bool
+  endpoint: str
+
+class EndpointsResponse(BaseModel):
+  data: List[Endpoint]

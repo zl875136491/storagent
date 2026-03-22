@@ -6,6 +6,16 @@ from src.modules.public import schema as public_schema
 
 router = APIRouter()
 
+@router.get(
+  path="/endpoints",
+  response_model=public_schema.EndpointsResponse,
+  summary="获取端点列表")
+async def get_endpoints() -> public_schema.EndpointsResponse:
+  """
+  获取端点列表
+  """
+  return await public_service.get_endpoints()
+    
 @router.post(
   path="/region",
   response_model=public_schema.RegionResponse,

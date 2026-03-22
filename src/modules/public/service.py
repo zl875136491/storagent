@@ -19,6 +19,24 @@ from src.modules.public.model import (
 )
 from src.core.redis_op import RedisOp
 
+async def get_endpoints() -> dict[str, List[str]]:
+  """
+  获取端点列表
+  """
+  from src.modules.storage import service as storage_service
+  minio_server_objs = await storage_service.get_minio_server_list()
+  data = []
+  for minio_server_obj in minio_server_objs["data"]:
+    data.append({
+      "region_id": minio_server_obj.region.id,
+      "server_id": minio_server_obj.id,
+      "name": minio_server_obj.region.name,
+      "shown_name": minio_server_obj.region.shown_name,
+      "master": minio_server_obj.master,
+      "endpoint": f"http://{minio_server_obj.host}:{minio_server_obj.port}"
+    })
+  return dict[str, List[dict]](data=data)
+
 async def _validate_application_nickname(nickname: str) -> None:
   """
   验证应用别名
