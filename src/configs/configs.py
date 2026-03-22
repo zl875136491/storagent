@@ -31,6 +31,9 @@ class Settings(BaseSettings):
   BACKEND_CORS_ORIGINS: list[str] = ["*"]
   TIMEZONE: str = "Asia/Shanghai"
   
+  # 唯一ID
+  REGION: str = "undefined"
+  
   # MongoDB
   MONGO_DB_HOST: str = "localhost"
   MONGO_DB_PORT: int = 27017
@@ -46,7 +49,8 @@ class Settings(BaseSettings):
   REDIS_PASSWORD: str = "passwd"
   # 频道命名基本不会变
   REDIS_API_KEY_CHANNEL: str = "api_key_patch"
-  REDIS_FILE_CHANNEL: str = "file_patch" 
+  REDIS_FILE_CHANNEL: str = "file_patch"
+  
 
   LOG_PATH: str = "/var/log/cross_storage"
   LOG_STD_LEVEL: str = "INFO"

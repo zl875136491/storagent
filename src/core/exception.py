@@ -59,6 +59,9 @@ class ErrorDesc(Enum):
   OPERATION_NOT_ALLOWED = ("操作不允许", 400024)
   FIELD_NOT_FOUND = ("字段不存在", 400025)
   SEND_CODE_FAILED = ("发送登录代码失败", 400026)
+  REGION_NOT_DEF = ("地区信息未定义, 请通过环境变量设置", 400027)
+  REGION_EXISTED = ("地区信息已存在", 400028)
+  
   
   # file
   INTERNAL_SERVER_ERROR = ("服务器内部错误", 500001)

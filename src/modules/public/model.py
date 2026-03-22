@@ -10,13 +10,13 @@ from pydantic import BaseModel
 
 class Region(Document):
   name: str
-  nickname: str
+  shown_name: str
   
   class Settings:
     name = "region"
     indexes = [
       IndexModel(["name"], unique=True),
-      IndexModel(["nickname"], unique=True),
+      IndexModel(["shown_name"], unique=True),
     ]
 
 class Application(Document):
@@ -65,3 +65,15 @@ class APIKeyUsage(Document):
   data: List[APIKeyUsageData] = Field(default=[]) # 最大3000条数据
   full_at: datetime | None = Field(default=None) # 满3000条数据的时间
 
+class SystemConfig(Document):
+  key: str
+  value: str
+  name: str
+  description: str
+  value_type: str
+  
+  class Settings:
+    name = "system_config"
+    indexes = [
+      IndexModel(["key"], unique=True),
+    ]

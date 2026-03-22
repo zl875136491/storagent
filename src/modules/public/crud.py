@@ -8,7 +8,7 @@ from beanie.operators import Set, In
 from src.modules.auth.model import User
 from src.utils.helpers import try_to_obj_id, utc_now
 from src.core.exception import CustomException, ErrorDesc
-from src.modules.public.model import Region, Application, APIKey, APIKeyUsage
+from src.modules.public.model import Region, Application, APIKey, APIKeyUsage, SystemConfig
 
 async def get_document_fields(model: Type[Document]) -> list[str]:
   """
@@ -70,12 +70,13 @@ async def update_document(
 
 async def create_region(
   name: str,
-  nickname: str) -> Region:
+  shown_name: str) -> Region:
   """
   创建区域
 
   Args:
     name: 区域名称
+    shown_name: 区域显示名称
 
   Returns:
     Region: 区域
@@ -83,10 +84,10 @@ async def create_region(
   existed_name = await read_region_by_name(name)
   if existed_name:
     raise CustomException(ErrorDesc.NAME_EXISTED, "Region.name")
-  existed_nickname = await read_region_by_nickname(nickname)
+  existed_nickname = await read_region_by_shown_name(shown_name)
   if existed_nickname:
-    raise CustomException(ErrorDesc.NAME_EXISTED, "Region.nickname")
-  region = Region(name=name, nickname=nickname)
+    raise CustomException(ErrorDesc.NAME_EXISTED, "Region.shown_name")
+  region = Region(name=name, shown_name=shown_name)
   await region.save()
   return region
 
@@ -117,14 +118,14 @@ async def read_region_by_name(name: str) -> Region | None:
   """
   return await Region.find_one(Region.name == name)
 
-async def read_region_by_nickname(nickname: str) -> Region | None:
+async def read_region_by_shown_name(shown_name: str) -> Region | None:
   """
   获取区域
 
   Returns:
     Region | None: 区域
   """
-  return await Region.find_one(Region.nickname == nickname)
+  return await Region.find_one(Region.shown_name == shown_name)
 
 async def read_many_region_by_ids(region_ids: List[str | ObjectId]) -> List[Region]:
   """
@@ -267,4 +268,41 @@ async def delete_api_key_by_id(api_key_id: str | ObjectId) -> bool:
   api_key.deleted = True
   api_key.deleted_at = utc_now()
   await api_key.save()
+  return True
+
+async def create_system_config(
+  key: str,
+  value: str,
+  name: str,
+  description: str,
+  value_type: str):
+  """
+  创建系统配置信息
+  """
+  value_str = str(value)
+  system_config = SystemConfig(
+    key=key,
+    value=value_str,
+    name=name,
+    description=description,
+    value_type=value_type
+  )
+  await system_config.save()
+  return system_config
+
+async def read_system_config_by_key(key: str) -> SystemConfig | None:
+  """
+  获取系统配置信息
+  """
+  return await SystemConfig.find_one(SystemConfig.key == key)
+
+async def update_system_config_by_key(key: str, value: str | int | float | bool) -> bool:
+  """
+  更新系统配置信息
+  """
+  system_config = await read_system_config_by_key(key)
+  if not system_config:
+    return False
+  system_config.value = str(value)
+  await system_config.update()
   return True

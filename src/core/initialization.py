@@ -18,4 +18,32 @@ async def init_service():
   """
   初始化服务
   """
-  # TODO: 检查 mc 命令是否可用
+  # 0: 检查 mc 命令是否可用
+  
+  # 1. 确定 Region 信息
+  from src.configs.configs import settings
+  from src.core.exception import CustomException, ErrorDesc
+  from src.modules.public import crud as public_crud
+  region_config_status = public_crud.read_system_config_by_key("region_config_status")
+  if not region_config_status:
+    region_config_status = await public_crud.create_system_config(
+      key="region",
+      value="none",
+      name="区域",
+      description="区域",
+      value_type="str"
+    )
+  if region_config_status.value == "none":
+    region_name = settings.REGION
+    if region_name == "undefined":
+      raise CustomException(ErrorDesc.REGION_NOT_DEF)
+    existed_region = await public_crud.read_region_by_name(region_name)
+    if existed_region:
+      raise CustomException(ErrorDesc.REGION_EXISTED)
+    region = await public_crud.create_region(region_name, region_name)
+    await public_crud.update_system_config_by_key("region_config_status", region_name)
+  else:
+    region_name = region_config_status.value
+  
+  # 2. 连接 minio 存储
+  
