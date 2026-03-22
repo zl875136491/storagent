@@ -6,7 +6,7 @@ from src.api import register_api
 from src.core.database import init_db
 from src.configs.configs import settings
 from src.utils.logger import setup_logging
-from src.core.initialization import init_project
+from src.core.initialization import init_project, init_service
 from src.core.exception import register_exception
 
 
@@ -27,6 +27,9 @@ async def lifespan(app: FastAPI):
   
   # 3. 初始化项目
   await init_project()
+
+  # 4. 初始化服务
+  await init_service()
 
   yield
 

@@ -1,3 +1,5 @@
+from src.utils.logger import logger
+
 async def init_project():
   """
   初始化项目
@@ -13,6 +15,7 @@ async def init_project():
     await user_crud.create_role(name="用户", is_admin=False, permissions=basic_permissions)
   if not admin_role:
     await user_crud.create_role(name="管理员", is_admin=True, permissions=admin_permissions)
+  logger.info(f"Role Data Created.")
 
 async def init_service():
   """
@@ -24,10 +27,12 @@ async def init_service():
   from src.configs.configs import settings
   from src.core.exception import CustomException, ErrorDesc
   from src.modules.public import crud as public_crud
-  region_config_status = public_crud.read_system_config_by_key("region_config_status")
+  region_status_key = "region_config_status"
+  region_config_status = await public_crud.read_system_config_by_key(region_status_key)
+  print(region_config_status)
   if not region_config_status:
     region_config_status = await public_crud.create_system_config(
-      key="region",
+      key=region_status_key,
       value="none",
       name="区域",
       description="区域",
@@ -36,14 +41,24 @@ async def init_service():
   if region_config_status.value == "none":
     region_name = settings.REGION
     if region_name == "undefined":
-      raise CustomException(ErrorDesc.REGION_NOT_DEF)
+      raise CustomException(ErrorDesc.REGION_NOT_DEF, "")
     existed_region = await public_crud.read_region_by_name(region_name)
     if existed_region:
-      raise CustomException(ErrorDesc.REGION_EXISTED)
+      raise CustomException(ErrorDesc.REGION_EXISTED, "")
     region = await public_crud.create_region(region_name, region_name)
-    await public_crud.update_system_config_by_key("region_config_status", region_name)
+    await public_crud.update_system_config_by_key(region_status_key, region_name)
   else:
     region_name = region_config_status.value
+  logger.info(f"Region Initialized: {region_name}.")
   
-  # 2. 连接 minio 存储
+  # 2. 连接 minio 存储服务
+  from src.core.minio_op import test_minio_server
+  test_minio_server(
+    host=settings.MINIO_HOST,
+    port=settings.MINIO_PORT,
+    access_key=settings.MINIO_ACCESS_KEY,
+    secret_key=settings.MINIO_SECRET_KEY
+  )
+  logger.info(f"Minio Server Tested: {settings.MINIO_HOST}:{settings.MINIO_PORT}.")
+
   

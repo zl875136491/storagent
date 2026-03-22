@@ -19,6 +19,7 @@ from ..modules.public.model import (
   Region,
   APIKey,
   Application,
+  SystemConfig,
 )
 
 from ..modules.storage.model import (
@@ -49,6 +50,7 @@ async def init_db():
     Region,
     APIKey,
     Application,
+    SystemConfig,
     User,
     Role,
     TempCode,

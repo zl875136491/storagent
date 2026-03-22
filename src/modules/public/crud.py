@@ -304,5 +304,5 @@ async def update_system_config_by_key(key: str, value: str | int | float | bool)
   if not system_config:
     return False
   system_config.value = str(value)
-  await system_config.update()
+  await system_config.save()
   return True

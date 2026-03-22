@@ -36,6 +36,12 @@ async def import_user_from_springboard(username: str) -> dict | None:
   """
   从 springboard 中导入用户
   """
+  if settings.IGNORE_AUTH:
+    return {
+      "user_info": {
+        "l": username
+      }
+    }
   api_url = settings.USER_INFO_URL + "?itcode=" + username
   response = requests_get(api_url, timeout=3)
   if response.status_code != 200:
