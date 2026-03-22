@@ -34,6 +34,10 @@ class Settings(BaseSettings):
   # 唯一ID
   REGION: str = "undefined"
   
+  # 服务器名称
+  SERVER_HOST: str = "localhost"
+  SERVER_PORT: int = 9000
+
   # MongoDB
   MONGO_DB_HOST: str = "localhost"
   MONGO_DB_PORT: int = 27017

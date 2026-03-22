@@ -181,3 +181,10 @@ def generate_api_key():
   # token_urlsafe 会生成包含 A-Z, a-z, 0-9, -, _ 的字符
   random_str = secrets.token_urlsafe(36).replace('-', '').replace('_', '').lower()
   return f"{prefix}-{random_str}"
+
+def load_json_from_str(json_str: str) -> dict:
+  """
+  从字符串中加载 JSON 数据
+  """
+  import json
+  return json.loads(json_str)

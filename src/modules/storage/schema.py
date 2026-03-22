@@ -13,6 +13,7 @@ class MinioServerCreateRequest(BaseModel):
 class SimpleRegionResponse(BaseModel):
   id: PydanticObjectId
   name: str
+  shown_name: str
 
 class MinioServerResponse(BaseModel):
   id: PydanticObjectId

@@ -54,12 +54,12 @@ class SimpleMessageResponse(BaseModel):
 
 class RegionCreateRequest(BaseModel):
   name: str
-  nickname: str
+  shown_name: str
 
 class RegionResponse(BaseModel):
   id: PydanticObjectId
   name: str
-  nickname: str
+  shown_name: str
 
 class RegionListResponse(BaseModel):
   data: List[RegionResponse]

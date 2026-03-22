@@ -7,6 +7,7 @@ from src.modules.storage.model import MinioBucket
 from src.core.exception import CustomException, ErrorDesc
 from loguru import logger
 from src.utils.helpers import try_to_obj_id
+from src.configs.configs import settings
 
 async def create_minio_server(
   region: Region,
@@ -29,12 +30,10 @@ async def create_minio_server(
   Returns:
     MinioServer: Minio 服务器
   """
-
-  master_minio_server = await read_master_minio_server()
-  if master_minio_server:
-    master = False
-  else:
+  if region.name == settings.REGION:
     master = True
+  else:
+    master = False
   minio_server = MinioServer(
     region=region,
     name=name,
