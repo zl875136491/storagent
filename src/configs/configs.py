@@ -25,7 +25,7 @@ class Settings(BaseSettings):
   请引入该库下的 settings 实例, 该类无需重复实例化
   """
   # Info
-  APP_NAME: str = "Cross Storage"
+  APP_NAME: str = "Storagent"
   APP_VERSION: str = "0.1.0"
   DEBUG: bool = True
   BACKEND_CORS_ORIGINS: list[str] = ["*"]
@@ -43,7 +43,7 @@ class Settings(BaseSettings):
   MONGO_DB_PORT: int = 27017
   MONGO_DB_USER: str = "user"
   MONGO_DB_PASSWD: str = "passwd"
-  MONGO_DB_NAME: str = "manufacture-mgmt"
+  MONGO_DB_NAME: str = "storagent"
   MONGO_DB_AUTH_SOURCE: str = "admin"
 
   # Minio
@@ -69,8 +69,7 @@ class Settings(BaseSettings):
   
   # JWT 认证配置
   SECRET_KEY: str = "XXXXXXX"
-  # 密码哈希轮数, 用于 bcrypt 加密, 数值应该介于 4 到 31 之间
-  BCRYPT_ROUNDS: int = 4
+  BCRYPT_SALT: str = "XXXXXXXX"
   ALGORITHM: str = "HS256"
   ACCESS_TOKEN_EXPIRE_MINUTES: int = 480 # 8 hours
   REFRESH_TOKEN_EXPIRE_DAYS: int = 30  # 30 days

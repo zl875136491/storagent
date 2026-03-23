@@ -62,9 +62,11 @@ def get_password_hash(password: str) -> str:
   if len(password_bytes) > 72:
     password_bytes = password_bytes[:72]
   
-  # 生成盐并哈希密码
+  # # 生成盐并哈希密码
   
-  salt = bcrypt.gensalt(rounds=settings.BCRYPT_ROUNDS)
+  # salt = bcrypt.gensalt(rounds=settings.BCRYPT_ROUNDS)
+  # 使用静态盐，保证多后端的认证互认
+  salt = settings.BCRYPT_SALT.encode('utf-8')
   hashed = bcrypt.hashpw(password_bytes, salt)
   return hashed.decode('utf-8')
 
