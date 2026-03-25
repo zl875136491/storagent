@@ -62,7 +62,7 @@ class Settings(BaseSettings):
   REDIS_FILE_CHANNEL: str = "file_patch"
   
 
-  LOG_PATH: str = "~/logs/storagent"
+  LOG_PATH: str = "logs/"
   LOG_STD_LEVEL: str = "INFO"
   LOG_STORAGE_LEVEL: str = "INFO"
   LOG_STORAGE_DAYS: int = 30
