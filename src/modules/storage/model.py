@@ -12,7 +12,8 @@ class MinioServer(Document):
   region: Link[Region]
   name: str = Field(default="")
   host: str
-  port: int
+  server_port: int
+  minio_port: int
   access_key: str = Field(default="")
   secret_key: str = Field(default="")
   master: bool = Field(default=False)
@@ -21,7 +22,7 @@ class MinioServer(Document):
     name = "minio_server"
     indexes = [
       IndexModel(["region"], unique=True),
-      IndexModel(["host", "port"], unique=True),
+      IndexModel(["host", "minio_port"], unique=True),
     ]
 
 class MinioBucket(Document):

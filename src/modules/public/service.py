@@ -33,7 +33,7 @@ async def get_endpoints() -> dict[str, List[str]]:
       "name": minio_server_obj.region.name,
       "shown_name": minio_server_obj.region.shown_name,
       "master": minio_server_obj.master,
-      "endpoint": f"http://{minio_server_obj.host}:{minio_server_obj.port}"
+      "endpoint": f"http://{minio_server_obj.host}:{minio_server_obj.server_port}"
     })
   return dict[str, List[dict]](data=data)
 

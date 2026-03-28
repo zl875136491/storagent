@@ -84,16 +84,17 @@ async def init_service():
       region=region_obj,
       name=region_name,
       host=settings.SERVER_HOST,
-      port=settings.SERVER_PORT,
+      server_port=settings.SERVER_PORT,
+      minio_port=settings.MINIO_PORT,
       access_key=settings.MINIO_ACCESS_KEY,
       secret_key=settings.MINIO_SECRET_KEY
     )
   else:
     if any([
       settings.SERVER_HOST != minio_server_obj.host,
-      settings.SERVER_PORT != minio_server_obj.port
+      settings.SERVER_PORT != minio_server_obj.server_port
     ]):
       minio_server_obj.host = settings.SERVER_HOST
-      minio_server_obj.port = settings.SERVER_PORT
+      minio_server_obj.server_port = settings.SERVER_PORT
       await minio_server_obj.save()
   logger.info(f"Minio Server Created: {region_name}.")

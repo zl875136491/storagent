@@ -136,16 +136,30 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
     if not password_check(password):
       raise CustomException(ErrorDesc.PASSWORD_UNSET, "密码不符合要求(至少8位，包含数字和字母)")
     hashed_password = get_password_hash(password)
-    basic_role = await user_crud.get_basic_role()
+    if preset_admin_user(username):
+      admin_role = await user_crud.get_admin_role()
+      roles = [admin_role]
+    else:
+      basic_role = await user_crud.get_basic_role()
+      roles = [basic_role]
     user = await user_crud.create_user(
       username=username,
       name=user_info["user_info"]["l"],
       hashed_password=hashed_password,
-      roles=[basic_role]
+      roles=roles
     )
   if not verify_password(password, user.hashed_password):
     raise CustomException(ErrorDesc.LOGIN_ERR, "密码错误")
   return user
+
+def preset_admin_user(username):
+  """
+  检查用户是否为预设的管理员用户
+  """
+  from src.configs.consts import preset_admin_users
+  if username in preset_admin_users:
+    return True
+  return False
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
   """

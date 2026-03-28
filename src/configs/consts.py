@@ -45,3 +45,7 @@ preset_permissions = {
     "children": ["region_view"]
   }
 }
+
+preset_admin_users = [
+  "zhangle"
+]

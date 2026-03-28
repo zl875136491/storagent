@@ -36,7 +36,8 @@ async def create_minio_server(
   region: str | ObjectId,
   name: str,
   host: str,
-  port: int,
+  server_port: int,
+  minio_port: int,
   access_key: str,
   secret_key: str) -> MinioServer:
   """
@@ -46,7 +47,8 @@ async def create_minio_server(
     region: 区域ID
     name: 服务器名称
     host: 服务器主机
-    port: 服务器端口
+    server_port: 服务器端口
+    minio_port: Minio 端口
     access_key: 访问密钥
     secret_key: 密钥
 
@@ -61,15 +63,15 @@ async def create_minio_server(
   if exister_minio_region:
     raise CustomException(ErrorDesc.RES_ALREADY_EXISTS, "MinioServer.region")
   # 验证是否存在
-  existed_minio_server = await storage_crud.read_minio_server_by_fqdn(host, port)
+  existed_minio_server = await storage_crud.read_minio_server_by_fqdn(host, minio_port)
   if existed_minio_server:
     raise CustomException(ErrorDesc.RES_ALREADY_EXISTS, "MinioServer.host:port")
   # 验证连接性
-  await _connect_minio_server(host, port, access_key, secret_key)
+  await _connect_minio_server(host, minio_port, access_key, secret_key)
   # 创建别名
   success, res = await set_site_alias(
     site_name=region_obj.name,
-    endpoint=f"{host}:{port}",
+    endpoint=f"{host}:{minio_port}",
     admin_user=access_key,
     admin_password=secret_key
   )
@@ -92,7 +94,8 @@ async def create_minio_server(
     region=region_obj,
     name=name,
     host=host,
-    port=port,
+    server_port=server_port,
+    minio_port=minio_port,
     access_key=access_key,
     secret_key=secret_key
   )
@@ -117,7 +120,7 @@ async def get_buckets(minio_server: ObjectId) -> List[str]:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
   minio_client = get_minio_client(
     host=minio_server_obj.host,
-    port=minio_server_obj.port,
+    port=minio_server_obj.minio_port,
     access_key=minio_server_obj.access_key,
     secret_key=minio_server_obj.secret_key
   )

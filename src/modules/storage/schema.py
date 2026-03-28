@@ -20,9 +20,10 @@ class MinioServerResponse(BaseModel):
   region: SimpleRegionResponse
   name: str
   host: str
-  port: int
+  server_port: int
+  minio_port: int
   master: bool
-  access_key: str
+  # access_key: str
   secret_key: str
 
 class MinioServerListResponse(BaseModel):

@@ -13,7 +13,8 @@ async def create_minio_server(
   region: Region,
   name: str,
   host: str,
-  port: int,
+  server_port: int,
+  minio_port: int,
   access_key: str,
   secret_key: str) -> MinioServer:
   """
@@ -23,7 +24,8 @@ async def create_minio_server(
     region: 区域
     name: 服务器名称
     host: 服务器主机
-    port: 服务器端口
+    server_port: 服务器端口
+    minio_port: Minio 端口
     access_key: 访问密钥
     secret_key: 密钥
 
@@ -38,7 +40,8 @@ async def create_minio_server(
     region=region,
     name=name,
     host=host,
-    port=port,
+    server_port=server_port,
+    minio_port=minio_port,
     master=master,
     access_key=access_key,
     secret_key=secret_key
@@ -63,13 +66,13 @@ async def read_minio_server_by_region(region: Region) -> MinioServer | None:
     MinioServer.region.id == region.id
   )
 
-async def read_minio_server_by_fqdn(host: str, port: int) -> MinioServer | None:
+async def read_minio_server_by_fqdn(host: str, minio_port: int) -> MinioServer | None:
   """
   根据 FQDN 获取 Minio 服务器
   """
   return await MinioServer.find_one(
     MinioServer.host == host,
-    MinioServer.port == port
+    MinioServer.minio_port == minio_port
   )
 
 async def read_minio_server_by_id(id: str | ObjectId) -> MinioServer | None:

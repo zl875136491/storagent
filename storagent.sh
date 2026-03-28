@@ -14,6 +14,10 @@ function run() {
   uvicorn main:app --host 0.0.0.0 --port=$SERVER_PORT --timeout-graceful-shutdown 1 --reload --reload-exclude '*/tests/*'
 }
 
+function stop() {
+  fuser -k $SERVER_PORT/tcp
+}
+
 # 安装包
 function install() {
   if [ -z "$module_arg" ]; then
@@ -65,6 +69,8 @@ function help() {
 
 if [ "$action" == "run" ]; then
   run
+elif [ "$action" == "stop" ]; then
+  stop
 elif [ "$action" == "install" ]; then
   install
 elif [ "$action" == "uninstall" ]; then
