@@ -110,7 +110,7 @@ async def bulk_create_minio_bucket(
       region=minio_server_obj.region,
       app=app,
       server=minio_server_obj,
-      name=app.nickname
+      name=app.name
     )
     try:
       await minio_bucket.save()

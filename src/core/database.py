@@ -28,6 +28,21 @@ from ..modules.storage.model import (
   MinioBucket,
 )
 
+document_models = [
+  Region,
+  APIKey,
+  Application,
+  SystemConfig,
+  User,
+  Role,
+  TempCode,
+  DestoryedToken,
+  MinioEvent,
+  MinioServer,
+  MinioBucket,
+]
+
+
 async def init_db():
   """
   初始化 MongoDB 数据库连接和 Beanie ODM。

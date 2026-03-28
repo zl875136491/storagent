@@ -32,8 +32,8 @@ async def create_region(
     RegionResponse: 区域
   """
   name = payload.name.strip()
-  nickname = payload.nickname.strip()
-  return await public_service.create_region(name, nickname)
+  shown_name = payload.shown_name.strip()
+  return await public_service.create_region(name, shown_name)
 
 @router.get(
   path="/region",
@@ -59,14 +59,12 @@ async def create_application(
   创建应用
   """
   name = payload.name.strip()
-  nickname = payload.nickname.strip().lower()
+  shown_name = payload.shown_name.strip().lower()
   description = payload.description.strip()
-  regions = payload.regions
   return await public_service.create_application(
     name=name,
-    nickname=nickname,
+    shown_name=shown_name,
     description=description,
-    regions=regions,
     current_user=current_user
   )
 

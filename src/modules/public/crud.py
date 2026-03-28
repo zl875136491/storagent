@@ -84,8 +84,8 @@ async def create_region(
   existed_name = await read_region_by_name(name)
   if existed_name:
     raise CustomException(ErrorDesc.NAME_EXISTED, "Region.name")
-  existed_nickname = await read_region_by_shown_name(shown_name)
-  if existed_nickname:
+  existed_shown_name = await read_region_by_shown_name(shown_name)
+  if existed_shown_name:
     raise CustomException(ErrorDesc.NAME_EXISTED, "Region.shown_name")
   region = Region(name=name, shown_name=shown_name)
   await region.save()
@@ -158,11 +158,11 @@ async def read_application_by_name(name: str) -> Application | None:
   """
   return await Application.find_one(Application.name == name)
 
-async def read_application_by_nickname(nickname: str) -> Application | None:
+async def read_application_by_shown_name(shown_name: str) -> Application | None:
   """
   获取应用
   """
-  return await Application.find_one(Application.nickname == nickname)
+  return await Application.find_one(Application.shown_name == shown_name)
 
 async def read_users_enabled_application_list(current_user: User) -> List[Application]:
   """
@@ -175,15 +175,15 @@ async def read_users_enabled_application_list(current_user: User) -> List[Applic
 
 async def create_application(
   name: str,
-  nickname: str,
+  shown_name: str,
   description: str,
-  regions: List[Region],
   author: User) -> Application:
   """
   创建应用
 
   Args:
     name: 应用名称
+    shown_name: 应用显示名称
     description: 应用描述
     author: 作者
 
@@ -193,9 +193,8 @@ async def create_application(
 
   application = Application(
     name=name,
-    nickname=nickname,
+    shown_name=shown_name,
     description=description,
-    regions=regions,
     author=author
   )
   await application.save()

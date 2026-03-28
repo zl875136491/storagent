@@ -37,15 +37,15 @@ async def get_endpoints() -> dict[str, List[str]]:
     })
   return dict[str, List[dict]](data=data)
 
-async def _validate_application_nickname(nickname: str) -> None:
+async def _validate_application_name(name: str) -> None:
   """
-  验证应用别名
+  验证应用显示名称
   """
 
-  if len(nickname) < 3 or len(nickname) > 32:
+  if len(name) < 3 or len(name) > 32:
     raise CustomException(ErrorDesc.INVALID_PARAMS, "应用别名长度不能小于3或大于32")
   # 符号仅允许连字符, 其他 deny
-  for char in nickname:
+  for char in name:
     if char.isalnum() or char == "-":
       continue
     else:
@@ -53,7 +53,7 @@ async def _validate_application_nickname(nickname: str) -> None:
 
 async def create_region(
   name: str,
-  nickname: str) -> Region:
+  shown_name: str) -> Region:
   """
   创建区域
 
@@ -63,7 +63,7 @@ async def create_region(
   Returns:
     Region: 区域
   """
-  return await public_crud.create_region(name, nickname)
+  return await public_crud.create_region(name, shown_name)
 
 async def get_region_list() -> dict[str, List[Region]]:
   """
@@ -77,25 +77,24 @@ async def get_region_list() -> dict[str, List[Region]]:
 
 async def create_application(
   name: str,
-  nickname: str,
+  shown_name: str,
   description: str,
-  regions: List[str | ObjectId],
   current_user: User) -> Application:
   """
   创建应用
   """
-  # 因为应用别名用于存储桶创建, 所以需要一定的约束条件
-  await _validate_application_nickname(nickname)
-  region_objs = await public_crud.read_many_region_by_ids(regions)
-  if len(region_objs) != len(regions):
-    raise CustomException(ErrorDesc.RES_NOT_FOUND, "Region.id")
+  # 因为应用名用于存储桶创建, 所以需要一定的约束条件
+  await _validate_application_name(name)
+  # region_objs = await public_crud.read_many_region_by_ids(regions)
+  # if len(region_objs) != len(regions):
+  #   raise CustomException(ErrorDesc.RES_NOT_FOUND, "Region.id")
   existed_name = await public_crud.read_application_by_name(name)
   if existed_name:
     raise CustomException(ErrorDesc.NAME_EXISTED, "Application.name")
-  existed_nickname = await public_crud.read_application_by_nickname(nickname)
-  if existed_nickname:
-    raise CustomException(ErrorDesc.NAME_EXISTED, "Application.nickname")
-  return await public_crud.create_application(name, nickname, description, region_objs, current_user)
+  existed_shown_name = await public_crud.read_application_by_shown_name(shown_name)
+  if existed_shown_name:
+    raise CustomException(ErrorDesc.NAME_EXISTED, "Application.shown_name")
+  return await public_crud.create_application(name, shown_name, description, current_user)
 
 async def get_application_list() -> dict[str, List[Application]]:
   """
@@ -118,10 +117,10 @@ async def enable_application(
   application_obj.enabled = True
   application_obj.enabled_at = utc_now()
   application_obj.approver = current_user
-  # 将应用别名相应的桶添加到 master minio server 中
+  # 将应用名称相应的桶添加到 master minio server 中
   master_minio_server_obj = await storage_crud.read_master_minio_server()
   master_region : Region = master_minio_server_obj.region
-  await create_bucket(master_region.nickname, application_obj.nickname)
+  await create_bucket(master_region.name, application_obj.name)
   # 批量创建 Minio 存储桶数据
   await storage_crud.bulk_create_minio_bucket(application_obj)
   await application_obj.save()
@@ -166,7 +165,7 @@ async def create_api_key(
   async with RedisOp() as redis_op:
     await redis_op.publish_api_key_create_patch(
       api_key=api_key_obj.key,
-      app_name=application_obj.nickname,
+      app_name=application_obj.name,
       expired_at=expired_at,
     )
   return api_key_obj
@@ -186,7 +185,7 @@ async def get_api_key_list(
       "application": {
         "id": api_key_obj.application.id,
         "name": api_key_obj.application.name,
-        "nickname": api_key_obj.application.nickname
+        "shown_name": api_key_obj.application.shown_name
       },
       "expired_at": api_key_obj.expired_at
     })

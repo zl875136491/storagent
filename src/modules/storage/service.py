@@ -68,7 +68,7 @@ async def create_minio_server(
   await _connect_minio_server(host, port, access_key, secret_key)
   # 创建别名
   success, res = await set_site_alias(
-    site_name=region_obj.nickname,
+    site_name=region_obj.name,
     endpoint=f"{host}:{port}",
     admin_user=access_key,
     admin_password=secret_key
@@ -80,12 +80,12 @@ async def create_minio_server(
     master_region_obj: Region = master_minio_server_obj.region
     # 已有主节点, 需要执行加入复制集的操作
     set_success, set_res = await add_new_site(
-      master_name=master_region_obj.nickname,
-      site_name=region_obj.nickname
+      master_name=master_region_obj.name,
+      site_name=region_obj.name
     )
     if not set_success:
       # 加入复制集失败, 需要删除别名
-      remove_success, _ = await remove_site_alias(region_obj.nickname)
+      remove_success, _ = await remove_site_alias(region_obj.name)
       raise CustomException(ErrorDesc.MINIO_REPLICATE_FAILED, set_res)
   # 创建 Minio 服务器数据
   minio_server_obj = await storage_crud.create_minio_server(

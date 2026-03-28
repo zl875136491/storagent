@@ -66,9 +66,8 @@ class RegionListResponse(BaseModel):
 
 class ApplicationCreateRequest(BaseModel):
   name: str
-  nickname: str
+  shown_name: str
   description: str
-  regions: List[PydanticObjectId]
 
 class SimpleUserResponse(BaseModel):
   id: PydanticObjectId
@@ -78,14 +77,13 @@ class SimpleUserResponse(BaseModel):
 class ApplicationResponse(BaseModel):
   id: PydanticObjectId
   name: str
-  nickname: str
+  shown_name: str
   created_at: datetime
   updated_at: datetime
   description: str
   enabled: bool
   enabled_at: datetime | None
   author: SimpleUserResponse
-  regions: List[RegionResponse]
 
 class ApplicationListResponse(BaseModel):
   data: List[ApplicationResponse]
@@ -93,7 +91,7 @@ class ApplicationListResponse(BaseModel):
 class SimpleApplicationResponse(BaseModel):
   id: PydanticObjectId
   name: str
-  nickname: str
+  shown_name: str
 
 class SimpleApplicationListResponse(BaseModel):
   data: List[SimpleApplicationResponse]
