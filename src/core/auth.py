@@ -1,5 +1,5 @@
 import bcrypt
-from fastapi import Depends
+from fastapi import Depends, applications
 from jose import JWTError, jwt
 from datetime import timedelta
 from typing import Optional, List
@@ -210,8 +210,6 @@ async def check_permissions(user: User = Depends(get_current_user), permissions:
   """
   admin_role = await user_crud.get_admin_role()
   if admin_role:
-    print(user.roles)
-    print(admin_role)
     for role in user.roles:
       if role.to_ref().id == admin_role.id:
         return True
@@ -220,3 +218,23 @@ async def check_permissions(user: User = Depends(get_current_user), permissions:
       permission_name = preset_permissions[permission]["name"]
       raise CustomException(ErrorDesc.INSUFFICIENT_PERMISSIONS, f"用户缺少权限: {permission_name}")
   return user
+
+# 从请求头中提取 API-KEY 字段作为 App 数据源
+from fastapi.security import APIKeyHeader
+from src.modules.public import crud as public_crud
+from src.utils.helpers import before_compare
+async def get_current_app(api_key: str = Depends(APIKeyHeader(name="x-api-key"))) -> str:
+  """
+  从请求头中提取 API-KEY 字段作为输入源
+  """
+  from src.modules.public.model import Application
+  api_key_obj = await public_crud.read_api_key_by_key(api_key)
+  if not api_key_obj:
+    raise CustomException(ErrorDesc.API_KEY_INVALID, "API-KEY 无效")
+  if before_compare(api_key_obj.expired_at) < utc_now():
+    raise CustomException(ErrorDesc.API_KEY_EXPIRED, "API-KEY 已过期")
+  application_obj: Application = api_key_obj.application
+  if application_obj.enabled:
+    return application_obj.name
+  else:
+    raise CustomException(ErrorDesc.APP_NOT_ENABLED, "应用未启用")

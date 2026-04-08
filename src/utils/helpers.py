@@ -14,6 +14,12 @@ from src.configs.configs import settings
 
 LOCAL_TIMEZONE = ZoneInfo(settings.TIMEZONE)
 
+def before_compare(dt: datetime) -> datetime:
+  """
+  将 datetime 对象转换为本地时区的 datetime 对象
+  """
+  return dt.replace(tzinfo=LOCAL_TIMEZONE)
+
 def local_utc_now() -> datetime:
   """
   获取本地时区的当前时间

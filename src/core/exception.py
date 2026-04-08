@@ -62,6 +62,10 @@ class ErrorDesc(Enum):
   REGION_NOT_DEF = ("地区信息未定义, 请通过环境变量设置", 400027)
   REGION_EXISTED = ("地区信息已存在", 400028)
   
+  # API resource
+  API_KEY_INVALID = ("API-KEY 无效", 400029)
+  API_KEY_EXPIRED = ("API-KEY 已过期", 400030)
+  APP_NOT_ENABLED = ("应用未启用", 400031)
   
   # file
   INTERNAL_SERVER_ERROR = ("服务器内部错误", 500001)

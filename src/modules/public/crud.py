@@ -255,7 +255,7 @@ async def read_api_key_by_key(key: str) -> APIKey | None:
   """
   获取API密钥
   """
-  return await APIKey.find_one(APIKey.key == key)
+  return await APIKey.find_one(APIKey.key == key, fetch_links=True)
 
 async def delete_api_key_by_id(api_key_id: str | ObjectId) -> bool:
   """
