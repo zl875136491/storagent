@@ -49,6 +49,24 @@ async def create_minio_server(
   await minio_server.save()
   return minio_server
 
+async def update_minio_server(
+  minio_server: MinioServer,
+  host: str,
+  server_port: int,
+  minio_port: int,
+  access_key: str,
+  secret_key: str) -> MinioServer:
+  """
+  更新 Minio 服务器
+  """
+  minio_server.host = host
+  minio_server.server_port = server_port
+  minio_server.minio_port = minio_port
+  minio_server.access_key = access_key
+  minio_server.secret_key = secret_key
+  await minio_server.save()
+  return minio_server
+
 async def read_master_minio_server() -> MinioServer | None:
   """
   获取主 Minio 服务器

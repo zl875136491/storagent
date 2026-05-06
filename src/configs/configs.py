@@ -33,6 +33,7 @@ class Settings(BaseSettings):
   
   # 唯一ID
   REGION: str = "undefined"
+  REGION_NAME: str = "未定义"
   
   # 服务器名称
   SERVER_HOST: str = "localhost"
