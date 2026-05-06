@@ -7,8 +7,9 @@ from src.core.database import init_db
 from src.configs.configs import settings
 from src.utils.logger import setup_logging
 from src.core.initialization import init_project, init_service
+from src.core.etcd_op import get_etcd_client, watch_etcd_task
 from src.core.exception import register_exception
-
+import asyncio
 
 app_description = """
 Manufacture Management Backend
@@ -30,8 +31,15 @@ async def lifespan(app: FastAPI):
 
   # 4. 初始化服务
   await init_service()
+  
+  # 5. Etcd 监听
+  etcd_client = await get_etcd_client()
+  watch_job = asyncio.create_task(watch_etcd_task(etcd_client))
 
   yield
+  
+  # watch_job.cancel()
+  # await etcd_client.close()
 
 def create_app() -> FastAPI:
   """

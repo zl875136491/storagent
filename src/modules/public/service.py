@@ -1,6 +1,7 @@
 from typing import List
 from bson import ObjectId
 from datetime import datetime, timedelta
+from fastapi.responses import Response
 
 from src.modules.auth.model import User
 from src.modules.public.model import Region
@@ -17,7 +18,7 @@ from src.modules.public.model import (
   Region,
   Application
 )
-from src.core.redis_op import RedisOp
+# from src.core.redis_op import RedisOp
 
 async def get_endpoints() -> dict[str, List[str]]:
   """
@@ -36,6 +37,14 @@ async def get_endpoints() -> dict[str, List[str]]:
       "endpoint": f"http://{minio_server_obj.host}:{minio_server_obj.server_port}"
     })
   return dict[str, List[dict]](data=data)
+
+async def test_endpoints():
+  """
+  测试端点
+  """
+  # 返回一个 512 Byte 的文件流
+  file_content = b"Storagent" * 56
+  return Response(content=file_content, media_type="application/octet-stream")
 
 async def _validate_application_name(name: str) -> None:
   """
@@ -169,12 +178,12 @@ async def create_api_key(
     key = generate_api_key()
   api_key_obj = await public_crud.create_api_key(application_obj, key, expired_at)
   # 将 API Key 数据同步到 Agent 中
-  async with RedisOp() as redis_op:
-    await redis_op.publish_api_key_create_patch(
-      api_key=api_key_obj.key,
-      app_name=application_obj.name,
-      expired_at=expired_at,
-    )
+  # async with RedisOp() as redis_op:
+  #   await redis_op.publish_api_key_create_patch(
+  #     api_key=api_key_obj.key,
+  #     app_name=application_obj.name,
+  #     expired_at=expired_at,
+  #   )
   return api_key_obj
 
 async def get_api_key_list(

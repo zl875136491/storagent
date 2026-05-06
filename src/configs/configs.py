@@ -52,15 +52,20 @@ class Settings(BaseSettings):
   MINIO_ACCESS_KEY: str = "admin"
   MINIO_SECRET_KEY: str = "passwd"
   
-  # Redis 
-  REDIS_HOST: str = "localhost"
-  REDIS_PORT: int = 6379
-  REDIS_DB: int = 0
-  REDIS_PASSWORD: str = "passwd"
-  # 频道命名基本不会变
-  REDIS_API_KEY_CHANNEL: str = "api_key_patch"
-  REDIS_FILE_CHANNEL: str = "file_patch"
+  # # Redis 
+  # REDIS_HOST: str = "localhost"
+  # REDIS_PORT: int = 6379
+  # REDIS_DB: int = 0
+  # REDIS_PASSWORD: str = "passwd"
+  # # 频道命名基本不会变
+  # REDIS_API_KEY_CHANNEL: str = "api_key_patch"
+  # REDIS_FILE_CHANNEL: str = "file_patch"
   
+  # Etcd
+  ETCD_HOST: str = "localhost"
+  ETCD_PORT: int = 2379
+  ETCD_USERNAME: str = "admin"
+  ETCD_PASSWORD: str = "passwd"
 
   LOG_PATH: str = "logs/"
   LOG_STD_LEVEL: str = "INFO"

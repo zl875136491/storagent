@@ -15,6 +15,15 @@ async def get_endpoints() -> public_schema.EndpointsResponse:
   获取端点列表
   """
   return await public_service.get_endpoints()
+
+@router.get(
+  path="/endpoints/test",
+  summary="测试端点")
+async def test_endpoints():
+  """
+  测试端点
+  """
+  return await public_service.test_endpoints()
     
 @router.post(
   path="/region",
