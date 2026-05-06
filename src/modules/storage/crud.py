@@ -85,6 +85,17 @@ async def read_minio_server_by_id(id: str | ObjectId) -> MinioServer | None:
 async def read_minio_server_list() -> List[MinioServer]:
   return await MinioServer.find_all(fetch_links=True).to_list()
 
+async def read_minio_server_names() -> List[str]:
+  """
+  获取 Minio 服务器名称列表
+  """
+  server_names = []
+  server_objs = await read_minio_server_list()
+  for server_obj in server_objs:
+    server_name = server_obj.name
+    server_names.append(server_name)
+  return server_names
+
 async def create_minio_bucket(
   region: Region,
   app: Application,

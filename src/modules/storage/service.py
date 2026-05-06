@@ -12,7 +12,8 @@ from src.core.minio_op import (
   add_new_site,
   remove_site_alias,
   get_buckets_info,
-  get_minio_client
+  get_minio_client,
+  get_server_buckets
 )
 
 async def _connect_minio_server(
@@ -111,7 +112,37 @@ async def get_minio_server_list() -> dict[str, List[MinioServer]]:
   minio_server_objs = await storage_crud.read_minio_server_list()
   return dict[str, List[MinioServer]](data=minio_server_objs)
 
-async def get_buckets(minio_server: ObjectId) -> List[str]:
+async def get_buckets() -> List[str]:
+  """
+  获取存储桶列表
+  """
+  bucket_data = {}
+  server_names = await storage_crud.read_minio_server_names()
+  app_infos = {}
+  app_objs = await public_crud.read_application_list()
+  for app_obj in app_objs:
+    app_infos[app_obj.name] = {
+      "shown_name": app_obj.shown_name,
+      "description": app_obj.description
+    }
+  for server_name in server_names:
+    buckets = await get_server_buckets(server_name)
+    for bucket_name in buckets:
+      if bucket_name not in bucket_data:
+        if bucket_name in app_infos:
+          app_info = app_infos[bucket_name]
+        else:
+          app_info = {}
+        bucket_data[bucket_name] = {
+          "name": bucket_name,
+          "servers": [server_name],
+          "app": app_info
+        }
+      else:
+        bucket_data[bucket_name]["servers"].append(server_name)
+  return dict[str, List](data=list(bucket_data.values()))
+
+async def get_server_details(minio_server: ObjectId) -> List[str]:
   """
   获取存储桶列表
   """

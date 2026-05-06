@@ -51,6 +51,7 @@ class ErrorDesc(Enum):
   MINIO_ALIAS_FAILED = ("Minio 别名设置失败", 400020)
   MINIO_REPLICATE_FAILED = ("Minio 复制集设置失败", 400021)
   MINIO_CREATE_BUCKET_FAILED = ("Minio 创建存储桶失败", 400022)
+  MINIO_ENABLE_VERSIONING_FAILED = ("Minio 开启版本控制失败", 400023)
   
   # special resource
   STATUS_ERR = ("状态错误", 400020)

@@ -41,5 +41,13 @@ class BucketInfo(BaseModel):
   created_at: datetime
   files: List[BucketFileItem]
 
-class BucketsResponse(BaseModel):
+class ServerDetailsResponse(BaseModel):
   data: List[BucketInfo]
+
+class SimpBucketInfo(BaseModel):
+  id: PydanticObjectId
+  name: str
+  app_name: str
+
+class BucketsResponse(BaseModel):
+  data: List[SimpBucketInfo]

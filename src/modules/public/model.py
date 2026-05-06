@@ -77,3 +77,15 @@ class SystemConfig(Document):
     indexes = [
       IndexModel(["key"], unique=True),
     ]
+
+class ShellCommandLog(Document):
+  command: str
+  date: datetime = Field(default_factory=utc_now)
+  stdout: str = Field(default="")
+  stderr: str = Field(default="")
+  
+  class Settings:
+    name = "shell_command"
+    indexes = [
+      IndexModel(["date"]),
+    ]

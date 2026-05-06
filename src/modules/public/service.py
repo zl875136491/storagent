@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 from src.modules.auth.model import User
 from src.modules.public.model import Region
-from src.core.minio_op import create_bucket
+from src.core import minio_op
 from src.modules.public import crud as public_crud
 from src.modules.storage import crud as storage_crud
 from src.core.exception import CustomException, ErrorDesc
@@ -94,6 +94,7 @@ async def create_application(
   existed_shown_name = await public_crud.read_application_by_shown_name(shown_name)
   if existed_shown_name:
     raise CustomException(ErrorDesc.NAME_EXISTED, "Application.shown_name")
+  # 创建所有桶, 并且开启版本控制
   return await public_crud.create_application(name, shown_name, description, current_user)
 
 async def get_application_list() -> dict[str, List[Application]]:
@@ -117,12 +118,18 @@ async def enable_application(
   application_obj.enabled = True
   application_obj.enabled_at = utc_now()
   application_obj.approver = current_user
-  # 将应用名称相应的桶添加到 master minio server 中
-  master_minio_server_obj = await storage_crud.read_master_minio_server()
-  master_region : Region = master_minio_server_obj.region
-  await create_bucket(master_region.name, application_obj.name)
   # 批量创建 Minio 存储桶数据
-  await storage_crud.bulk_create_minio_bucket(application_obj)
+  server_names = await storage_crud.read_minio_server_names()
+  for server_name in server_names:
+    success, err = await minio_op.create_bucket(server_name, application_obj.name)
+    if not success:
+      raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, err)
+  # 批量开启桶的版本控制
+  for server_name in server_names:
+    success, err = await minio_op.enable_bucket_versioning(server_name, application_obj.name)
+    if not success:
+      raise CustomException(ErrorDesc.MINIO_ENABLE_VERSIONING_FAILED, err)
+  # await storage_crud.bulk_create_minio_bucket(application_obj)
   await application_obj.save()
   return dict[str, str](message="启用授权成功")
 

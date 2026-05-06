@@ -57,8 +57,8 @@ async def init_service():
   logger.info(f"Region Initialized: {region_name}.")
   
   # 2. 连接 minio 存储服务
-  from src.core.minio_op import test_minio_server, set_site_alias
-  test_minio_server(
+  from src.core import minio_op
+  minio_op.test_minio_server(
     host=settings.MINIO_HOST,
     port=settings.MINIO_PORT,
     access_key=settings.MINIO_ACCESS_KEY,
@@ -66,18 +66,7 @@ async def init_service():
   )
   logger.info(f"Minio Server Tested: {settings.MINIO_HOST}:{settings.MINIO_PORT}.")
 
-  # 3. 创建别名
-  success, res = await set_site_alias(
-    site_name=region_name,
-    endpoint=f"{settings.MINIO_HOST}:{settings.MINIO_PORT}",
-    admin_user=settings.MINIO_ACCESS_KEY,
-    admin_password=settings.MINIO_SECRET_KEY
-  )
-  if not success:
-    raise CustomException(ErrorDesc.MINIO_ALIAS_FAILED, res)
-  logger.info(f"Minio Alias Created: {region_name}.")
-
-  # 4. 创建 Minio 服务数据
+  # 3. 创建 Minio 服务数据
   minio_server_obj = await storage_crud.read_minio_server_by_region(region_obj)
   if not minio_server_obj:
     minio_server_obj = await storage_crud.create_minio_server(
@@ -98,3 +87,15 @@ async def init_service():
       minio_server_obj.server_port = settings.SERVER_PORT
       await minio_server_obj.save()
   logger.info(f"Minio Server Created: {region_name}.")
+  
+  # 4. 创建别名
+  success, res = await minio_op.set_site_alias(
+    site_name=region_name,
+    endpoint=f"{settings.MINIO_HOST}:{settings.MINIO_PORT}",
+    admin_user=settings.MINIO_ACCESS_KEY,
+    admin_password=settings.MINIO_SECRET_KEY
+  )
+  if not success:
+    raise CustomException(ErrorDesc.MINIO_ALIAS_FAILED, res)
+  logger.info(f"Minio Alias Created: {region_name}.")
+  

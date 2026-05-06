@@ -8,7 +8,7 @@ from beanie.operators import Set, In
 from src.modules.auth.model import User
 from src.utils.helpers import try_to_obj_id, utc_now
 from src.core.exception import CustomException, ErrorDesc
-from src.modules.public.model import Region, Application, APIKey, APIKeyUsage, SystemConfig
+from src.modules.public.model import Region, Application, APIKey, APIKeyUsage, SystemConfig, ShellCommandLog
 
 async def get_document_fields(model: Type[Document]) -> list[str]:
   """
@@ -305,3 +305,20 @@ async def update_system_config_by_key(key: str, value: str | int | float | bool)
   system_config.value = str(value)
   await system_config.save()
   return True
+
+async def create_shell_command_log(
+  command: str,
+  stdout: str = "",
+  stderr: str = "") -> ShellCommandLog:
+  """
+  创建Shell命令日志
+  """
+  if command == "mc alias list --json":
+    return None
+  shell_command_log = ShellCommandLog(
+    command=command,
+    stdout=stdout,
+    stderr=stderr
+  )
+  await shell_command_log.save()
+  return shell_command_log

@@ -39,11 +39,21 @@ async def get_minio_server_list() -> storage_schema.MinioServerListResponse:
   return await storage_service.get_minio_server_list()
 
 @router.get(
-  path="/{minio_server_id}/buckets",
-  response_model=storage_schema.BucketsResponse,
+  path="/buckets",
+  # response_model=storage_schema.BucketsResponse,
   summary="获取存储桶列表")
-async def get_buckets(minio_server_id: public_schema.PydanticObjectId):# -> storage_schema.BucketsResponse:
+async def get_buckets() :# -> storage_schema.BucketsResponse
   """
   获取存储桶列表
   """
-  return await storage_service.get_buckets(minio_server_id)
+  return await storage_service.get_buckets()
+
+@router.get(
+  path="/{minio_server_id}/details",
+  response_model=storage_schema.ServerDetailsResponse,
+  summary="获取服务器文件详情")
+async def get_buckets(minio_server_id: public_schema.PydanticObjectId):# -> storage_schema.BucketsResponse:
+  """
+  获取服务器文件详情
+  """
+  return await storage_service.get_server_details(minio_server_id)

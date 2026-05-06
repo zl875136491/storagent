@@ -1,9 +1,11 @@
 import json
 import subprocess
 from minio import Minio
+from typing import List
 
 from src.core.exception import CustomException, ErrorDesc
 from src.utils.helpers import build_file_tree
+from src.modules.public.crud import create_shell_command_log
 
 async def _run_cmd(cmd):
   """
@@ -23,9 +25,11 @@ async def _run_cmd(cmd):
       cmd, shell=True, check=True, 
       capture_output=True, text=True
     )
+    await create_shell_command_log(cmd, result.stdout, result.stderr)
     return True, result.stdout
   except subprocess.CalledProcessError as e:
-      return False, e.stderr
+    await create_shell_command_log(cmd, "", e.stderr)
+    return False, e.stderr
 
 def get_minio_client(host: str, port: int, access_key: str, secret_key: str) -> Minio:
   """
@@ -128,6 +132,27 @@ async def get_buckets_info(client: Minio):
     })
   return results
 
+async def get_site_alias():
+  """
+  获取站点别名
+  
+  Args:
+    site_name: 站点名称
+  """
+  data = {}
+  alias_cmd = f"mc alias list --json"
+  success, output = await _run_cmd(alias_cmd)
+  if success:
+    lines = [line.strip() for line in output.split('\n') if line.strip()]
+    for line in lines:
+      try:
+        alias_item = json.loads(line)
+        alias_name = alias_item["alias"]
+        data[alias_name] = alias_item
+      except json.JSONDecodeError:
+        continue
+  return data
+
 async def set_site_alias(site_name, endpoint, admin_user, admin_password):
   """
   设置站点别名
@@ -205,3 +230,43 @@ async def get_site_replication_status(master):
   if success:
       return json.loads(output)
   return None
+
+async def get_server_buckets(server_name: str) -> List[str]:
+  """
+  获取存储桶列表
+  
+  Args:
+    server_name: 服务器名称
+
+  Returns:
+    List[str]: 存储桶列表
+  """
+  data = []
+  cmd = f"mc ls {server_name} --json"
+  success, output = await _run_cmd(cmd)
+  if success:
+    lines = [line.strip() for line in output.split('\n') if line.strip()]
+    for line in lines:
+      try:
+        bucket_item = json.loads(line)
+        if "key" in bucket_item:
+          data.append(bucket_item["key"].rsplit("/", 1)[0])
+        else:
+          continue
+      except json.JSONDecodeError:
+        continue
+  return data
+
+async def enable_bucket_versioning(server_name: str, bucket_name: str):
+  """
+  开启存储桶版本控制
+  
+  Args:
+    server_name: 服务器名称
+    bucket_name: 存储桶名称
+  """
+  cmd = f"mc version enable {server_name}/{bucket_name}"
+  success, _ = await _run_cmd(cmd)
+  if not success:
+    return False, f"开启版本控制失败:{str(_)}"
+  return True, "开启版本控制成功"
