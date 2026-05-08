@@ -2,6 +2,7 @@ from typing import List
 from bson import ObjectId
 from datetime import datetime, timedelta
 from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 
 from src.modules.auth.model import User
 from src.modules.public.model import Region
@@ -128,11 +129,17 @@ async def enable_application(
   application_obj.enabled_at = utc_now()
   application_obj.approver = current_user
   # 批量创建 Minio 存储桶数据
+  errors = {}
   server_names = await storage_crud.read_minio_server_names()
   for server_name in server_names:
+    existed = await minio_op.check_server_bucket_existed(server_name, application_obj.name)
+    if existed:
+      continue
     success, err = await minio_op.create_bucket(server_name, application_obj.name)
     if not success:
-      raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, err)
+      errors[server_name] = err
+  if errors:
+    raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, errors)
   # 批量开启桶的版本控制
   for server_name in server_names:
     success, err = await minio_op.enable_bucket_versioning(server_name, application_obj.name)

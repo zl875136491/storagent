@@ -79,6 +79,15 @@ def test_minio_server(host: str, port: int, access_key: str, secret_key: str):
   except Exception as e:
     raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
 
+async def check_server_bucket_existed(server_name: str, bucket_name: str) -> bool:
+  """
+  检查存储桶是否存在
+  """
+  success, output = await _run_cmd(f"mc ls {server_name}/{bucket_name} --json")
+  if not success:
+    return False
+  return True
+
 async def create_bucket(server_name: str, bucket_name: str):
   """
   创建存储桶
@@ -95,6 +104,7 @@ async def create_bucket(server_name: str, bucket_name: str):
   # except Exception as e:
   #   raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
   success, err = await _run_cmd(f"mc mb {server_name}/{bucket_name}")
+  return success, err
   if not success:
     raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, str(err))
 
@@ -270,3 +280,6 @@ async def enable_bucket_versioning(server_name: str, bucket_name: str):
   if not success:
     return False, f"开启版本控制失败:{str(_)}"
   return True, "开启版本控制成功"
+
+async def connect_buckets(from_server: str, to_server: str, bucket_name: str):
+  pass
