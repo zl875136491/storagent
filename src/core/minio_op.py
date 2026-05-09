@@ -281,5 +281,42 @@ async def enable_bucket_versioning(server_name: str, bucket_name: str):
     return False, f"开启版本控制失败:{str(_)}"
   return True, "开启版本控制成功"
 
-async def connect_buckets(from_server: str, to_server: str, bucket_name: str):
-  pass
+async def create_bucket_replicate(from_server: str, to_server: str, bucket_name: str):
+  """
+  创建存储桶复制
+  
+  Args:
+    from_server: 源服务器名称
+    to_server: 目标服务器名称
+    bucket_name: 存储桶名称
+  """
+  replicate_cmd = f"mc replicate add {from_server}/{bucket_name} --remote-bucket {to_server}/{bucket_name}"
+  replicate_args = " --replicate \"delete,delete-marker,existing-objects\""
+  cmd = replicate_cmd + replicate_args
+  success, err = await _run_cmd(cmd)
+  if not success:
+    return False, f"创建复制失败:{str(err)}"
+  return True, "创建复制成功"
+
+async def get_bucket_replicate_status(server_name: str, bucket_name: str):
+  """
+  获取存储桶复制状态
+  
+  Args:
+    server_name: 服务器名称
+    bucket_name: 存储桶名称
+  """
+  cmd = f"mc replicate ls {server_name}/{bucket_name} --json"
+  success, output = await _run_cmd(cmd)
+  if success:
+    return json.loads(output)
+  return None
+
+async def get_remote_bucket_endpoint(server: str, bucket: str):
+  success, output = await _run_cmd(f"mc replicate ls {server}/{bucket}")
+  if success:
+    for line in output.splitlines():
+      if "Remote Bucket:" in line:
+        # 使用 strip 移除两端空格，split 分割后取最后一部分
+        return line.split("Remote Bucket:")[-1].strip()
+  return None

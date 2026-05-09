@@ -3,6 +3,8 @@ from src.core.auth import get_current_user, check_permissions
 from src.modules.auth.model import User
 from src.modules.public import service as public_service
 from src.modules.public import schema as public_schema
+from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 
 router = APIRouter()
 
@@ -23,7 +25,10 @@ async def test_endpoints():
   """
   测试端点
   """
-  return await public_service.test_endpoints()
+  return Response(
+    content=await public_service.test_endpoints(),
+    media_type="application/octet-stream"
+  )
     
 @router.post(
   path="/region",
@@ -92,16 +97,23 @@ async def get_application_list() -> public_schema.ApplicationListResponse:
 
 @router.post(
   path="/application/{application_id}/approval",
-  response_model=public_schema.SimpleMessageResponse,
-  summary="授权应用")
+  summary="授权应用（SSE 进度）")
 async def approval_application(
   application_id: public_schema.PydanticObjectId,
-  current_user: User = Depends(get_current_user)) -> public_schema.SimpleMessageResponse:
+  current_user: User = Depends(get_current_user)):
   """
-  授权应用
+  授权应用；响应为 text/event-stream，每条事件为 JSON（含 step、status、message 等）。
   """
   await check_permissions(current_user, ["application_manage"])
-  return await public_service.enable_application(application_id, current_user)
+  return StreamingResponse(
+    public_service.enable_application(application_id, current_user),
+    media_type="text/event-stream",
+    headers={
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  )
 
 @router.get(
   path="/application/enabled",

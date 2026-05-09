@@ -1,8 +1,12 @@
+import json
+import logging
+from collections.abc import AsyncGenerator
 from typing import List
+
 from bson import ObjectId
 from datetime import datetime, timedelta
-from fastapi.responses import Response
-from fastapi.responses import StreamingResponse
+
+logger = logging.getLogger(__name__)
 
 from src.modules.auth.model import User
 from src.modules.public.model import Region
@@ -39,13 +43,13 @@ async def get_endpoints() -> dict[str, List[str]]:
     })
   return dict[str, List[dict]](data=data)
 
-async def test_endpoints():
+async def test_endpoints() -> bytes:
   """
   测试端点
   """
   # 返回一个 512 Byte 的文件流
   file_content = b"Storagent" * 56
-  return Response(content=file_content, media_type="application/octet-stream")
+  return file_content
 
 async def _validate_application_name(name: str) -> None:
   """
@@ -114,40 +118,207 @@ async def get_application_list() -> dict[str, List[Application]]:
   application_objs = await public_crud.read_application_list()
   return dict[str, List[Application]](data=application_objs)
 
+def _sse_line(payload: dict) -> bytes:
+  return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
 async def enable_application(
   application_id: ObjectId,
-  current_user: User) -> Application:
+  current_user: User) -> AsyncGenerator[bytes, None]:
   """
-  启用应用
+  启用应用（SSE 流式进度：按 MinIO 服务器逐步处理桶，最终成功或失败并结束连接）
   """
+
+  async def _emit(payload: dict) -> AsyncGenerator[bytes, None]:
+    logger.info(
+      "enable_application SSE step=%s status=%s server=%s msg=%s",
+      payload.get("step"),
+      payload.get("status"),
+      payload.get("server_name"),
+      payload.get("message"),
+    )
+    yield _sse_line(payload)
+
   application_obj = await public_crud.read_application_by_id(application_id)
   if not application_obj:
-    raise CustomException(ErrorDesc.RES_NOT_FOUND, "Application.id")
+    msg = "应用不存在，无法授权"
+    async for chunk in _emit({
+      "step": "validate",
+      "server_name": None,
+      "status": "failed",
+      "message": msg,
+    }):
+      yield chunk
+    async for chunk in _emit({
+      "step": "done",
+      "server_name": None,
+      "status": "failed",
+      "message": "授权失败",
+    }):
+      yield chunk
+    return
   if application_obj.enabled:
-    raise CustomException(ErrorDesc.RES_ALREADY_EXISTS, "Application.enabled")
+    msg = "应用已启用，无需重复授权"
+    async for chunk in _emit({
+      "step": "validate",
+      "server_name": None,
+      "status": "failed",
+      "message": msg,
+    }):
+      yield chunk
+    async for chunk in _emit({
+      "step": "done",
+      "server_name": None,
+      "status": "failed",
+      "message": "授权失败",
+    }):
+      yield chunk
+    return
+
+  async for chunk in _emit({
+    "step": "start",
+    "server_name": None,
+    "status": "running",
+    "message": "开始授权流程",
+  }):
+    yield chunk
+
   application_obj.enabled = True
   application_obj.enabled_at = utc_now()
   application_obj.approver = current_user
-  # 批量创建 Minio 存储桶数据
-  errors = {}
+
   server_names = await storage_crud.read_minio_server_names()
+  async for chunk in _emit({
+    "step": "bucket_phase",
+    "server_name": None,
+    "status": "running",
+    "message": f"共 {len(server_names)} 台 MinIO 服务器待处理桶: {application_obj.name}",
+  }):
+    yield chunk
+
+  # 逐个创建桶
+  errors: dict[str, str] = {}
   for server_name in server_names:
+    async for chunk in _emit({
+      "step": "bucket_check",
+      "server_name": server_name,
+      "status": "running",
+      "message": f"检查服务器 {server_name} 上桶是否存在",
+    }):
+      yield chunk
     existed = await minio_op.check_server_bucket_existed(server_name, application_obj.name)
     if existed:
+      async for chunk in _emit({
+        "step": "bucket_check",
+        "server_name": server_name,
+        "status": "skipped",
+        "message": f"服务器 {server_name} 上桶已存在，跳过创建",
+      }):
+        yield chunk
       continue
+    async for chunk in _emit({
+      "step": "bucket_create",
+      "server_name": server_name,
+      "status": "running",
+      "message": f"在服务器 {server_name} 上创建桶",
+    }):
+      yield chunk
     success, err = await minio_op.create_bucket(server_name, application_obj.name)
     if not success:
       errors[server_name] = err
+      async for chunk in _emit({
+        "step": "bucket_create",
+        "server_name": server_name,
+        "status": "failed",
+        "message": f"服务器 {server_name} 创建桶失败: {err}",
+      }):
+        yield chunk
+    else:
+      async for chunk in _emit({
+        "step": "bucket_create",
+        "server_name": server_name,
+        "status": "ok",
+        "message": f"服务器 {server_name} 创建桶成功",
+      }):
+        yield chunk
+
+  # 如果部分服务器创建桶失败，则终止授权
   if errors:
-    raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, errors)
-  # 批量开启桶的版本控制
+    async for chunk in _emit({
+      "step": "bucket_create",
+      "server_name": None,
+      "status": "failed",
+      "message": "部分服务器创建桶失败，终止授权",
+      "detail": errors,
+    }):
+      yield chunk
+    async for chunk in _emit({
+      "step": "done",
+      "server_name": None,
+      "status": "failed",
+      "message": "授权失败",
+    }):
+      yield chunk
+    return
+
+  # 逐个开启桶版本控制
   for server_name in server_names:
+    async for chunk in _emit({
+      "step": "bucket_versioning",
+      "server_name": server_name,
+      "status": "running",
+      "message": f"在服务器 {server_name} 上开启桶版本控制",
+    }):
+      yield chunk
     success, err = await minio_op.enable_bucket_versioning(server_name, application_obj.name)
     if not success:
-      raise CustomException(ErrorDesc.MINIO_ENABLE_VERSIONING_FAILED, err)
-  # await storage_crud.bulk_create_minio_bucket(application_obj)
+      async for chunk in _emit({
+        "step": "bucket_versioning",
+        "server_name": server_name,
+        "status": "failed",
+        "message": f"服务器 {server_name} 开启版本控制失败: {err}",
+      }):
+        yield chunk
+      async for chunk in _emit({
+        "step": "done",
+        "server_name": None,
+        "status": "failed",
+        "message": "授权失败",
+      }):
+        yield chunk
+      return
+    async for chunk in _emit({
+      "step": "bucket_versioning",
+      "server_name": server_name,
+      "status": "ok",
+      "message": f"服务器 {server_name} 开启版本控制成功",
+    }):
+      yield chunk
+      
+  # 更改应用启用状态
+  async for chunk in _emit({
+    "step": "persist",
+    "server_name": None,
+    "status": "running",
+    "message": "保存应用启用状态",
+  }):
+    yield chunk
   await application_obj.save()
-  return dict[str, str](message="启用授权成功")
+  async for chunk in _emit({
+    "step": "persist",
+    "server_name": None,
+    "status": "ok",
+    "message": "应用状态已保存",
+  }):
+    yield chunk
+
+  async for chunk in _emit({
+    "step": "done",
+    "server_name": None,
+    "status": "success",
+    "message": "授权成功",
+  }):
+    yield chunk
 
 async def get_users_enabled_application_list(
   current_user: User) -> List[Application]:
