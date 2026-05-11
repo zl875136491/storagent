@@ -13,7 +13,9 @@ from src.core.minio_op import (
   remove_site_alias,
   get_buckets_info,
   get_minio_client,
-  get_server_buckets
+  get_server_buckets,
+  get_bucket_replicate_status,
+  get_remote_bucket_endpoint
 )
 
 async def _connect_minio_server(
@@ -157,3 +159,32 @@ async def get_server_details(minio_server: ObjectId) -> List[str]:
   )
   buckets = await get_buckets_info(minio_client)
   return dict[str, list](data=buckets)
+
+async def get_bucket_replicate_infos() -> List[dict]:
+  """
+  获取存储桶复制信息
+  """
+  server_names = await storage_crud.read_minio_server_names()
+  bucket_names = []
+  for server_name in server_names:
+    buckets = await get_server_buckets(server_name)
+    for bucket_name in buckets:
+      if bucket_name not in bucket_names:
+        bucket_names.append(bucket_name)
+  info_mash = {}
+  bucket_names.sort()
+  for bucket_name in bucket_names:
+    info_mash[bucket_name] = {
+      "name": bucket_name,
+      "replicates": []
+    }      
+  for bucket_name in bucket_names:
+    for server_name in server_names:
+      to_server_names = await get_remote_bucket_endpoint(server_name, bucket_name)
+      for to_server_name in to_server_names:
+        info_mash[bucket_name]["replicates"].append({
+          "from": server_name,
+          "to": to_server_name,
+          "status": "N/A"
+        })
+  return list(info_mash.values())

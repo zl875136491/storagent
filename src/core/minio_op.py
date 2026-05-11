@@ -314,9 +314,10 @@ async def get_bucket_replicate_status(server_name: str, bucket_name: str):
 
 async def get_remote_bucket_endpoint(server: str, bucket: str):
   success, output = await _run_cmd(f"mc replicate ls {server}/{bucket}")
+  results = []
   if success:
     for line in output.splitlines():
       if "Remote Bucket:" in line:
         # 使用 strip 移除两端空格，split 分割后取最后一部分
-        return line.split("Remote Bucket:")[-1].strip()
-  return None
+        results.append(line.split("Remote Bucket:")[-1].strip().rstrip("/"+bucket))
+  return results

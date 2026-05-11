@@ -5,6 +5,7 @@ from typing import List
 
 from bson import ObjectId
 from datetime import datetime, timedelta
+from os import urandom
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,8 @@ async def test_endpoints() -> bytes:
   测试端点
   """
   # 返回一个 512 Byte 的文件流
-  file_content = b"Storagent" * 56
+  # 使用 随机字符串, 防止缓存
+  file_content: bytes = urandom(512)
   return file_content
 
 async def _validate_application_name(name: str) -> None:
