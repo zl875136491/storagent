@@ -29,6 +29,11 @@ from ..modules.storage.model import (
   MinioBucket,
 )
 
+from ..modules.graph.model import (
+  BucketNodePosition,
+  BucketEdgePosition,
+)
+
 document_models = [
   Region,
   APIKey,
@@ -41,6 +46,8 @@ document_models = [
   MinioEvent,
   MinioServer,
   MinioBucket,
+  BucketNodePosition,
+  BucketEdgePosition,
 ]
 
 
@@ -75,6 +82,8 @@ async def init_db():
     MinioEvent,
     MinioServer,
     MinioBucket,
+    BucketNodePosition,
+    BucketEdgePosition,
   ]
   await init_beanie(
     database=database,

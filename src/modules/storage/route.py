@@ -50,19 +50,20 @@ async def get_buckets(minio_server_id: public_schema.PydanticObjectId):# -> stor
 
 @router.get(
   path="/buckets",
-  # response_model=storage_schema.BucketsResponse,
+  response_model=storage_schema.BucketsResponse,
   summary="获取存储桶列表")
-async def get_buckets() :# -> storage_schema.BucketsResponse
+async def get_buckets() -> storage_schema.BucketsResponse:
   """
   获取存储桶列表
   """
   return await storage_service.get_buckets()
 
 @router.get(
-  path="/buckets/replicates",
+  path="/buckets/{bucket_name}/replicates",
+  # response_model=storage_schema.BucketReplicateResponse,
   summary="获取存储桶复制信息")
-async def get_bucket_replicate_infos():
+async def get_bucket_replicate_infos(bucket_name: str):
   """
   获取存储桶复制信息
   """
-  return await storage_service.get_bucket_replicate_infos()
+  return await storage_service.get_bucket_replicate_infos(bucket_name)

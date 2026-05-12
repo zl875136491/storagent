@@ -6,6 +6,7 @@ from src.core.exception import CustomException, ErrorDesc
 from src.modules.public import crud as public_crud
 from src.modules.storage import crud as storage_crud
 from src.modules.storage.model import MinioServer
+from src.modules.graph import crud as graph_crud
 from src.core.minio_op import (
   test_minio_server,
   set_site_alias,
@@ -15,7 +16,8 @@ from src.core.minio_op import (
   get_minio_client,
   get_server_buckets,
   get_bucket_replicate_status,
-  get_remote_bucket_endpoint
+  get_bucket_replicate_info,
+  get_site_alias
 )
 
 async def _connect_minio_server(
@@ -160,31 +162,86 @@ async def get_server_details(minio_server: ObjectId) -> List[str]:
   buckets = await get_buckets_info(minio_client)
   return dict[str, list](data=buckets)
 
-async def get_bucket_replicate_infos() -> List[dict]:
+async def format_replicate_status(status: dict) -> str:
+  """
+  格式化复制状态
+  """
+  data = {}
+  if "status" in status:
+    data["status"] = status["status"]
+  if "rule" in status:
+    if "Priority" in status["rule"]:
+      data["priority"] = status["rule"]["Priority"]
+    if "DeleteMarkerReplication" in status["rule"]:
+      data["delete_marker_replication"] = status["rule"]["DeleteMarkerReplication"]["Status"]
+    if "ExistingObjectReplication" in status["rule"]:
+      data["existing_object_replication"] = status["rule"]["ExistingObjectReplication"]["Status"]
+    if "SourceSelectionCriteria" in status["rule"]:
+      if "ReplicaModifications" in status["rule"]["SourceSelectionCriteria"]:
+        data["source_selection_criteria"] = status["rule"]["SourceSelectionCriteria"]["ReplicaModifications"]["Status"]
+  return data
+
+async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
   """
   获取存储桶复制信息
   """
+  replicates = []
+  alias_datas = await get_site_alias()
+  # 获取服务器别名与服务器地址的映射关系
+  # 因为 mc replicate ls 命令返回的是服务器地址, 而不是服务器别名
+  mappings = {}
+  for alias_name, alias_data in alias_datas.items():
+    url = alias_data["URL"].split("://")[1]
+    mappings[url] = alias_name
   server_names = await storage_crud.read_minio_server_names()
-  bucket_names = []
+  # 获取拓扑图的边和节点的位置信息
+  nodes = {}
+  edges = {}
+  node_objs = await graph_crud.read_many_bucket_node_positions(bucket_name)
+  edge_objs = await graph_crud.read_many_bucket_edge_positions(bucket_name)
+  for node_item in node_objs:
+    nodes[node_item.server] = {
+      "position_x": node_item.position_x,
+      "position_y": node_item.position_y
+    }
   for server_name in server_names:
-    buckets = await get_server_buckets(server_name)
-    for bucket_name in buckets:
-      if bucket_name not in bucket_names:
-        bucket_names.append(bucket_name)
-  info_mash = {}
-  bucket_names.sort()
-  for bucket_name in bucket_names:
-    info_mash[bucket_name] = {
-      "name": bucket_name,
-      "replicates": []
-    }      
-  for bucket_name in bucket_names:
-    for server_name in server_names:
-      to_server_names = await get_remote_bucket_endpoint(server_name, bucket_name)
-      for to_server_name in to_server_names:
-        info_mash[bucket_name]["replicates"].append({
-          "from": server_name,
-          "to": to_server_name,
-          "status": "N/A"
-        })
-  return list(info_mash.values())
+    if server_name not in nodes.keys():
+      nodes[server_name] = {
+        "position_x": 0,
+        "position_y": 0
+      }
+  for edge_item in edge_objs:
+    from_server = edge_item.from_server
+    to_server = edge_item.to_server
+    from_position = edge_item.from_position
+    to_position = edge_item.to_position
+    temp_id = f"{from_server}-{to_server}"
+    edges[temp_id] = {
+      "from_position": from_position,
+      "to_position": to_position
+    } 
+  for server_name in server_names:
+    to_server_endpoints = await get_bucket_replicate_info(server_name, bucket_name)
+    status_infos = await get_bucket_replicate_status(server_name, bucket_name)
+    if not to_server_endpoints:
+      continue
+    for endpoint in to_server_endpoints.keys():
+      to_server_name = mappings[endpoint]
+      rule_id = to_server_endpoints[endpoint]
+      status_info = await format_replicate_status(status_infos[rule_id])
+      temp_id = f"{server_name}-{to_server_name}"
+      if temp_id in edges:
+        from_position = edges[temp_id]["from_position"]
+        to_position = edges[temp_id]["to_position"]
+      else:
+        from_position = "up"
+        to_position = "down"
+      replicates.append({
+        "from": server_name,
+        "from_position": from_position,
+        "to": to_server_name,
+        "to_position": to_position,
+        "status": status_info,
+        "rule_id": rule_id
+      })
+  return dict(servers=nodes, replicates=replicates)

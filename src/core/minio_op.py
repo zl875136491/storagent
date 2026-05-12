@@ -1,7 +1,7 @@
 import json
 import subprocess
 from minio import Minio
-from typing import List
+from typing import Any, List
 
 from src.core.exception import CustomException, ErrorDesc
 from src.utils.helpers import build_file_tree
@@ -308,16 +308,33 @@ async def get_bucket_replicate_status(server_name: str, bucket_name: str):
   """
   cmd = f"mc replicate ls {server_name}/{bucket_name} --json"
   success, output = await _run_cmd(cmd)
+  data = {}
   if success:
-    return json.loads(output)
-  return None
+    lines = [line.strip() for line in output.split('\n') if line.strip()]
+    for line in lines:
+      try:
+        status_item = json.loads(line)
+        data[status_item["rule"]["ID"]] = status_item
+      except json.JSONDecodeError:
+        continue
+  return data
 
-async def get_remote_bucket_endpoint(server: str, bucket: str):
+async def get_bucket_replicate_info(server: str, bucket: str):
   success, output = await _run_cmd(f"mc replicate ls {server}/{bucket}")
-  results = []
+  endpoints = []
+  rule_ids = []
   if success:
     for line in output.splitlines():
       if "Remote Bucket:" in line:
         # 使用 strip 移除两端空格，split 分割后取最后一部分
-        results.append(line.split("Remote Bucket:")[-1].strip().rstrip("/"+bucket))
-  return results
+        bucket_endpoint = line.split("Remote Bucket:")[-1].strip().rstrip("/"+bucket)
+        endpoints.append(bucket_endpoint)
+      if "Rule ID:" in line:
+        rule_id = line.split("Rule ID:")[-1].strip()
+        rule_ids.append(rule_id)
+  data = {}
+  if len(endpoints) != len(rule_ids):
+    return None
+  for i in range(len(endpoints)):
+    data[endpoints[i]] = rule_ids[i]
+  return data
