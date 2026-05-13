@@ -106,6 +106,25 @@ async def create_minio_server(
   )
   return minio_server_obj
 
+async def update_minio_server(
+  minio_server_id: ObjectId,
+  replicate_weight: int) -> MinioServer:
+  """
+  更新 Minio 服务器
+  """
+  minio_server_obj = await storage_crud.read_minio_server_by_id(minio_server_id)
+  if not minio_server_obj:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
+  return await storage_crud.update_minio_server(
+    minio_server_obj,
+    host=minio_server_obj.host,
+    server_port=minio_server_obj.server_port,
+    minio_port=minio_server_obj.minio_port,
+    access_key=minio_server_obj.access_key,
+    secret_key=minio_server_obj.secret_key,
+    replicate_weight=replicate_weight
+  )
+
 async def get_minio_server_list() -> dict[str, List[MinioServer]]:
   """
   获取 Minio 服务器列表

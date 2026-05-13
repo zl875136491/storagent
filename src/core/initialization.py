@@ -61,7 +61,8 @@ async def init_service():
     "server_port": settings.SERVER_PORT,
     "minio_port": settings.MINIO_PORT,
     "access_key": settings.MINIO_ACCESS_KEY,
-    "secret_key": settings.MINIO_SECRET_KEY
+    "secret_key": settings.MINIO_SECRET_KEY,
+    "replicate_weight": settings.MINIO_REPLICATE_WEIGHT
   }
   servers_data[region_value] = this_server_data
   await etcd_op.push_to_etcd("servers", servers_data, client=etcd_client)
@@ -72,7 +73,8 @@ async def init_service():
       "server_port" not in server_data,
       "minio_port" not in server_data,
       "access_key" not in server_data,
-      "secret_key" not in server_data
+      "secret_key" not in server_data,
+      "replicate_weight" not in server_data
     ]):
       # 非有效数据, 跳过
       continue
@@ -89,7 +91,8 @@ async def init_service():
           server_port=server_data["server_port"],
           minio_port=server_data["minio_port"],
           access_key=server_data["access_key"],
-          secret_key=server_data["secret_key"]
+          secret_key=server_data["secret_key"],
+          replicate_weight=server_data["replicate_weight"]
         )
       else:
         await storage_crud.update_minio_server(
@@ -98,7 +101,8 @@ async def init_service():
           server_port=server_data["server_port"],
           minio_port=server_data["minio_port"],
           access_key=server_data["access_key"],
-          secret_key=server_data["secret_key"]
+          secret_key=server_data["secret_key"],
+          replicate_weight=server_data["replicate_weight"]
         )  
   
   # 5. 创建别名
@@ -107,7 +111,8 @@ async def init_service():
       "server_port" not in server_data,
       "minio_port" not in server_data,
       "access_key" not in server_data,
-      "secret_key" not in server_data
+      "secret_key" not in server_data,
+      "replicate_weight" not in server_data
     ]):
       # 非有效数据, 跳过
       continue

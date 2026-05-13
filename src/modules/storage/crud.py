@@ -16,7 +16,8 @@ async def create_minio_server(
   server_port: int,
   minio_port: int,
   access_key: str,
-  secret_key: str) -> MinioServer:
+  secret_key: str,
+  replicate_weight: int) -> MinioServer:
   """
   创建 Minio 服务器
 
@@ -28,6 +29,7 @@ async def create_minio_server(
     minio_port: Minio 端口
     access_key: 访问密钥
     secret_key: 密钥
+    replicate_weight: 复制集权重
 
   Returns:
     MinioServer: Minio 服务器
@@ -44,7 +46,8 @@ async def create_minio_server(
     minio_port=minio_port,
     master=master,
     access_key=access_key,
-    secret_key=secret_key
+    secret_key=secret_key,
+    replicate_weight=replicate_weight
   )
   await minio_server.save()
   return minio_server
@@ -55,7 +58,8 @@ async def update_minio_server(
   server_port: int,
   minio_port: int,
   access_key: str,
-  secret_key: str) -> MinioServer:
+  secret_key: str,
+  replicate_weight: int) -> MinioServer:
   """
   更新 Minio 服务器
   """
@@ -64,6 +68,7 @@ async def update_minio_server(
   minio_server.minio_port = minio_port
   minio_server.access_key = access_key
   minio_server.secret_key = secret_key
+  minio_server.replicate_weight = replicate_weight
   await minio_server.save()
   return minio_server
 

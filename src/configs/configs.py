@@ -52,6 +52,7 @@ class Settings(BaseSettings):
   MINIO_PORT: int = 9000
   MINIO_ACCESS_KEY: str = "admin"
   MINIO_SECRET_KEY: str = "passwd"
+  MINIO_REPLICATE_WEIGHT: int = 0
   
   # # Redis 
   # REDIS_HOST: str = "localhost"

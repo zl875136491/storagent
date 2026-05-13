@@ -17,6 +17,7 @@ class MinioServer(Document):
   access_key: str = Field(default="")
   secret_key: str = Field(default="")
   master: bool = Field(default=False)
+  replicate_weight: int = Field(default=0, description="复制集权重")
   
   class Settings:
     name = "minio_server"
