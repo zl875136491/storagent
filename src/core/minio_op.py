@@ -281,7 +281,11 @@ async def enable_bucket_versioning(server_name: str, bucket_name: str):
     return False, f"开启版本控制失败:{str(_)}"
   return True, "开启版本控制成功"
 
-async def create_bucket_replicate(from_server: str, to_server: str, bucket_name: str):
+async def create_bucket_replicate(
+  from_server: str,
+  to_server: str,
+  bucket_name: str,
+  priority: int):
   """
   创建存储桶复制
   
@@ -289,9 +293,10 @@ async def create_bucket_replicate(from_server: str, to_server: str, bucket_name:
     from_server: 源服务器名称
     to_server: 目标服务器名称
     bucket_name: 存储桶名称
+    priority: 优先级
   """
   replicate_cmd = f"mc replicate add {from_server}/{bucket_name} --remote-bucket {to_server}/{bucket_name}"
-  replicate_args = " --replicate \"delete,delete-marker,existing-objects\""
+  replicate_args = f" --replicate \"delete,delete-marker,existing-objects\" --priority {priority}"
   cmd = replicate_cmd + replicate_args
   success, err = await _run_cmd(cmd)
   if not success:

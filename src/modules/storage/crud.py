@@ -119,6 +119,18 @@ async def read_minio_server_names() -> List[str]:
     server_names.append(server_name)
   return server_names
 
+async def read_minio_server_priorities() -> List[int]:
+  """
+  获取 Minio 服务器优先级列表
+  """
+  server_priorities = {}
+  server_objs = await read_minio_server_list()
+  for server_obj in server_objs:
+    server_name = server_obj.name
+    server_priority = server_obj.replicate_weight
+    server_priorities[server_name] = server_priority
+  return server_priorities
+
 async def create_minio_bucket(
   region: Region,
   app: Application,

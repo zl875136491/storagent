@@ -30,7 +30,7 @@ router = APIRouter()
 #     replicate_weight=replicate_weight
 #   )
 
-@router.put(
+@router.post(
   path="/minio-server/{minio_server_id}",
   response_model=storage_schema.MinioServerResponse,
   summary="更新 Minio 服务器")
@@ -40,9 +40,10 @@ async def update_minio_server(
   """
   更新 Minio 服务器
   """
+  replicate_weight = payload.replicate_weight
   return await storage_service.update_minio_server(
     minio_server_id=minio_server_id,
-    payload=payload
+    replicate_weight=replicate_weight
   )
 
 @router.get(

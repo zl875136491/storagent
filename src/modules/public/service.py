@@ -190,6 +190,8 @@ async def enable_application(
   application_obj.approver = current_user
 
   server_names = await storage_crud.read_minio_server_names()
+  server_priorities = await storage_crud.read_minio_server_priorities()
+  print(server_priorities)
   async for chunk in _emit({
     "step": "bucket_phase",
     "server_name": None,
@@ -199,7 +201,7 @@ async def enable_application(
     yield chunk
 
   # 逐个创建桶
-  errors: dict[str, str] = {}
+  bucket_create_errors: dict[str, str] = {}
   for server_name in server_names:
     async for chunk in _emit({
       "step": "bucket_check",
@@ -227,7 +229,7 @@ async def enable_application(
       yield chunk
     success, err = await minio_op.create_bucket(server_name, application_obj.name)
     if not success:
-      errors[server_name] = err
+      bucket_create_errors[server_name] = err
       async for chunk in _emit({
         "step": "bucket_create",
         "server_name": server_name,
@@ -245,13 +247,13 @@ async def enable_application(
         yield chunk
 
   # 如果部分服务器创建桶失败，则终止授权
-  if errors:
+  if bucket_create_errors:
     async for chunk in _emit({
       "step": "bucket_create",
       "server_name": None,
       "status": "failed",
       "message": "部分服务器创建桶失败，终止授权",
-      "detail": errors,
+      "detail": bucket_create_errors,
     }):
       yield chunk
     async for chunk in _emit({
@@ -296,7 +298,58 @@ async def enable_application(
       "message": f"服务器 {server_name} 开启版本控制成功",
     }):
       yield chunk
-      
+
+  # 为成对的 server 创建桶复制连接
+  replicate_errors: dict[str, str] = {}
+  for from_server_name in server_names:
+    for to_server_name in server_names:
+      if from_server_name != to_server_name:
+        async for chunk in _emit({
+          "step": "bucket_replicate",
+          "server_name": from_server_name,
+          "status": "running",
+          "message": f"在服务器 {from_server_name} -> {to_server_name} 上创建桶复制连接",
+        }):
+          yield chunk
+        this_replicate_priority = server_priorities[from_server_name]
+        success, err = await minio_op.create_bucket_replicate(
+          from_server_name,
+          to_server_name,
+          application_obj.name,
+          this_replicate_priority
+        )
+        if not success:
+          replicate_errors[from_server_name] = err
+        else:
+          async for chunk in _emit({
+            "step": "bucket_replicate",
+            "server_name": from_server_name,
+            "status": "ok",
+            "message": f"服务器 {from_server_name} -> {to_server_name} 创建桶复制连接成功",
+          }):
+            yield chunk
+        async for chunk in _emit({
+          "step": "bucket_replicate",
+          "server_name": from_server_name,
+          "status": "ok",
+          "message": f"服务器 {from_server_name} -> {to_server_name} 创建桶复制连接成功",
+        }):
+          yield chunk
+          
+  # 如果部分服务器创建桶复制连接失败，则终止授权
+  if replicate_errors:
+    async for chunk in _emit({
+      "step": "bucket_replicate",
+      "server_name": None,
+      "status": "failed",
+      "message": "部分服务器创建桶复制连接失败，终止授权",
+      "detail": replicate_errors,
+    }):
+      yield chunk
+  print("bucket_create_errors")
+  print(bucket_create_errors)
+  print("replicate_errors")
+  print(replicate_errors)
   # 更改应用启用状态
   async for chunk in _emit({
     "step": "persist",
@@ -305,7 +358,8 @@ async def enable_application(
     "message": "保存应用启用状态",
   }):
     yield chunk
-  await application_obj.save()
+  # 临时屏蔽, 测试用
+  # await application_obj.save()
   async for chunk in _emit({
     "step": "persist",
     "server_name": None,

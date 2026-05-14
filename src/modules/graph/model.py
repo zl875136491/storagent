@@ -33,6 +33,6 @@ class BucketEdgePosition(Document):
   class Settings:
     name = "bucket_edge_position"
     indexes = [
-      IndexModel(["from_server", "to_server"], unique=True),
+      IndexModel(["bucket", "from_server", "to_server"], unique=True),
     ]
   
