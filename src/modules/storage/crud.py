@@ -49,7 +49,11 @@ async def create_minio_server(
     secret_key=secret_key,
     replicate_weight=replicate_weight
   )
-  await minio_server.save()
+  try:
+    await minio_server.save()
+  except Exception as e:
+    logger.error(f"Minio Server Create Failed: {str(e)}")
+    # raise CustomException(ErrorDesc.MINIO_CREATE_SERVER_FAILED, str(e))
   return minio_server
 
 async def update_minio_server(

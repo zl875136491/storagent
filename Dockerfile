@@ -11,4 +11,4 @@ RUN pip install -r requirements.txt -i https://mirrors.tuna.tsinghua.edu.cn/pypi
 
 RUN cp .env.example .env
 
-CMD ["./run_server.sh"]
+CMD ["./storagent.sh", "run"]

@@ -11,11 +11,11 @@ source="https://pypi.tuna.tsinghua.edu.cn/simple"
 
 # 启动项目
 function run() {
-  uvicorn main:app --host 0.0.0.0 --port=$SERVER_PORT --timeout-graceful-shutdown 1 --reload --reload-exclude '*/tests/*'
+  uvicorn main:app --host 0.0.0.0 --port=6783 --timeout-graceful-shutdown 1 --reload --reload-exclude '*/tests/*'
 }
 
 function stop() {
-  fuser -k $SERVER_PORT/tcp
+  fuser -k 6783/tcp
 }
 
 # 安装包

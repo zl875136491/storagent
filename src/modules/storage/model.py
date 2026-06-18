@@ -23,7 +23,7 @@ class MinioServer(Document):
     name = "minio_server"
     indexes = [
       IndexModel(["region"], unique=True),
-      IndexModel(["host", "minio_port"], unique=True),
+      IndexModel(["host", "minio_port", "server_port"], unique=True),
     ]
 
 class MinioBucket(Document):
