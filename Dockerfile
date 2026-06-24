@@ -3,7 +3,6 @@ LABEL org.opencontainers.image.authors="NC_SIT_ZHANGLE"
 
 WORKDIR /app
 COPY . .
-RUN rm .env
 RUN mv runtimes/mc /usr/local/bin/mc
 RUN chmod +x /usr/local/bin/mc
 
