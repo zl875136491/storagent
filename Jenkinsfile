@@ -9,7 +9,7 @@ pipeline {
         // 镜像的标签，使用构建号作为唯一标识
         DOCKER_TAG = "${env.BUILD_NUMBER}"
         // 应用源码目录（Dockerfile 所在路径）
-        APP_DIR = "storagent"
+        // APP_DIR = "storagent"
         // Dockerfile 文件名
         DOCKERFILE_PATH = "Dockerfile"
         // Harbor 地址
@@ -36,10 +36,10 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 script {
-                    dir("${APP_DIR}") {
+                    // dir("${APP_DIR}") {
                         sh "docker build -f ${DOCKERFILE_PATH} -t ${DOCKER_IMAGE}:${DOCKER_TAG} ."
                         sh "docker tag ${DOCKER_IMAGE}:${DOCKER_TAG} ${HARBOR}/${HARBOR_REPO}/${DOCKER_IMAGE}:${DOCKER_TAG}"
-                    }
+                    //}
                 }
             }
         }
