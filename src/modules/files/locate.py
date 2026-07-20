@@ -22,9 +22,14 @@ def _is_object_not_found(exc: Exception) -> bool:
   return "nosuchkey" in msg or "not found" in msg or "does not exist" in msg
 
 
+def _scheme() -> str:
+  scheme = (settings.PUBLIC_SCHEME or "http").strip().lower()
+  return "https" if scheme == "https" else "http"
+
+
 def _build_api_url(host: str, port: int, path: str, params: dict) -> str:
   query = urlencode(params)
-  return f"http://{host}:{port}{path}?{query}"
+  return f"{_scheme()}://{host}:{port}{path}?{query}"
 
 
 def _build_location_item(
@@ -38,30 +43,30 @@ def _build_location_item(
   shown_name = region.shown_name if region else server.name
   download_params = {"object_key": object_key, "offset": offset, "length": length}
   stat_params = {"object_key": object_key}
+  base = f"{_scheme()}://{server.host}:{server.server_port}"
   return files_schema.ObjectLocationItem(
     region=region_name,
     shown_name=shown_name,
     master=server.master,
-    endpoint=f"http://{server.host}:{server.server_port}",
+    endpoint=base,
     stat_url=_build_api_url(server.host, server.server_port, "/api/files/object/stat", stat_params),
     download_url=_build_api_url(server.host, server.server_port, "/api/files/object/download", download_params),
   )
 
 
 async def _stat_on_server(server: MinioServer, bucket: str, object_key: str):
-  """在指定 MinIO 节点上 stat 对象，不存在则返回 None"""
+  """在指定 MinIO 节点上 stat 对象，不存在/超时则返回 None"""
 
   def _do():
     client = get_minio_client(server.host, server.minio_port, server.access_key, server.secret_key)
     return client.stat_object(bucket, object_key)
 
   try:
-    return await asyncio.to_thread(_do)
-  except S3Error as e:
-    if _is_object_not_found(e):
-      return None
-    return None
-  except Exception:
+    return await asyncio.wait_for(
+      asyncio.to_thread(_do),
+      timeout=settings.OBJECT_LOCATE_TIMEOUT,
+    )
+  except (S3Error, asyncio.TimeoutError, Exception):
     return None
 
 

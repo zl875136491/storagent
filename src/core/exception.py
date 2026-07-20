@@ -95,13 +95,14 @@ class ApiResponse(BaseModel, Generic[T]):
 
   msg: str = Field(default="Success", description="响应消息")
   data: Optional[T] = Field(default=None, description="响应数据")
+  code: Optional[int] = Field(default=None, description="业务错误码（成功时可为空）")
     
 class CustomException(HTTPException):
   """
   自定义基础异常类
   """
 
-  def __init__(self, msg: str | ErrorDesc, reason: Optional[str] = None):
+  def __init__(self, msg: str | ErrorDesc, reason: Any = None):
     if isinstance(msg, ErrorDesc):
       self.message = msg.message
       status_code = msg.code // 1000 # 高3位为状态码, 低3位为错误识别码
@@ -119,14 +120,11 @@ class CustomException(HTTPException):
   def __str__(self):
     return self.message + ": " + str(self.reason)
 
-def error_response(msg: str, data: Optional[Any] = None) -> ApiResponse:
+def error_response(msg: str, data: Optional[Any] = None, code: Optional[int] = None) -> dict:
   """
-  生成一个失败的 API 响应
-
-  注意：此函数主要用于在异常处理器中将捕获的异常转换为标准响应格式。
-  在业务代码中，应优先抛出自定义的业务异常 (CustomException)。
+  生成一个失败的 API 响应（含稳定业务 code，便于前端契约解析）
   """
-  return ApiResponse(msg=msg, data=data)
+  return {"msg": msg, "data": data, "code": code}
 
 async def custom_exception_handler(request: Request, exc: CustomException):
   """捕获自定义的业务异常"""
@@ -139,7 +137,7 @@ async def custom_exception_handler(request: Request, exc: CustomException):
   return JSONResponse(
     status_code=exc.status_code,
     content=jsonable_encoder(
-      error_response(msg=exc.message, data=exc.reason)
+      error_response(msg=exc.message, data=exc.reason, code=exc.code)
     ),
   )
 
@@ -192,7 +190,7 @@ async def all_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
       status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
       content=jsonable_encoder(
-        error_response(msg="服务器内部错误", data=error_detail)
+        error_response(msg="服务器内部错误", data=error_detail, code=500001)
       ),
     )
   else:
@@ -204,7 +202,7 @@ async def all_exception_handler(request: Request, exc: Exception):
     }
     return JSONResponse(
       status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-      content=jsonable_encoder(error_response(msg="服务器内部错误", data=error_detail)),
+      content=jsonable_encoder(error_response(msg="服务器内部错误", data=error_detail, code=500001)),
     )
 
 class ExceptionHandlerMiddleware(BaseHTTPMiddleware):
