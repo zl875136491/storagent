@@ -1,4 +1,4 @@
-"""/ready 在数据库未就绪时返回 HTTP 503。"""
+"""/ready 在数据库或 Etcd 未就绪时返回 HTTP 503。"""
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
@@ -23,10 +23,30 @@ def test_ready_503_when_db_not_initialized():
   assert body["reason"] == "database not initialized"
 
 
+def test_ready_503_when_etcd_fails():
+  mock_client = MagicMock()
+  mock_client.admin.command = AsyncMock(return_value={"ok": 1})
+  mock_etcd = MagicMock()
+  mock_etcd.status = AsyncMock(side_effect=RuntimeError("etcd down"))
+  mock_etcd.close = AsyncMock()
+  with patch("src.core.database.get_motor_client", return_value=mock_client), patch(
+    "src.core.etcd_op.get_etcd_client", new=AsyncMock(return_value=mock_etcd)
+  ):
+    client = TestClient(_app())
+    resp = client.get("/ready")
+  assert resp.status_code == 503
+  assert "etcd" in resp.json()["reason"]
+
+
 def test_ready_ok_when_ping_succeeds():
   mock_client = MagicMock()
   mock_client.admin.command = AsyncMock(return_value={"ok": 1})
-  with patch("src.core.database.get_motor_client", return_value=mock_client):
+  mock_etcd = MagicMock()
+  mock_etcd.status = AsyncMock(return_value=MagicMock())
+  mock_etcd.close = AsyncMock()
+  with patch("src.core.database.get_motor_client", return_value=mock_client), patch(
+    "src.core.etcd_op.get_etcd_client", new=AsyncMock(return_value=mock_etcd)
+  ):
     client = TestClient(_app())
     resp = client.get("/ready")
   assert resp.status_code == 200
