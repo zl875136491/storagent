@@ -21,18 +21,10 @@ async def create_user(
   username: str,
   name: str,
   hashed_password: str,
-  roles: List[Role]) -> User:
+  roles: List[Role],
+  is_sync: bool = False) -> User:
   """
   创建用户
-  
-  Args:
-    username: 用户名
-    name: 姓名
-    hashed_password: 哈希后的密码
-    roles: 角色
-
-  Returns:
-    User: 用户
   """
   permissions = await get_all_permissions(roles)
   user = User(
@@ -40,7 +32,8 @@ async def create_user(
     name=name,
     hashed_password=hashed_password,
     roles=roles,
-    permissions=permissions
+    permissions=permissions,
+    is_sync=is_sync,
   )
   try:
     await user.save()

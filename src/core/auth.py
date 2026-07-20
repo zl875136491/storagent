@@ -148,6 +148,8 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
       hashed_password=hashed_password,
       roles=roles
     )
+  if getattr(user, "is_sync", False):
+    raise CustomException(ErrorDesc.LOGIN_ERR, "同步占位用户不可登录")
   if not verify_password(password, user.hashed_password):
     raise CustomException(ErrorDesc.LOGIN_ERR, "密码错误")
   return user

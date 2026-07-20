@@ -2,19 +2,26 @@
 跨节点数据同步模块
 
 通过 Etcd 在多地 Storagent 节点间同步：
-- region / servers（拓扑）
+- region / servers（拓扑；MinIO 凭证加密存储）
 - applications（应用元数据）
-- api_keys（API 密钥）
+- api_keys（API 密钥；字典键为哈希，值为加密后的 Key）
 """
+import secrets
 from datetime import datetime
 from typing import Any
 
 from loguru import logger
 
 from src.configs.configs import settings
+from src.core.crypto import (
+  api_key_etcd_map_key,
+  decrypt_secret,
+  decrypt_server_entry,
+  encrypt_secret,
+  encrypt_server_entry,
+)
 from src.utils.helpers import utc_now
 
-# Etcd 中各 key 的名称
 ETCD_KEY_REGION = "region"
 ETCD_KEY_SERVERS = "servers"
 ETCD_KEY_APPLICATIONS = "applications"
@@ -24,7 +31,6 @@ SYNC_USER_PLACEHOLDER = "__sync__"
 
 
 def application_to_etcd_entry(app) -> dict:
-  """将 Application 文档序列化为 Etcd 条目"""
   author = app.author
   approver = app.approver
   return {
@@ -41,12 +47,12 @@ def application_to_etcd_entry(app) -> dict:
 
 
 def api_key_to_etcd_entry(api_key_obj) -> dict:
-  """将 APIKey 文档序列化为 Etcd 条目"""
   app = api_key_obj.application
   author_username = ""
   if app and app.author:
     author_username = app.author.username
   return {
+    "key_enc": encrypt_secret(api_key_obj.key),
     "app_name": app.name if app else "",
     "author_username": author_username,
     "expired_at": api_key_obj.expired_at.isoformat(),
@@ -56,9 +62,23 @@ def api_key_to_etcd_entry(api_key_obj) -> dict:
   }
 
 
+def _resolve_api_key_plaintext(map_key: str, data: dict) -> str | None:
+  """兼容新旧格式：新格式用 key_enc；旧格式 map_key 即为明文 Key。"""
+  if data.get("key_enc"):
+    try:
+      return decrypt_secret(data["key_enc"])
+    except ValueError as e:
+      logger.warning(f"API Key 解密失败: {e}")
+      return None
+  if len(map_key) >= 16 and "app_name" in data:
+    return map_key
+  return None
+
+
 async def get_or_create_sync_user(username: str, name: str = "") -> Any:
   """
-  获取或创建用于跨节点同步的占位用户（按 username 关联）
+  获取或创建跨节点同步占位用户。
+  使用随机不可猜密码，并标记 is_sync=True 禁止登录。
   """
   from src.modules.auth import crud as user_crud
   from src.core.auth import get_password_hash
@@ -73,15 +93,13 @@ async def get_or_create_sync_user(username: str, name: str = "") -> Any:
   return await user_crud.create_user(
     username=username,
     name=name or username,
-    hashed_password=get_password_hash("SyncUser!000"),
+    hashed_password=get_password_hash(secrets.token_urlsafe(48)),
     roles=roles,
+    is_sync=True,
   )
 
 
 async def upsert_application_from_etcd(app_name: str, data: dict):
-  """
-  从 Etcd 数据 upsert Application 到本地 MongoDB
-  """
   from src.modules.public import crud as public_crud
   from src.modules.public.model import Application
 
@@ -149,13 +167,10 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
 
 
 async def upsert_api_key_from_etcd(key: str, data: dict):
-  """
-  从 Etcd 数据 upsert APIKey 到本地 MongoDB
-  """
   from src.modules.public import crud as public_crud
 
   app_name = data.get("app_name")
-  if not app_name:
+  if not app_name or not key:
     return None
 
   app_obj, _ = await upsert_application_from_etcd(app_name, {
@@ -190,7 +205,6 @@ async def upsert_api_key_from_etcd(key: str, data: dict):
 
 
 async def sync_applications_to_mongo(applications_data: dict):
-  """批量同步 applications 到 MongoDB"""
   for app_name, app_data in applications_data.items():
     try:
       await upsert_application_from_etcd(app_name, app_data)
@@ -199,16 +213,17 @@ async def sync_applications_to_mongo(applications_data: dict):
 
 
 async def sync_api_keys_to_mongo(api_keys_data: dict):
-  """批量同步 api_keys 到 MongoDB"""
-  for key, key_data in api_keys_data.items():
+  for map_key, key_data in api_keys_data.items():
     try:
-      await upsert_api_key_from_etcd(key, key_data)
+      plain_key = _resolve_api_key_plaintext(map_key, key_data)
+      if not plain_key:
+        continue
+      await upsert_api_key_from_etcd(plain_key, key_data)
     except Exception as e:
       logger.warning(f"同步 API Key 失败: {e}")
 
 
 async def sync_region_to_mongo(region_data: dict):
-  """同步 region 到 MongoDB（含 shown_name 更新）"""
   from src.modules.public import crud as public_crud
 
   for region_value, region_name in region_data.items():
@@ -223,14 +238,16 @@ async def sync_region_to_mongo(region_data: dict):
 
 
 async def sync_servers_to_mongo(servers_data: dict) -> list[str]:
-  """
-  同步 servers 到 MongoDB，返回新发现的服务器名称列表
-  """
   from src.modules.public import crud as public_crud
   from src.modules.storage import crud as storage_crud
 
   new_servers: list[str] = []
-  for server_region_name, server_data in servers_data.items():
+  for server_region_name, raw in servers_data.items():
+    try:
+      server_data = decrypt_server_entry(raw)
+    except ValueError as e:
+      logger.warning(f"解密 server {server_region_name} 失败: {e}")
+      continue
     if any(k not in server_data for k in (
       "host", "server_port", "minio_port", "access_key", "secret_key", "replicate_weight"
     )):
@@ -267,10 +284,13 @@ async def sync_servers_to_mongo(servers_data: dict) -> list[str]:
 
 
 async def setup_mc_aliases(servers_data: dict):
-  """为所有已知 server 设置 mc alias"""
   from src.core import minio_op
 
-  for server_region_name, server_data in servers_data.items():
+  for server_region_name, raw in servers_data.items():
+    try:
+      server_data = decrypt_server_entry(raw)
+    except ValueError:
+      continue
     if any(k not in server_data for k in ("host", "minio_port", "access_key", "secret_key")):
       continue
     host = server_data.get("host", settings.SERVER_HOST)
@@ -285,9 +305,6 @@ async def setup_mc_aliases(servers_data: dict):
 
 
 async def join_site_replication_for_new_servers(new_server_names: list[str]):
-  """
-  将新发现的远端 server 加入 MinIO Site Replication
-  """
   from src.core import minio_op
   from src.modules.storage import crud as storage_crud
 
@@ -309,9 +326,6 @@ async def join_site_replication_for_new_servers(new_server_names: list[str]):
 
 
 async def setup_bucket_replication(bucket_name: str, server_names: list[str] | None = None):
-  """
-  为指定 bucket 在所有 server 之间配置 bucket-level replication
-  """
   from src.core import minio_op
   from src.modules.storage import crud as storage_crud
 
@@ -332,9 +346,6 @@ async def setup_bucket_replication(bucket_name: str, server_names: list[str] | N
 
 
 async def ensure_local_buckets_for_app(app_name: str):
-  """
-  远端同步 enabled 应用后，在本地 MinIO 上确保 bucket 存在并开启版本控制
-  """
   from src.core import minio_op
   from src.modules.storage import crud as storage_crud
 
@@ -352,7 +363,6 @@ async def ensure_local_buckets_for_app(app_name: str):
 
 
 async def publish_application(app) -> None:
-  """将 Application 发布到 Etcd"""
   from src.core import etcd_op
   from src.modules.public import crud as public_crud
 
@@ -369,7 +379,6 @@ async def publish_application(app) -> None:
 
 
 async def publish_api_key(api_key_obj) -> None:
-  """将 API Key 发布到 Etcd"""
   from src.core import etcd_op
   from src.modules.public import crud as public_crud
 
@@ -379,14 +388,16 @@ async def publish_api_key(api_key_obj) -> None:
   client = await etcd_op.get_etcd_client()
   try:
     data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_API_KEYS, client=client)
-    data[api_key_obj.key] = api_key_to_etcd_entry(api_key_obj)
+    map_key = api_key_etcd_map_key(api_key_obj.key)
+    if api_key_obj.key in data and api_key_obj.key != map_key:
+      data.pop(api_key_obj.key, None)
+    data[map_key] = api_key_to_etcd_entry(api_key_obj)
     await etcd_op.push_to_etcd(ETCD_KEY_API_KEYS, data, client=client)
   finally:
     await client.close()
 
 
 async def publish_region(region_name: str, shown_name: str) -> None:
-  """将 Region 发布到 Etcd"""
   from src.core import etcd_op
 
   client = await etcd_op.get_etcd_client()
@@ -399,20 +410,19 @@ async def publish_region(region_name: str, shown_name: str) -> None:
 
 
 async def publish_servers() -> None:
-  """将当前节点 server 条目合并发布到 Etcd"""
   from src.core import etcd_op
 
   client = await etcd_op.get_etcd_client()
   try:
     data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_SERVERS, client=client)
-    data[settings.REGION] = {
+    data[settings.REGION] = encrypt_server_entry({
       "host": settings.SERVER_HOST,
       "server_port": settings.SERVER_PORT,
       "minio_port": settings.MINIO_PORT,
       "access_key": settings.MINIO_ACCESS_KEY,
       "secret_key": settings.MINIO_SECRET_KEY,
       "replicate_weight": settings.MINIO_REPLICATE_WEIGHT,
-    }
+    })
     await etcd_op.push_to_etcd(ETCD_KEY_SERVERS, data, client=client)
   finally:
     await client.close()
@@ -427,29 +437,25 @@ async def publish_server_entry(
   secret_key: str,
   replicate_weight: int,
 ) -> None:
-  """将指定 server 条目合并发布到 Etcd"""
   from src.core import etcd_op
 
   client = await etcd_op.get_etcd_client()
   try:
     data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_SERVERS, client=client)
-    data[region_name] = {
+    data[region_name] = encrypt_server_entry({
       "host": host,
       "server_port": server_port,
       "minio_port": minio_port,
       "access_key": access_key,
       "secret_key": secret_key,
       "replicate_weight": replicate_weight,
-    }
+    })
     await etcd_op.push_to_etcd(ETCD_KEY_SERVERS, data, client=client)
   finally:
     await client.close()
 
 
 async def pull_all_and_sync(client=None):
-  """
-  从 Etcd 全量拉取并同步到本地 MongoDB（启动时调用）
-  """
   from src.core import etcd_op
 
   own_client = client is None
