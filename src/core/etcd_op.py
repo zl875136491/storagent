@@ -53,6 +53,8 @@ async def _handle_etcd_put(key: str, value: str):
         await sync_module.ensure_local_buckets_for_app(app_name)
   elif short_key == sync_module.ETCD_KEY_API_KEYS:
     await sync_module.sync_api_keys_to_mongo(data)
+  elif short_key == sync_module.ETCD_KEY_REVOKED_TOKENS:
+    await sync_module.sync_revoked_tokens_to_mongo(data)
 
 
 async def _handle_etcd_delete(key: str):

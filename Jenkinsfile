@@ -28,7 +28,13 @@ pipeline {
         stage('Test') {
             steps {
                 script {
-                    echo 'skip project test'
+                    sh '''
+                      set -e
+                      python3 -m venv .venv || true
+                      . .venv/bin/activate
+                      pip install -q -r requirements-dev.txt
+                      pytest -q
+                    '''
                 }
             }
         }

@@ -79,6 +79,20 @@ def redact_shell_command(command: str) -> str:
   return command
 
 
+def api_key_hint(plain_key: str) -> str:
+  if len(plain_key) <= 12:
+    return "************"
+  return f"{plain_key[:7]}************{plain_key[-4:]}"
+
+
+def is_sha256_hex(value: str) -> bool:
+  return len(value) == 64 and all(c in "0123456789abcdef" for c in value.lower())
+
+
+def token_sha256(token: str) -> str:
+  return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def minio_server_plain_credentials(access_key: str, secret_key: str) -> tuple[str, str]:
   """从可能加密的字段得到明文凭证。"""
   return decrypt_secret(access_key), decrypt_secret(secret_key)

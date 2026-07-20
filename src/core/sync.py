@@ -26,6 +26,7 @@ ETCD_KEY_REGION = "region"
 ETCD_KEY_SERVERS = "servers"
 ETCD_KEY_APPLICATIONS = "applications"
 ETCD_KEY_API_KEYS = "api_keys"
+ETCD_KEY_REVOKED_TOKENS = "revoked_tokens"
 
 SYNC_USER_PLACEHOLDER = "__sync__"
 
@@ -47,12 +48,22 @@ def application_to_etcd_entry(app) -> dict:
 
 
 def api_key_to_etcd_entry(api_key_obj) -> dict:
+  from src.core.crypto import is_sha256_hex
+
   app = api_key_obj.application
   author_username = ""
   if app and app.author:
     author_username = app.author.username
+  if getattr(api_key_obj, "key_enc", None):
+    key_enc = api_key_obj.key_enc
+    if not key_enc.startswith("enc:v1:"):
+      key_enc = encrypt_secret(key_enc)
+  elif not is_sha256_hex(api_key_obj.key):
+    key_enc = encrypt_secret(api_key_obj.key)
+  else:
+    raise ValueError("API Key 缺少 key_enc，无法同步到 Etcd")
   return {
-    "key_enc": encrypt_secret(api_key_obj.key),
+    "key_enc": key_enc,
     "app_name": app.name if app else "",
     "author_username": author_username,
     "expired_at": api_key_obj.expired_at.isoformat(),
@@ -429,22 +440,58 @@ async def publish_application(app) -> None:
 
 async def publish_api_key(api_key_obj) -> None:
   from src.core import etcd_op
+  from src.core.crypto import api_key_etcd_map_key, is_sha256_hex
   from src.modules.public import crud as public_crud
 
-  api_key_obj = await public_crud.read_api_key_by_key_including_deleted(api_key_obj.key)
+  api_key_obj = await public_crud.read_api_key_by_id(api_key_obj.id)
   if not api_key_obj:
     return
-  map_key = api_key_etcd_map_key(api_key_obj.key)
+  map_key = api_key_obj.key if is_sha256_hex(api_key_obj.key) else api_key_etcd_map_key(api_key_obj.key)
   entry = api_key_to_etcd_entry(api_key_obj)
-  plain_key = api_key_obj.key
 
   def mutator(data: dict) -> dict:
-    if plain_key in data and plain_key != map_key:
-      data.pop(plain_key, None)
     data[map_key] = entry
     return data
 
   await etcd_op.merge_update_etcd_key(ETCD_KEY_API_KEYS, mutator)
+
+
+
+
+async def publish_revoked_token(token_hash: str, expired_at: datetime) -> None:
+  """跨区同步 JWT 吊销（仅同步哈希，不落明文 token）。"""
+  from src.core import etcd_op
+
+  entry = {
+    "expired_at": expired_at.isoformat(),
+    "origin_region": settings.REGION,
+  }
+
+  def mutator(data: dict) -> dict:
+    data[token_hash] = entry
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_REVOKED_TOKENS, mutator)
+
+
+async def sync_revoked_tokens_to_mongo(revoked_data: dict) -> None:
+  from src.modules.auth.model import DestoryedToken
+
+  for token_hash, meta in revoked_data.items():
+    if not token_hash or not isinstance(meta, dict):
+      continue
+    existing = await DestoryedToken.find_one(DestoryedToken.token_hash == token_hash)
+    if existing:
+      continue
+    expired_at = utc_now()
+    raw_exp = meta.get("expired_at")
+    if raw_exp:
+      try:
+        expired_at = datetime.fromisoformat(raw_exp)
+      except ValueError:
+        pass
+    await DestoryedToken(token="", token_hash=token_hash, expired_at=expired_at).save()
+    logger.info(f"Etcd sync: 导入吊销 token_hash {token_hash[:12]}...")
 
 
 async def publish_region(region_name: str, shown_name: str) -> None:
@@ -531,6 +578,10 @@ async def pull_all_and_sync(client=None):
     keys_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_API_KEYS, client=client)
     if keys_data:
       await sync_api_keys_to_mongo(keys_data)
+
+    revoked_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_REVOKED_TOKENS, client=client)
+    if revoked_data:
+      await sync_revoked_tokens_to_mongo(revoked_data)
   finally:
     if own_client:
       await client.close()

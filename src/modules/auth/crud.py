@@ -43,10 +43,16 @@ async def create_user(
 
 async def check_token_valid(token: str) -> bool:
   """
-  检查 token 是否有效
+  检查 token 是否有效（本地明文条目或跨区同步的 hash）
   """
+  from src.core.crypto import token_sha256
+
   destoryed_token = await DestoryedToken.find_one(DestoryedToken.token == token)
   if destoryed_token:
+    return False
+  th = token_sha256(token)
+  by_hash = await DestoryedToken.find_one(DestoryedToken.token_hash == th)
+  if by_hash:
     return False
   return True
 
@@ -114,12 +120,23 @@ def blacklist_expiry_for_token(token: str):
 
 async def destroy_token(token: str) -> None:
   """
-  销毁 token：写入黑名单，expired_at 取 JWT 自身过期时间
+  销毁 token：写入黑名单，expired_at 取 JWT 自身过期时间，并同步到 Etcd
   """
-  existing = await DestoryedToken.find_one(DestoryedToken.token == token)
+  from src.core.crypto import token_sha256
+  from src.core import sync as sync_module
+
+  th = token_sha256(token)
+  existing = await DestoryedToken.find_one(
+    {"$or": [{"token": token}, {"token_hash": th}]}
+  )
   if existing:
     return
-  await DestoryedToken(token=token, expired_at=blacklist_expiry_for_token(token)).save()
+  expired_at = blacklist_expiry_for_token(token)
+  await DestoryedToken(token=token, token_hash=th, expired_at=expired_at).save()
+  try:
+    await sync_module.publish_revoked_token(th, expired_at)
+  except Exception as e:
+    logger.warning(f"吊销 token 同步 Etcd 失败: {e}")
 
 async def cleanup_expired_tokens() -> int:
   """

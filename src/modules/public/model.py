@@ -40,7 +40,12 @@ class Application(Document):
 
 class APIKey(Document):
   application: Link[Application]
+  """SHA256(明文 Key)，用于查询；历史数据可能仍为明文直至访问时迁移"""
   key: str
+  """展示用脱敏片段，如 sk_xxxx************abcd"""
+  key_hint: str = Field(default="")
+  """Fernet 加密的明文 Key，供 Etcd 同步/再发布"""
+  key_enc: str = Field(default="")
   expired_at: datetime # 过期时间
   deleted: bool = Field(default=False)
   deleted_at: datetime | None = Field(default=None)
