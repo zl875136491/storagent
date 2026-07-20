@@ -70,6 +70,9 @@ def get_password_hash(password: str) -> str:
   hashed = bcrypt.hashpw(password_bytes, salt)
   return hashed.decode('utf-8')
 
+TOKEN_TYP_ACCESS = "access"
+TOKEN_TYP_REFRESH = "refresh"
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
   """
   创建 JWT access token
@@ -93,7 +96,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 async def create_token(username: str) -> dict:
   """
-  创建 JWT token
+  创建 JWT token（access / refresh 带 typ，防止互相冒用）
   
   Args:
     username: 用户名
@@ -104,11 +107,11 @@ async def create_token(username: str) -> dict:
   access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
   refresh_token_expires = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
   access_token = create_access_token(
-    data={"sub": username},
+    data={"sub": username, "typ": TOKEN_TYP_ACCESS},
     expires_delta=access_token_expires
   )
   refresh_token = create_access_token(
-    data={"sub": username},
+    data={"sub": username, "typ": TOKEN_TYP_REFRESH},
     expires_delta=refresh_token_expires
   )
   return {
@@ -195,6 +198,10 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
     payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
     username: str | None = payload.get("sub")
     if username is None:
+      raise credentials_exception
+    typ = payload.get("typ")
+    # 兼容旧 token（无 typ）；有 typ 时必须为 access
+    if typ is not None and typ != TOKEN_TYP_ACCESS:
       raise credentials_exception
       
   except JWTError:
