@@ -29,3 +29,27 @@ async def update_bucket_edge_position(
   更新 Bucket 拓扑边位置信息
   """
   return await graph_service.update_bucket_edge_position(payload)
+
+@router.get(
+  path="/bucket-node-position",
+  response_model=graph_schema.BucketNodePositionListResponse,
+  summary="获取 Bucket 拓扑节点位置列表")
+async def get_bucket_node_positions(
+  bucket: str,
+  current_user: User = Depends(get_current_user)):
+  """
+  获取指定存储桶的拓扑节点位置列表
+  """
+  return await graph_service.get_bucket_node_positions(bucket)
+
+@router.get(
+  path="/bucket-edge-position",
+  response_model=graph_schema.BucketEdgePositionListResponse,
+  summary="获取 Bucket 拓扑边位置列表")
+async def get_bucket_edge_positions(
+  bucket: str,
+  current_user: User = Depends(get_current_user)):
+  """
+  获取指定存储桶的拓扑边位置列表
+  """
+  return await graph_service.get_bucket_edge_positions(bucket)

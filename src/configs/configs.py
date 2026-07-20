@@ -27,9 +27,11 @@ class Settings(BaseSettings):
   # Info
   APP_NAME: str = "Storagent"
   APP_VERSION: str = "0.1.0"
-  DEBUG: bool = True
+  DEBUG: bool = False
   BACKEND_CORS_ORIGINS: list[str] = ["*"]
   TIMEZONE: str = "Asia/Shanghai"
+  INIT_SERVICE: bool = True
+  RELOAD: bool = True
   
   # 唯一ID
   REGION: str = "undefined"

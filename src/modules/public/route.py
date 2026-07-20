@@ -154,3 +154,15 @@ async def get_api_key_list(
   获取API密钥列表
   """
   return await public_service.get_api_key_list(current_user)
+
+@router.delete(
+  path="/api-key/{api_key_id}",
+  response_model=public_schema.SimpleMessageResponse,
+  summary="吊销API密钥")
+async def revoke_api_key(
+  api_key_id: public_schema.PydanticObjectId,
+  current_user: User = Depends(get_current_user)) -> public_schema.SimpleMessageResponse:
+  """
+  吊销 API 密钥（软删除，不可恢复）
+  """
+  return await public_service.revoke_api_key(api_key_id, current_user)

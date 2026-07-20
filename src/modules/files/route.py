@@ -87,6 +87,23 @@ async def multipart_list_parts(
 
 
 @router.get(
+  path="/object/locate",
+  response_model=files_schema.ObjectLocateResponse,
+  summary="定位对象所在服务点",
+)
+async def object_locate(
+  object_key: str = Query(..., description="对象键"),
+  offset: int = Query(0, ge=0, description="下载起始字节（用于生成 download_url）"),
+  length: int = Query(0, ge=0, description="下载长度（用于生成 download_url）"),
+  app_name: str = Depends(get_current_app),
+) -> files_schema.ObjectLocateResponse:
+  """
+  扫描所有 MinIO 服务点，返回对象存在的位置及对应 stat/download 指引 URL。
+  """
+  return await files_service.locate_object(app_name, object_key, offset, length)
+
+
+@router.get(
   path="/object/stat",
   response_model=files_schema.ObjectStatResponse,
   summary="获取对象元信息（用于规划分片下载）",

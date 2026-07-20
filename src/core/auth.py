@@ -229,7 +229,7 @@ async def get_current_app(api_key: str = Depends(APIKeyHeader(name="x-api-key"))
   """
   from src.modules.public.model import Application
   api_key_obj = await public_crud.read_api_key_by_key(api_key)
-  if not api_key_obj:
+  if not api_key_obj or api_key_obj.deleted:
     raise CustomException(ErrorDesc.API_KEY_INVALID, "API-KEY 无效")
   if before_compare(api_key_obj.expired_at) < utc_now():
     raise CustomException(ErrorDesc.API_KEY_EXPIRED, "API-KEY 已过期")

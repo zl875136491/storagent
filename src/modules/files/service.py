@@ -11,6 +11,7 @@ from src.core.exception import CustomException, ErrorDesc
 from src.core.minio_op import get_minio_client
 from src.modules.storage import crud as storage_crud
 from src.modules.files import schema as files_schema
+from src.modules.files import locate as files_locate
 
 _READ_CHUNK = 1024 * 1024
 
@@ -173,29 +174,35 @@ async def multipart_list_parts(
   )
 
 
+async def locate_object(
+  app_name: str,
+  object_key: str,
+  offset: int = 0,
+  length: int = 0,
+) -> files_schema.ObjectLocateResponse:
+  """
+  查询对象在哪些服务点存在，并生成各节点的 stat / download 指引 URL
+  """
+  return await files_locate.find_object_locations(app_name, object_key, offset, length)
+
+
 async def stat_object(
   app_name: str,
   object_key: str,
 ) -> files_schema.ObjectStatResponse:
   b = app_name
   key = object_key.strip()
-  client = await _get_minio_client()
-
-  def _stat():
-    return client.stat_object(b, key)
-
-  try:
-    obj = await asyncio.to_thread(_stat)
-  except Exception as e:
-    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
-
+  stat, server = await files_locate.stat_object_local(b, key)
+  region = server.region
   return files_schema.ObjectStatResponse(
     bucket=b,
     object_key=key,
-    size=obj.size,
-    etag=obj.etag,
-    content_type=obj.content_type,
-    last_modified=obj.last_modified,
+    size=stat.size,
+    etag=stat.etag,
+    content_type=stat.content_type,
+    last_modified=stat.last_modified,
+    region=region.name if region else settings.REGION,
+    local=True,
   )
 
 
@@ -207,10 +214,13 @@ async def download_chunk(
   """
   分片下载：length>0 时读取固定字节区间；length=0 时从 offset 起读到对象末尾（流式，适合大文件）。
   offset=0 且 length=0 表示整对象流式下载。
+  本节点不存在时返回其他服务点的下载指引（见 OBJECT_NOT_FOUND_LOCAL）。
   """
   b = app_name
   key = object_key.strip()
-  client = await _get_minio_client()
+
+  stat, server = await files_locate.stat_object_local(b, key)
+  client = get_minio_client(server.host, server.minio_port, server.access_key, server.secret_key)
 
   if length > 0:
 
@@ -228,6 +238,8 @@ async def download_chunk(
     try:
       data, resp_headers, status = await asyncio.to_thread(_read)
     except Exception as e:
+      if files_locate._is_object_not_found(e):
+        await files_locate.raise_if_not_found_local(b, key, offset, length)
       raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
 
     out_headers = {}
@@ -244,7 +256,7 @@ async def download_chunk(
       status_code=code,
     )
 
-  meta = await stat_object(app_name, object_key)
+  content_type = stat.content_type or "application/octet-stream"
 
   def _sync_gen():
     resp = client.get_object(b, key, offset=offset, length=0)
@@ -260,7 +272,7 @@ async def download_chunk(
 
   return StreamingResponse(
     _sync_gen(),
-    media_type=meta.content_type or "application/octet-stream",
+    media_type=content_type,
   )
 
 

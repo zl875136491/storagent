@@ -2,6 +2,9 @@ from pydantic import BaseModel
 from typing import List
 from beanie import PydanticObjectId
 
+class RefreshTokenRequest(BaseModel):
+  refresh_token: str
+
 class LoginRequest(BaseModel):
   username: str
   password: str

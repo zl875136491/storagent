@@ -23,3 +23,17 @@ async def update_bucket_edge_position(
   from_position = payload.from_position
   to_position = payload.to_position
   return await graph_crud.update_bucket_edge_position(bucket, from_server, to_server, from_position, to_position)
+
+async def get_bucket_node_positions(bucket: str):
+  """
+  获取 Bucket 拓扑节点位置列表
+  """
+  node_objs = await graph_crud.read_many_bucket_node_positions(bucket)
+  return {"data": node_objs}
+
+async def get_bucket_edge_positions(bucket: str):
+  """
+  获取 Bucket 拓扑边位置列表
+  """
+  edge_objs = await graph_crud.read_many_bucket_edge_positions(bucket)
+  return {"data": edge_objs}

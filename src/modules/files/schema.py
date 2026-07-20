@@ -69,4 +69,23 @@ class ObjectStatResponse(BaseModel):
   etag: str
   content_type: Optional[str] = None
   last_modified: Optional[datetime] = None
+  region: Optional[str] = Field(None, description="对象所在区域标识")
+  local: bool = Field(True, description="是否位于当前访问节点")
+
+
+class ObjectLocationItem(BaseModel):
+  region: str = Field(..., description="区域标识")
+  shown_name: str = Field(..., description="区域显示名称")
+  master: bool = Field(..., description="是否为该 Region 的本地主节点")
+  endpoint: str = Field(..., description="Storagent API 地址")
+  stat_url: str = Field(..., description="对象元信息查询地址")
+  download_url: str = Field(..., description="对象下载地址（需携带相同 x-api-key）")
+
+
+class ObjectLocateResponse(BaseModel):
+  bucket: str
+  object_key: str
+  current_region: str
+  local_exists: bool
+  available_at: List[ObjectLocationItem] = Field(default_factory=list)
 

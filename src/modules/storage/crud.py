@@ -89,6 +89,16 @@ async def read_minio_server_by_region(region: Region) -> MinioServer | None:
     MinioServer.region.id == region.id
   )
 
+async def read_minio_server_by_region_name(region_name: str) -> MinioServer | None:
+  """
+  根据区域名称获取 Minio 服务器
+  """
+  from src.modules.public import crud as public_crud
+  region_obj = await public_crud.read_region_by_name(region_name)
+  if not region_obj:
+    return None
+  return await read_minio_server_by_region(region_obj)
+
 async def read_minio_server_by_fqdn(host: str, minio_port: int) -> MinioServer | None:
   """
   根据 FQDN 获取 Minio 服务器
@@ -103,7 +113,7 @@ async def read_minio_server_by_id(id: str | ObjectId) -> MinioServer | None:
   根据 ID 获取 Minio 服务器
   """
   id = try_to_obj_id(id)
-  return await MinioServer.find_one(MinioServer.id == id)
+  return await MinioServer.find_one(MinioServer.id == id, fetch_links=True)
 
 async def read_minio_server_list() -> List[MinioServer]:
   return await MinioServer.find_all(fetch_links=True).to_list()
