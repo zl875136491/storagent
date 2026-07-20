@@ -35,16 +35,13 @@ async def test_endpoints():
   response_model=public_schema.RegionResponse,
   summary="创建区域")
 async def create_region(
-  payload: public_schema.RegionCreateRequest) -> public_schema.RegionResponse:
+  payload: public_schema.RegionCreateRequest,
+  current_user: User = Depends(get_current_user),
+) -> public_schema.RegionResponse:
   """
-  创建区域
-
-  Args:
-    name: 区域名称
-
-  Returns:
-    RegionResponse: 区域
+  创建区域（需 region_manage）
   """
+  await check_permissions(current_user, ["region_manage"])
   name = payload.name.strip()
   shown_name = payload.shown_name.strip()
   return await public_service.create_region(name, shown_name)
@@ -53,12 +50,11 @@ async def create_region(
   path="/region",
   response_model=public_schema.RegionListResponse,
   summary="获取区域列表")
-async def get_region_list() -> public_schema.RegionListResponse:
+async def get_region_list(
+  current_user: User = Depends(get_current_user),
+) -> public_schema.RegionListResponse:
   """
-  获取区域列表
-
-  Returns:
-    RegionListResponse: 区域列表
+  获取区域列表（需登录）
   """
   return await public_service.get_region_list()
 
@@ -86,12 +82,11 @@ async def create_application(
   path="/application",
   response_model=public_schema.ApplicationListResponse,
   summary="获取应用列表")
-async def get_application_list() -> public_schema.ApplicationListResponse:
+async def get_application_list(
+  current_user: User = Depends(get_current_user),
+) -> public_schema.ApplicationListResponse:
   """
-  获取应用列表
-
-  Returns:
-    ApplicationListResponse: 应用列表
+  获取应用列表（需登录）
   """
   return await public_service.get_application_list()
 
