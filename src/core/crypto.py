@@ -1,14 +1,21 @@
 """
-Etcd 机密字段加解密：使用 SECRET_KEY 派生 Fernet 密钥。
+Etcd / Mongo 机密字段加解密：使用 SECRET_KEY 派生 Fernet 密钥。
 兼容未加密的历史明文（读取时原样返回）。
 """
 import base64
 import hashlib
+import re
 from cryptography.fernet import Fernet, InvalidToken
 
 from src.configs.configs import settings
 
 _ENC_PREFIX = "enc:v1:"
+
+# mc alias set <name> <url> <user> <password>
+_MC_ALIAS_SET_RE = re.compile(
+  r"(mc\s+alias\s+set\s+\S+\s+\S+)\s+\S+\s+\S+",
+  re.IGNORECASE,
+)
 
 
 def _fernet() -> Fernet:
@@ -60,3 +67,18 @@ def encrypt_server_entry(server_data: dict) -> dict:
   if "secret_key" in data:
     data["secret_key"] = encrypt_secret(data["secret_key"])
   return data
+
+
+def redact_shell_command(command: str) -> str:
+  """脱敏 shell 日志中的账号密码（如 mc alias set）。"""
+  if not command:
+    return command
+  redacted, n = _MC_ALIAS_SET_RE.subn(r"\1 *** ***", command)
+  if n:
+    return redacted
+  return command
+
+
+def minio_server_plain_credentials(access_key: str, secret_key: str) -> tuple[str, str]:
+  """从可能加密的字段得到明文凭证。"""
+  return decrypt_secret(access_key), decrypt_secret(secret_key)

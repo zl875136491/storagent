@@ -48,3 +48,19 @@ def test_server_entry_encrypt_decrypt(monkeypatch):
   dec = decrypt_server_entry(enc)
   assert dec["access_key"] == "ak"
   assert dec["secret_key"] == "sk"
+
+
+def test_redact_mc_alias_set():
+  from src.core.crypto import redact_shell_command
+  cmd = "mc alias set site1 http://1.2.3.4:9000 admin SuperSecret"
+  out = redact_shell_command(cmd)
+  assert "SuperSecret" not in out
+  assert "admin" not in out or "***" in out
+  assert out.startswith("mc alias set site1 http://1.2.3.4:9000")
+  assert "*** ***" in out
+
+
+def test_redact_leaves_other_commands():
+  from src.core.crypto import redact_shell_command
+  cmd = "mc ls site1/bucket"
+  assert redact_shell_command(cmd) == cmd

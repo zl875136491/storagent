@@ -33,7 +33,8 @@ async def _get_minio_client():
   ms = await storage_crud.read_master_minio_server()
   if not ms:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
-  return get_minio_client(ms.host, ms.minio_port, ms.access_key, ms.secret_key)
+  access_key, secret_key = storage_crud.plain_minio_credentials(ms)
+  return get_minio_client(ms.host, ms.minio_port, access_key, secret_key)
 
 
 async def multipart_init(
@@ -220,7 +221,8 @@ async def download_chunk(
   key = object_key.strip()
 
   stat, server = await files_locate.stat_object_local(b, key)
-  client = get_minio_client(server.host, server.minio_port, server.access_key, server.secret_key)
+  access_key, secret_key = storage_crud.plain_minio_credentials(server)
+  client = get_minio_client(server.host, server.minio_port, access_key, secret_key)
 
   if length > 0:
 

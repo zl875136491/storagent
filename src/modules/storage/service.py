@@ -143,13 +143,14 @@ async def update_minio_server(
   try:
     region_obj = minio_server_obj.region
     region_name = region_obj.name if hasattr(region_obj, "name") else minio_server_obj.name
+    access_key, secret_key = storage_crud.plain_minio_credentials(result)
     await sync_module.publish_server_entry(
       region_name=region_name,
       host=result.host,
       server_port=result.server_port,
       minio_port=result.minio_port,
-      access_key=result.access_key,
-      secret_key=result.secret_key,
+      access_key=access_key,
+      secret_key=secret_key,
       replicate_weight=result.replicate_weight,
     )
   except Exception as e:
@@ -204,11 +205,12 @@ async def get_server_details(minio_server: ObjectId) -> List[str]:
   minio_server_obj = await storage_crud.read_minio_server_by_id(minio_server)
   if not minio_server_obj:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
+  access_key, secret_key = storage_crud.plain_minio_credentials(minio_server_obj)
   minio_client = get_minio_client(
     host=minio_server_obj.host,
     port=minio_server_obj.minio_port,
-    access_key=minio_server_obj.access_key,
-    secret_key=minio_server_obj.secret_key
+    access_key=access_key,
+    secret_key=secret_key
   )
   buckets = await get_buckets_info(minio_client)
   return dict[str, list](data=buckets)

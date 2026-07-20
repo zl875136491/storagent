@@ -317,12 +317,14 @@ async def create_shell_command_log(
   stdout: str = "",
   stderr: str = "") -> ShellCommandLog:
   """
-  创建Shell命令日志
+  创建Shell命令日志（命令中的凭证已脱敏）
   """
+  from src.core.crypto import redact_shell_command
+
   if command == "mc alias list --json":
     return None
   shell_command_log = ShellCommandLog(
-    command=command,
+    command=redact_shell_command(command),
     stdout=stdout,
     stderr=stderr
   )
