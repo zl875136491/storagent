@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from starlette.middleware.cors import CORSMiddleware
 
 from src.api import register_api
-from src.core.database import init_db
+from src.core.database import init_db, close_db
 from src.configs.configs import settings
 from src.utils.logger import setup_logging
 from src.core.initialization import init_project, init_service
@@ -23,6 +23,8 @@ async def lifespan(app: FastAPI):
   """
   应用生命周期管理
   """
+  settings.validate_runtime()
+
   # 1. 设置日志
   setup_logging()
 
@@ -55,18 +57,24 @@ async def lifespan(app: FastAPI):
     await etcd_client.close()
   except Exception:
     pass
+  try:
+    await close_db()
+  except Exception:
+    pass
 
 def create_app() -> FastAPI:
   """
   创建 FastAPI 应用实例
   """
+  enable_docs = settings.DEBUG or settings.ENABLE_DOCS
   app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     debug=settings.DEBUG,
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if enable_docs else None,
+    redoc_url="/redoc" if enable_docs else None,
+    openapi_url="/openapi.json" if enable_docs else None,
     description=app_description
   )
 
