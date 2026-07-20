@@ -31,7 +31,9 @@ class Settings(BaseSettings):
   BACKEND_CORS_ORIGINS: list[str] = ["*"]
   TIMEZONE: str = "Asia/Shanghai"
   INIT_SERVICE: bool = True
-  RELOAD: bool = True
+  RELOAD: bool = False
+  # 生产默认关闭 OpenAPI；DEBUG=true 时仍开启
+  ENABLE_DOCS: bool = False
   
   # 唯一ID
   REGION: str = "undefined"
@@ -109,6 +111,36 @@ class Settings(BaseSettings):
     创建一些预设的文件系统路径
     """
     create_file_path(self.LOG_PATH)
+
+  def validate_runtime(self) -> None:
+    """
+    启动前校验：拒绝明显不安全的生产配置。
+    pytest 导入时跳过，避免本地 .env 未改完即打断单测。
+    """
+    import sys
+    if "pytest" in sys.modules:
+      return
+
+    errors: list[str] = []
+    if self.REGION.strip().lower() in ("", "undefined"):
+      errors.append("REGION 未设置（不能为 undefined）")
+
+    weak_secrets = {
+      "",
+      "XXXXXXX",
+      "your-secret-key-here",
+      "secret",
+      "changeme",
+    }
+    if not self.DEBUG:
+      if self.SECRET_KEY.strip() in weak_secrets or len(self.SECRET_KEY.strip()) < 16:
+        errors.append("SECRET_KEY 过弱或为占位值（生产环境至少 16 字符）")
+      origins = [str(o).strip() for o in self.BACKEND_CORS_ORIGINS]
+      if not origins or origins == ["*"]:
+        errors.append("生产环境禁止 BACKEND_CORS_ORIGINS=[\"*\"]，请配置明确前端域名")
+
+    if errors:
+      raise RuntimeError("启动配置校验失败:\n- " + "\n- ".join(errors))
 
 settings = Settings()
 settings.create_path()

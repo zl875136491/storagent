@@ -12,10 +12,13 @@ source="https://pypi.tuna.tsinghua.edu.cn/simple"
 # 启动项目
 function run() {
   RELOAD_FLAG=""
-  if [ "${RELOAD:-true}" = "true" ]; then
+  if [ "${RELOAD:-false}" = "true" ]; then
     RELOAD_FLAG="--reload --reload-exclude '*/tests/*'"
   fi
-  uvicorn main:app --host 0.0.0.0 --port=${SERVER_PORT:-9000} --timeout-graceful-shutdown 1 $RELOAD_FLAG
+  # 优雅关闭需覆盖上传/下载耗时；可用 GRACEFUL_SHUTDOWN_TIMEOUT 覆盖
+  uvicorn main:app --host 0.0.0.0 --port=${SERVER_PORT:-9000} \
+    --timeout-graceful-shutdown "${GRACEFUL_SHUTDOWN_TIMEOUT:-30}" \
+    $RELOAD_FLAG
 }
 
 function stop() {
