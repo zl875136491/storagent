@@ -1,13 +1,18 @@
 import aetcd
 import asyncio
+from copy import deepcopy
+from typing import Callable
 from loguru import logger
 from src.configs.configs import settings
-from fastapi import Depends, Request
+from fastapi import Request
 from json import loads as json_loads
 from json import dumps as json_dumps
+from json import JSONDecodeError
 from src.core import sync as sync_module
 
 ETCD_PREFIX = "/storagent/"
+CAS_MAX_RETRIES = 8
+
 
 async def get_etcd_client() -> aetcd.Client:
   """
@@ -21,6 +26,7 @@ async def get_etcd_client() -> aetcd.Client:
   )
   return client
 
+
 async def _handle_etcd_put(key: str, value: str):
   """
   处理 Etcd PUT 事件
@@ -30,7 +36,7 @@ async def _handle_etcd_put(key: str, value: str):
     return
   try:
     data = json_loads(value)
-  except (json.JSONDecodeError, TypeError):
+  except (JSONDecodeError, TypeError):
     logger.warning(f"Etcd 事件值解析失败: key={key}")
     return
 
@@ -48,36 +54,52 @@ async def _handle_etcd_put(key: str, value: str):
   elif short_key == sync_module.ETCD_KEY_API_KEYS:
     await sync_module.sync_api_keys_to_mongo(data)
 
+
 async def watch_etcd_task(client: aetcd.Client):
   """
-  增量更新订阅：监听 Etcd 变更并同步到 MongoDB
+  增量更新订阅：监听 Etcd 变更并同步到 MongoDB（断线自动重连）
   """
-  try:
-    encoded_prefix = ETCD_PREFIX.encode()
-    logger.info("Etcd watch 已启动（region / servers / applications / api_keys）")
-    async for event in await client.watch_prefix(encoded_prefix):
-      key = event.kv.key.decode("utf-8")
-      value = event.kv.value.decode("utf-8") if event.kv.value else ""
-      logger.info(f"Etcd 变更: {key}")
+  backoff = 1.0
+  while True:
+    try:
+      encoded_prefix = ETCD_PREFIX.encode()
+      logger.info("Etcd watch 已启动（region / servers / applications / api_keys）")
+      async for event in await client.watch_prefix(encoded_prefix):
+        backoff = 1.0
+        key = event.kv.key.decode("utf-8")
+        value = event.kv.value.decode("utf-8") if event.kv.value else ""
+        logger.info(f"Etcd 变更: {key}")
+        try:
+          await _handle_etcd_put(key, value)
+        except Exception as e:
+          logger.warning(f"Etcd 事件处理失败: {e}")
+    except asyncio.CancelledError:
+      logger.info("Etcd watch 已停止")
+      raise
+    except Exception as e:
+      logger.warning(f"Etcd watch 异常，{backoff:.0f}s 后重连: {e}")
+      await asyncio.sleep(backoff)
+      backoff = min(backoff * 2, 30.0)
       try:
-        await _handle_etcd_put(key, value)
-      except Exception as e:
-        logger.warning(f"Etcd 事件处理失败: {e}")
-  except asyncio.CancelledError:
-    logger.info("Etcd watch 已停止")
+        await client.close()
+      except Exception:
+        pass
+      try:
+        client = await get_etcd_client()
+      except Exception as ce:
+        logger.warning(f"Etcd 客户端重建失败: {ce}")
+
 
 async def get_etcd(request: Request) -> aetcd.Client:
-  """
-  依赖注入: 获取 Etcd 客户端
-  """
   return await get_etcd_client()
+
 
 async def push_to_etcd(
   key: str,
   value: dict,
   client: aetcd.Client | None = None):
   """
-  发送数据到 Etcd
+  无条件覆盖写入（启动注册等场景可用；业务更新请用 merge_update_etcd_key）
   """
   if client is None:
     client = await get_etcd_client()
@@ -91,12 +113,10 @@ async def push_to_etcd(
     if should_close:
       await client.close()
 
+
 async def pull_from_etcd_by_prefix(
   prefix: str,
   client: aetcd.Client | None = None):
-  """
-  从 Etcd 拉取前缀数据
-  """
   if client is None:
     client = await get_etcd_client()
     should_close = True
@@ -114,12 +134,10 @@ async def pull_from_etcd_by_prefix(
     if should_close:
       await client.close()
 
+
 async def pull_from_etcd_by_key(
   key: str,
   client: aetcd.Client | None = None) -> dict:
-  """
-  从 Etcd 拉取单 key 数据
-  """
   if client is None:
     client = await get_etcd_client()
     should_close = True
@@ -130,8 +148,75 @@ async def pull_from_etcd_by_key(
     if not response:
       return {}
     value = response.value.decode("utf-8")
-    json_value = json_loads(value)
-    return json_value
+    return json_loads(value)
+  finally:
+    if should_close:
+      await client.close()
+
+
+async def pull_from_etcd_by_key_with_rev(
+  key: str,
+  client: aetcd.Client,
+) -> tuple[dict, int | None]:
+  """
+  拉取单 key，返回 (dict, mod_revision)。
+  key 不存在时返回 ({}, None)。
+  """
+  response = await client.get(f"{ETCD_PREFIX}{key}".encode())
+  if not response:
+    return {}, None
+  value = response.value.decode("utf-8")
+  return json_loads(value), response.mod_revision
+
+
+async def merge_update_etcd_key(
+  key: str,
+  mutator: Callable[[dict], dict],
+  client: aetcd.Client | None = None,
+  max_retries: int = CAS_MAX_RETRIES,
+) -> dict:
+  """
+  基于 mod_revision 的 compare-and-swap 合并更新，避免多节点互相覆盖。
+
+  mutator(current_dict) -> new_dict
+  """
+  if client is None:
+    client = await get_etcd_client()
+    should_close = True
+  else:
+    should_close = False
+
+  full_key = f"{ETCD_PREFIX}{key}".encode()
+  try:
+    last_err = None
+    for attempt in range(max_retries):
+      current, mod_rev = await pull_from_etcd_by_key_with_rev(key, client=client)
+      base = deepcopy(current) if current else {}
+      updated = mutator(base)
+      plain = json_dumps(updated).encode()
+
+      if mod_rev is None:
+        # 创建：仅当 create_revision == 0（键不存在）
+        status, _ = await client.transaction(
+          compare=[client.transactions.create(full_key) == 0],
+          success=[client.transactions.put(full_key, plain)],
+          failure=[],
+        )
+      else:
+        status, _ = await client.transaction(
+          compare=[client.transactions.mod(full_key) == mod_rev],
+          success=[client.transactions.put(full_key, plain)],
+          failure=[],
+        )
+
+      if status:
+        return updated
+
+      last_err = f"CAS conflict on {key} (attempt {attempt + 1}/{max_retries})"
+      logger.warning(last_err)
+      await asyncio.sleep(0.05 * (attempt + 1))
+
+    raise RuntimeError(last_err or f"Etcd CAS failed for {key}")
   finally:
     if should_close:
       await client.close()
