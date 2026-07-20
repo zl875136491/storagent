@@ -19,6 +19,7 @@ from src.core.minio_op import (
   get_bucket_replicate_info,
   get_site_alias
 )
+from src.core import sync as sync_module
 
 async def _connect_minio_server(
   host: str,
@@ -44,7 +45,8 @@ async def create_minio_server(
   server_port: int,
   minio_port: int,
   access_key: str,
-  secret_key: str) -> MinioServer:
+  secret_key: str,
+  replicate_weight: int = 0) -> MinioServer:
   """
   创建 Minio 服务器
 
@@ -102,28 +104,59 @@ async def create_minio_server(
     server_port=server_port,
     minio_port=minio_port,
     access_key=access_key,
-    secret_key=secret_key
+    secret_key=secret_key,
+    replicate_weight=replicate_weight
   )
+  try:
+    await sync_module.publish_server_entry(
+      region_name=region_obj.name,
+      host=host,
+      server_port=server_port,
+      minio_port=minio_port,
+      access_key=access_key,
+      secret_key=secret_key,
+      replicate_weight=replicate_weight,
+    )
+  except Exception as e:
+    from loguru import logger
+    logger.warning(f"Server 同步到 Etcd 失败: {e}")
   return minio_server_obj
 
 async def update_minio_server(
   minio_server_id: ObjectId,
-  replicate_weight: int) -> MinioServer:
+  payload) -> MinioServer:
   """
   更新 Minio 服务器
   """
   minio_server_obj = await storage_crud.read_minio_server_by_id(minio_server_id)
   if not minio_server_obj:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
-  return await storage_crud.update_minio_server(
+  result = await storage_crud.update_minio_server(
     minio_server_obj,
     host=minio_server_obj.host,
     server_port=minio_server_obj.server_port,
     minio_port=minio_server_obj.minio_port,
     access_key=minio_server_obj.access_key,
     secret_key=minio_server_obj.secret_key,
-    replicate_weight=replicate_weight
+    replicate_weight=payload.replicate_weight
   )
+  try:
+    region_obj = minio_server_obj.region
+    region_name = region_obj.name if hasattr(region_obj, "name") else minio_server_obj.name
+    access_key, secret_key = storage_crud.plain_minio_credentials(result)
+    await sync_module.publish_server_entry(
+      region_name=region_name,
+      host=result.host,
+      server_port=result.server_port,
+      minio_port=result.minio_port,
+      access_key=access_key,
+      secret_key=secret_key,
+      replicate_weight=result.replicate_weight,
+    )
+  except Exception as e:
+    from loguru import logger
+    logger.warning(f"Server 更新同步到 Etcd 失败: {e}")
+  return result
 
 async def get_minio_server_list() -> dict[str, List[MinioServer]]:
   """
@@ -172,11 +205,12 @@ async def get_server_details(minio_server: ObjectId) -> List[str]:
   minio_server_obj = await storage_crud.read_minio_server_by_id(minio_server)
   if not minio_server_obj:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
+  access_key, secret_key = storage_crud.plain_minio_credentials(minio_server_obj)
   minio_client = get_minio_client(
     host=minio_server_obj.host,
     port=minio_server_obj.minio_port,
-    access_key=minio_server_obj.access_key,
-    secret_key=minio_server_obj.secret_key
+    access_key=access_key,
+    secret_key=secret_key
   )
   buckets = await get_buckets_info(minio_client)
   return dict[str, list](data=buckets)

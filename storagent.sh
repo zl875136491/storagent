@@ -11,11 +11,18 @@ source="https://pypi.tuna.tsinghua.edu.cn/simple"
 
 # 启动项目
 function run() {
-  uvicorn main:app --host 0.0.0.0 --port=6783 --timeout-graceful-shutdown 1 --reload --reload-exclude '*/tests/*'
+  RELOAD_FLAG=""
+  if [ "${RELOAD:-false}" = "true" ]; then
+    RELOAD_FLAG="--reload --reload-exclude '*/tests/*'"
+  fi
+  # 优雅关闭需覆盖上传/下载耗时；可用 GRACEFUL_SHUTDOWN_TIMEOUT 覆盖
+  uvicorn main:app --host 0.0.0.0 --port=${SERVER_PORT:-9000} \
+    --timeout-graceful-shutdown "${GRACEFUL_SHUTDOWN_TIMEOUT:-30}" \
+    $RELOAD_FLAG
 }
 
 function stop() {
-  fuser -k 6783/tcp
+  fuser -k $SERVER_PORT/tcp
 }
 
 # 安装包

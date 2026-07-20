@@ -1,8 +1,11 @@
 from datetime import datetime
+from jose import JWTError, jwt
+from datetime import timedelta
 from src.modules.auth.model import User, DestoryedToken
 from src.modules.auth import crud as user_crud
 from src.core.exception import CustomException, ErrorDesc
 from src.core.auth import authenticate_user, create_token
+from src.configs.configs import settings
 from src.utils.helpers import convert_utc_to_local_str, local_utc_now
 
 
@@ -27,6 +30,33 @@ async def login_user(username: str, password: str) -> dict:
   # 创建 access token
   token_data = await create_token(user.username)
   return token_data
+
+async def refresh_token(refresh_token_str: str) -> dict:
+  """
+  使用 refresh token 获取新的 access token
+  """
+  from src.core.auth import TOKEN_TYP_REFRESH
+
+  token_is_valid = await user_crud.check_token_valid(refresh_token_str)
+  if not token_is_valid:
+    raise CustomException(ErrorDesc.TOKEN_DESTROYED)
+  try:
+    payload = jwt.decode(refresh_token_str, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    username: str | None = payload.get("sub")
+    if username is None:
+      raise CustomException(ErrorDesc.REFRESH_TOKEN_NOT_VALID)
+    typ = payload.get("typ")
+    # 兼容旧 refresh（无 typ）；有 typ 时必须为 refresh，禁止用 access 续期
+    if typ is not None and typ != TOKEN_TYP_REFRESH:
+      raise CustomException(ErrorDesc.REFRESH_TOKEN_NOT_VALID)
+  except JWTError:
+    raise CustomException(ErrorDesc.REFRESH_TOKEN_NOT_VALID)
+  user = await user_crud.read_user_by_username(username)
+  if user is None:
+    raise CustomException(ErrorDesc.REFRESH_TOKEN_NOT_VALID)
+  # 旋转：旧 refresh 立即失效
+  await user_crud.destroy_token(refresh_token_str)
+  return await create_token(user.username)
 
 async def get_user_profile(user: User) -> dict:
   """

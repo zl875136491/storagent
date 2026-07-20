@@ -24,7 +24,8 @@ from src.modules.public.model import (
   Region,
   Application
 )
-# from src.core.redis_op import RedisOp
+from src.core import sync as sync_module
+from src.configs.configs import settings
 
 async def get_endpoints() -> dict[str, List[str]]:
   """
@@ -40,7 +41,8 @@ async def get_endpoints() -> dict[str, List[str]]:
       "name": minio_server_obj.region.name,
       "shown_name": minio_server_obj.region.shown_name,
       "master": minio_server_obj.master,
-      "endpoint": f"http://{minio_server_obj.host}:{minio_server_obj.server_port}"
+      "endpoint": f"{settings.PUBLIC_SCHEME}://{minio_server_obj.host}:{minio_server_obj.server_port}",
+      "minio_endpoint": f"{settings.PUBLIC_SCHEME}://{minio_server_obj.host}:{minio_server_obj.minio_port}",
     })
   return dict[str, List[dict]](data=data)
 
@@ -79,7 +81,37 @@ async def create_region(
   Returns:
     Region: 区域
   """
-  return await public_crud.create_region(name, shown_name)
+  region = await public_crud.create_region(name, shown_name)
+  try:
+    await sync_module.publish_region(name, shown_name)
+  except Exception as e:
+    logger.warning(f"Region 同步到 Etcd 失败: {e}")
+  return region
+
+async def offline_region(region_id) -> dict:
+  """
+  下线区域：从 Etcd 拓扑移除并删除本地 Region / MinIO 记录（禁止下线本节点 REGION）
+  """
+  from src.modules.storage import crud as storage_crud
+
+  region = await public_crud.read_region_by_id(region_id)
+  if not region:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "Region")
+  if region.name == settings.REGION:
+    raise CustomException(ErrorDesc.OPERATION_NOT_ALLOWED, "不能下线本节点区域")
+
+  try:
+    await sync_module.unpublish_server(region.name)
+    await sync_module.unpublish_region(region.name)
+  except Exception as e:
+    logger.warning(f"Region 下线同步 Etcd 失败: {e}")
+    raise CustomException(ErrorDesc.DB_UPDATE_FAILED, f"Etcd 下线失败: {e}")
+
+  server = await storage_crud.read_minio_server_by_region(region)
+  if server:
+    await server.delete()
+  await region.delete()
+  return {"message": f"区域 {region.name} 已下线"}
 
 async def get_region_list() -> dict[str, List[Region]]:
   """
@@ -111,7 +143,12 @@ async def create_application(
   if existed_shown_name:
     raise CustomException(ErrorDesc.NAME_EXISTED, "Application.shown_name")
   # 创建所有桶, 并且开启版本控制
-  return await public_crud.create_application(name, shown_name, description, current_user)
+  app = await public_crud.create_application(name, shown_name, description, current_user)
+  try:
+    await sync_module.publish_application(app)
+  except Exception as e:
+    logger.warning(f"Application 同步到 Etcd 失败: {e}")
+  return app
 
 async def get_application_list() -> dict[str, List[Application]]:
   """
@@ -368,6 +405,60 @@ async def enable_application(
   }):
     yield chunk
 
+  # 跨节点同步：发布 Application 到 Etcd
+  async for chunk in _emit({
+    "step": "sync",
+    "server_name": None,
+    "status": "running",
+    "message": "同步应用信息到其他节点",
+  }):
+    yield chunk
+  try:
+    await sync_module.publish_application(application_obj)
+    sync_msg = "应用信息已同步到其他节点"
+    sync_status = "ok"
+  except Exception as e:
+    sync_msg = f"应用信息同步失败: {e}"
+    sync_status = "failed"
+    logger.warning(sync_msg)
+  async for chunk in _emit({
+    "step": "sync",
+    "server_name": None,
+    "status": sync_status,
+    "message": sync_msg,
+  }):
+    yield chunk
+
+  # 配置 bucket 级复制规则
+  async for chunk in _emit({
+    "step": "replicate",
+    "server_name": None,
+    "status": "running",
+    "message": "配置存储桶跨节点复制规则",
+  }):
+    yield chunk
+  try:
+    await sync_module.setup_bucket_replication(application_obj.name, server_names)
+    rep_msg = "存储桶复制规则配置完成"
+    rep_status = "ok"
+  except Exception as e:
+    rep_msg = f"存储桶复制规则配置失败: {e}"
+    rep_status = "failed"
+    logger.warning(rep_msg)
+  async for chunk in _emit({
+    "step": "replicate",
+    "server_name": None,
+    "status": rep_status,
+    "message": rep_msg,
+  }):
+    yield chunk
+
+  # 持久化桶记录
+  try:
+    await storage_crud.bulk_create_minio_bucket(application_obj)
+  except Exception as e:
+    logger.warning(f"MinioBucket 记录写入失败: {e}")
+
   async for chunk in _emit({
     "step": "done",
     "server_name": None,
@@ -411,13 +502,10 @@ async def create_api_key(
   while await public_crud.read_api_key_by_key(key):
     key = generate_api_key()
   api_key_obj = await public_crud.create_api_key(application_obj, key, expired_at)
-  # 将 API Key 数据同步到 Agent 中
-  # async with RedisOp() as redis_op:
-  #   await redis_op.publish_api_key_create_patch(
-  #     api_key=api_key_obj.key,
-  #     app_name=application_obj.name,
-  #     expired_at=expired_at,
-  #   )
+  try:
+    await sync_module.publish_api_key(api_key_obj)
+  except Exception as e:
+    logger.warning(f"API Key 同步到 Etcd 失败: {e}")
   return api_key_obj
 
 async def get_api_key_list(
@@ -440,3 +528,26 @@ async def get_api_key_list(
       "expired_at": api_key_obj.expired_at
     })
   return dict[str, List[APIKey]](data=data)
+
+async def revoke_api_key(
+  api_key_id: ObjectId,
+  current_user: User) -> dict:
+  """
+  吊销 API 密钥
+  """
+  api_key_obj = await public_crud.read_api_key_by_id(api_key_id)
+  if not api_key_obj:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "API密钥不存在")
+  application_obj = await public_crud.read_application_by_id(api_key_obj.application.id)
+  if not application_obj or application_obj.author.id != current_user.id:
+    raise CustomException(ErrorDesc.RES_NOT_BELONG_TO_USER, "API密钥不属于当前用户")
+  if api_key_obj.deleted:
+    raise CustomException(ErrorDesc.STATUS_ERR, "API密钥已吊销")
+  await public_crud.delete_api_key_by_id(api_key_id)
+  try:
+    revoked = await public_crud.read_api_key_by_key_including_deleted(api_key_obj.key)
+    if revoked:
+      await sync_module.publish_api_key(revoked)
+  except Exception as e:
+    logger.warning(f"API Key 吊销同步到 Etcd 失败: {e}")
+  return {"message": "API密钥已吊销"}

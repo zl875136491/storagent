@@ -249,11 +249,17 @@ async def read_api_key_by_id(api_key_id: str | ObjectId) -> APIKey | None:
   获取API密钥
   """
   api_key_id = try_to_obj_id(api_key_id)
-  return await APIKey.find_one(APIKey.id == api_key_id)
+  return await APIKey.find_one(APIKey.id == api_key_id, fetch_links=True)
 
 async def read_api_key_by_key(key: str) -> APIKey | None:
   """
-  获取API密钥
+  获取API密钥（不含已吊销）
+  """
+  return await APIKey.find_one(APIKey.key == key, APIKey.deleted == False, fetch_links=True)
+
+async def read_api_key_by_key_including_deleted(key: str) -> APIKey | None:
+  """
+  获取API密钥（含已吊销，用于跨节点同步）
   """
   return await APIKey.find_one(APIKey.key == key, fetch_links=True)
 
@@ -311,12 +317,14 @@ async def create_shell_command_log(
   stdout: str = "",
   stderr: str = "") -> ShellCommandLog:
   """
-  创建Shell命令日志
+  创建Shell命令日志（命令中的凭证已脱敏）
   """
+  from src.core.crypto import redact_shell_command
+
   if command == "mc alias list --json":
     return None
   shell_command_log = ShellCommandLog(
-    command=command,
+    command=redact_shell_command(command),
     stdout=stdout,
     stderr=stderr
   )

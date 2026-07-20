@@ -6,10 +6,11 @@ class MinioServerCreateRequest(BaseModel):
   region: PydanticObjectId
   name: str
   host: str
-  port: int
+  server_port: int
+  minio_port: int
   access_key: str
   secret_key: str
-  replicate_weight: int
+  replicate_weight: int = 0
 
 class MinioServerUpdateRequest(BaseModel):
   replicate_weight: int
@@ -27,7 +28,6 @@ class MinioServerResponse(BaseModel):
   server_port: int
   minio_port: int
   master: bool
-  secret_key: str
   replicate_weight: int
 
 class MinioServerListResponse(BaseModel):

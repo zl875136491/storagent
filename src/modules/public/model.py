@@ -49,7 +49,7 @@ class APIKey(Document):
     name = "api_key"
     indexes = [
       IndexModel(["key"], unique=True),
-      IndexModel(["app"]),
+      IndexModel(["application"]),
       IndexModel(["expired_at"]),
     ]
 

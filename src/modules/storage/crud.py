@@ -5,6 +5,7 @@ from src.modules.public.model import Region
 from src.modules.public.model import Application
 from src.modules.storage.model import MinioBucket
 from src.core.exception import CustomException, ErrorDesc
+from src.core.crypto import encrypt_secret, minio_server_plain_credentials
 from loguru import logger
 from src.utils.helpers import try_to_obj_id
 from src.configs.configs import settings
@@ -19,20 +20,7 @@ async def create_minio_server(
   secret_key: str,
   replicate_weight: int) -> MinioServer:
   """
-  创建 Minio 服务器
-
-  Args:
-    region: 区域
-    name: 服务器名称
-    host: 服务器主机
-    server_port: 服务器端口
-    minio_port: Minio 端口
-    access_key: 访问密钥
-    secret_key: 密钥
-    replicate_weight: 复制集权重
-
-  Returns:
-    MinioServer: Minio 服务器
+  创建 Minio 服务器（凭证落库前加密）
   """
   if region.name == settings.REGION:
     master = True
@@ -45,8 +33,8 @@ async def create_minio_server(
     server_port=server_port,
     minio_port=minio_port,
     master=master,
-    access_key=access_key,
-    secret_key=secret_key,
+    access_key=encrypt_secret(access_key),
+    secret_key=encrypt_secret(secret_key),
     replicate_weight=replicate_weight
   )
   try:
@@ -65,16 +53,20 @@ async def update_minio_server(
   secret_key: str,
   replicate_weight: int) -> MinioServer:
   """
-  更新 Minio 服务器
+  更新 Minio 服务器（凭证落库前加密）
   """
   minio_server.host = host
   minio_server.server_port = server_port
   minio_server.minio_port = minio_port
-  minio_server.access_key = access_key
-  minio_server.secret_key = secret_key
+  minio_server.access_key = encrypt_secret(access_key)
+  minio_server.secret_key = encrypt_secret(secret_key)
   minio_server.replicate_weight = replicate_weight
   await minio_server.save()
   return minio_server
+
+def plain_minio_credentials(minio_server: MinioServer) -> tuple[str, str]:
+  """解密 Mongo 中的 MinIO 凭证。"""
+  return minio_server_plain_credentials(minio_server.access_key, minio_server.secret_key)
 
 async def read_master_minio_server() -> MinioServer | None:
   """
@@ -93,6 +85,16 @@ async def read_minio_server_by_region(region: Region) -> MinioServer | None:
     MinioServer.region.id == region.id
   )
 
+async def read_minio_server_by_region_name(region_name: str) -> MinioServer | None:
+  """
+  根据区域名称获取 Minio 服务器
+  """
+  from src.modules.public import crud as public_crud
+  region_obj = await public_crud.read_region_by_name(region_name)
+  if not region_obj:
+    return None
+  return await read_minio_server_by_region(region_obj)
+
 async def read_minio_server_by_fqdn(host: str, minio_port: int) -> MinioServer | None:
   """
   根据 FQDN 获取 Minio 服务器
@@ -107,7 +109,7 @@ async def read_minio_server_by_id(id: str | ObjectId) -> MinioServer | None:
   根据 ID 获取 Minio 服务器
   """
   id = try_to_obj_id(id)
-  return await MinioServer.find_one(MinioServer.id == id)
+  return await MinioServer.find_one(MinioServer.id == id, fetch_links=True)
 
 async def read_minio_server_list() -> List[MinioServer]:
   return await MinioServer.find_all(fetch_links=True).to_list()

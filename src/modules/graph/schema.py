@@ -26,3 +26,9 @@ class BucketEdgePositionResponse(BaseModel):
   to_server: str = Field(..., description="目标服务器名称")
   from_position: str = Field(..., description="起始节点位置")
   to_position: str = Field(..., description="目标节点位置")
+
+class BucketNodePositionListResponse(BaseModel):
+  data: list[BucketNodePositionResponse]
+
+class BucketEdgePositionListResponse(BaseModel):
+  data: list[BucketEdgePositionResponse]
