@@ -452,6 +452,8 @@ async def create_api_key(
     await sync_module.publish_api_key(api_key_obj)
   except Exception as e:
     logger.warning(f"API Key 同步到 Etcd 失败: {e}")
+  # 仅创建响应返回一次明文
+  api_key_obj.key = key
   return api_key_obj
 
 async def get_api_key_list(
@@ -463,9 +465,10 @@ async def get_api_key_list(
   api_key_objs = await public_crud.read_api_key_by_app(users_app_objs)
   data = []
   for api_key_obj in api_key_objs:
+    hint = api_key_obj.key_hint or "************"
     data.append({
       "id": api_key_obj.id,
-      "key": f"{api_key_obj.key[:7]}************{api_key_obj.key[-4:]}",
+      "key": hint,
       "application": {
         "id": api_key_obj.application.id,
         "name": api_key_obj.application.name,
@@ -491,7 +494,7 @@ async def revoke_api_key(
     raise CustomException(ErrorDesc.STATUS_ERR, "API密钥已吊销")
   await public_crud.delete_api_key_by_id(api_key_id)
   try:
-    revoked = await public_crud.read_api_key_by_key_including_deleted(api_key_obj.key)
+    revoked = await public_crud.read_api_key_by_id(api_key_id)
     if revoked:
       await sync_module.publish_api_key(revoked)
   except Exception as e:

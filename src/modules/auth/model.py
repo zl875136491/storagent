@@ -46,12 +46,15 @@ class TempCode(Document):
     ]
   
 class DestoryedToken(Document):
-  token: str
+  """吊销的 JWT。优先用 token_hash 跨区同步；token 字段兼容旧数据。"""
+  token: str = Field(default="")
+  token_hash: str = Field(default="")
   expired_at: datetime
   
   class Settings:
     name = "destoryed_token"
     indexes = [
-      IndexModel(["token"], unique=True),
+      IndexModel(["token"]),
+      IndexModel(["token_hash"]),
       IndexModel(["expired_at"]),
     ]

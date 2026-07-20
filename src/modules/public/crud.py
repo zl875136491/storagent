@@ -223,11 +223,15 @@ async def create_api_key(
   key: str,
   expired_at: datetime) -> APIKey:
   """
-  创建API密钥
+  创建API密钥：Mongo 仅存哈希 + 提示 + 密文
   """
+  from src.core.crypto import api_key_etcd_map_key, api_key_hint, encrypt_secret
+
   api_key = APIKey(
     application=application,
-    key=key,
+    key=api_key_etcd_map_key(key),
+    key_hint=api_key_hint(key),
+    key_enc=encrypt_secret(key),
     expired_at=expired_at
   )
   await api_key.save()
@@ -251,17 +255,49 @@ async def read_api_key_by_id(api_key_id: str | ObjectId) -> APIKey | None:
   api_key_id = try_to_obj_id(api_key_id)
   return await APIKey.find_one(APIKey.id == api_key_id, fetch_links=True)
 
+async def _migrate_legacy_api_key_plaintext(api_key_obj: APIKey, plain_key: str) -> APIKey:
+  from src.core.crypto import api_key_etcd_map_key, api_key_hint, encrypt_secret, is_sha256_hex
+
+  if is_sha256_hex(api_key_obj.key) and api_key_obj.key_enc:
+    return api_key_obj
+  api_key_obj.key = api_key_etcd_map_key(plain_key)
+  api_key_obj.key_hint = api_key_obj.key_hint or api_key_hint(plain_key)
+  api_key_obj.key_enc = encrypt_secret(plain_key)
+  await api_key_obj.save()
+  return api_key_obj
+
 async def read_api_key_by_key(key: str) -> APIKey | None:
   """
-  获取API密钥（不含已吊销）
+  获取API密钥（不含已吊销）。按哈希查询，兼容历史明文行并就地迁移。
   """
-  return await APIKey.find_one(APIKey.key == key, APIKey.deleted == False, fetch_links=True)
+  from src.core.crypto import api_key_etcd_map_key
+
+  hashed = api_key_etcd_map_key(key)
+  found = await APIKey.find_one(APIKey.key == hashed, APIKey.deleted == False, fetch_links=True)
+  if found:
+    return found
+  legacy = await APIKey.find_one(APIKey.key == key, APIKey.deleted == False, fetch_links=True)
+  if legacy:
+    return await _migrate_legacy_api_key_plaintext(legacy, key)
+  return None
 
 async def read_api_key_by_key_including_deleted(key: str) -> APIKey | None:
   """
   获取API密钥（含已吊销，用于跨节点同步）
   """
-  return await APIKey.find_one(APIKey.key == key, fetch_links=True)
+  from src.core.crypto import api_key_etcd_map_key, is_sha256_hex
+
+  if is_sha256_hex(key):
+    return await APIKey.find_one(APIKey.key == key, fetch_links=True)
+  hashed = api_key_etcd_map_key(key)
+  found = await APIKey.find_one(APIKey.key == hashed, fetch_links=True)
+  if found:
+    return found
+  legacy = await APIKey.find_one(APIKey.key == key, fetch_links=True)
+  if legacy:
+    return await _migrate_legacy_api_key_plaintext(legacy, key)
+  return None
+
 
 async def delete_api_key_by_id(api_key_id: str | ObjectId) -> bool:
   """
