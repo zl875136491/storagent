@@ -152,6 +152,10 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
       app_obj.approver = approver
     changed = True
     newly_enabled = True
+  elif data.get("enabled") is False and app_obj.enabled:
+    app_obj.enabled = False
+    changed = True
+    newly_enabled = False
   else:
     newly_enabled = False
   if changed:
@@ -225,6 +229,7 @@ async def sync_api_keys_to_mongo(api_keys_data: dict):
 
 async def sync_region_to_mongo(region_data: dict):
   from src.modules.public import crud as public_crud
+  from src.modules.public.model import Region
 
   for region_value, region_name in region_data.items():
     region_obj = await public_crud.read_region_by_name(region_value)
@@ -235,6 +240,15 @@ async def sync_region_to_mongo(region_data: dict):
       region_obj.shown_name = region_name
       await region_obj.save()
       logger.info(f"Etcd sync: 更新 Region {region_value} shown_name")
+
+  # 收敛：Etcd 中已移除的远程 Region（保留本节点 REGION）
+  known = set(region_data.keys())
+  for region_obj in await Region.find_all().to_list():
+    if region_obj.name == settings.REGION:
+      continue
+    if region_obj.name not in known:
+      await region_obj.delete()
+      logger.info(f"Etcd sync: 移除已下线 Region {region_obj.name}")
 
 
 async def sync_servers_to_mongo(servers_data: dict) -> list[str]:
@@ -280,7 +294,41 @@ async def sync_servers_to_mongo(servers_data: dict) -> list[str]:
         secret_key=server_data["secret_key"],
         replicate_weight=server_data["replicate_weight"],
       )
+
+  # 收敛：移除 Etcd 中已不存在的远程 MinIO（保留本节点）
+  known = set(servers_data.keys())
+  for server_obj in await storage_crud.read_minio_server_list():
+    region = server_obj.region
+    region_name = region.name if region and hasattr(region, "name") else server_obj.name
+    if region_name == settings.REGION:
+      continue
+    if region_name not in known:
+      await server_obj.delete()
+      logger.info(f"Etcd sync: 移除已下线 MinIO 服务器 {region_name}")
+
   return new_servers
+
+
+async def unpublish_region(region_name: str) -> None:
+  """从 Etcd region map 移除区域（跨节点下线）。"""
+  from src.core import etcd_op
+
+  def mutator(data: dict) -> dict:
+    data.pop(region_name, None)
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_REGION, mutator)
+
+
+async def unpublish_server(region_name: str) -> None:
+  """从 Etcd servers map 移除服务点。"""
+  from src.core import etcd_op
+
+  def mutator(data: dict) -> dict:
+    data.pop(region_name, None)
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_SERVERS, mutator)
 
 
 async def setup_mc_aliases(servers_data: dict):

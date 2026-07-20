@@ -55,6 +55,22 @@ async def _handle_etcd_put(key: str, value: str):
     await sync_module.sync_api_keys_to_mongo(data)
 
 
+async def _handle_etcd_delete(key: str):
+  """
+  处理 Etcd DELETE：整 key 被删时，按空 map 收敛拓扑；应用/密钥仅告警不批量清空
+  """
+  short_key = key.replace(ETCD_PREFIX, "")
+  logger.warning(f"Etcd key 已删除: {short_key}")
+  if short_key == sync_module.ETCD_KEY_REGION:
+    await sync_module.sync_region_to_mongo({})
+  elif short_key == sync_module.ETCD_KEY_SERVERS:
+    await sync_module.sync_servers_to_mongo({})
+  elif short_key in (sync_module.ETCD_KEY_APPLICATIONS, sync_module.ETCD_KEY_API_KEYS):
+    logger.warning(f"跳过对 {short_key} 的批量清空，等待显式 PUT 收敛")
+  else:
+    logger.info(f"未处理的 Etcd DELETE: {short_key}")
+
+
 async def watch_etcd_task(client: aetcd.Client):
   """
   增量更新订阅：监听 Etcd 变更并同步到 MongoDB（断线自动重连）
@@ -68,9 +84,13 @@ async def watch_etcd_task(client: aetcd.Client):
         backoff = 1.0
         key = event.kv.key.decode("utf-8")
         value = event.kv.value.decode("utf-8") if event.kv.value else ""
-        logger.info(f"Etcd 变更: {key}")
+        kind = getattr(event, "kind", "PUT")
+        logger.info(f"Etcd 变更: {kind} {key}")
         try:
-          await _handle_etcd_put(key, value)
+          if kind == "DELETE":
+            await _handle_etcd_delete(key)
+          else:
+            await _handle_etcd_put(key, value)
         except Exception as e:
           logger.warning(f"Etcd 事件处理失败: {e}")
     except asyncio.CancelledError:

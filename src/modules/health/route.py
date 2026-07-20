@@ -23,9 +23,11 @@ async def health_check():
   summary="就绪检查")
 async def readiness_check():
   """
-  就绪探针：MongoDB 不可用时返回 HTTP 503，便于编排摘流
+  就绪探针：MongoDB / Etcd 不可用时返回 HTTP 503，便于编排摘流
   """
   from src.core.database import get_motor_client
+  from src.core.etcd_op import get_etcd_client
+
   client = get_motor_client()
   if client is None:
     return JSONResponse(
@@ -34,9 +36,26 @@ async def readiness_check():
     )
   try:
     await client.admin.command("ping")
-    return {"status": "ready", "region": settings.REGION}
   except Exception as e:
     return JSONResponse(
       status_code=503,
-      content={"status": "not_ready", "reason": str(e), "region": settings.REGION},
+      content={"status": "not_ready", "reason": f"database: {e}", "region": settings.REGION},
     )
+
+  etcd = None
+  try:
+    etcd = await get_etcd_client()
+    await etcd.status()
+  except Exception as e:
+    return JSONResponse(
+      status_code=503,
+      content={"status": "not_ready", "reason": f"etcd: {e}", "region": settings.REGION},
+    )
+  finally:
+    if etcd is not None:
+      try:
+        await etcd.close()
+      except Exception:
+        pass
+
+  return {"status": "ready", "region": settings.REGION}

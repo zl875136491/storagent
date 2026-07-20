@@ -58,6 +58,20 @@ async def get_region_list(
   """
   return await public_service.get_region_list()
 
+@router.delete(
+  path="/region/{region_id}",
+  response_model=public_schema.SimpleMessageResponse,
+  summary="下线区域")
+async def offline_region(
+  region_id: public_schema.PydanticObjectId,
+  current_user: User = Depends(get_current_user),
+) -> public_schema.SimpleMessageResponse:
+  """
+  从 Etcd 拓扑与本地库下线区域（需 region_manage；不可下线本节点）
+  """
+  await check_permissions(current_user, ["region_manage"])
+  return await public_service.offline_region(region_id)
+
 @router.post(
   path="/application",
   response_model=public_schema.ApplicationResponse,

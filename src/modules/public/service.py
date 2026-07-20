@@ -88,6 +88,31 @@ async def create_region(
     logger.warning(f"Region 同步到 Etcd 失败: {e}")
   return region
 
+async def offline_region(region_id) -> dict:
+  """
+  下线区域：从 Etcd 拓扑移除并删除本地 Region / MinIO 记录（禁止下线本节点 REGION）
+  """
+  from src.modules.storage import crud as storage_crud
+
+  region = await public_crud.read_region_by_id(region_id)
+  if not region:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "Region")
+  if region.name == settings.REGION:
+    raise CustomException(ErrorDesc.OPERATION_NOT_ALLOWED, "不能下线本节点区域")
+
+  try:
+    await sync_module.unpublish_server(region.name)
+    await sync_module.unpublish_region(region.name)
+  except Exception as e:
+    logger.warning(f"Region 下线同步 Etcd 失败: {e}")
+    raise CustomException(ErrorDesc.DB_UPDATE_FAILED, f"Etcd 下线失败: {e}")
+
+  server = await storage_crud.read_minio_server_by_region(region)
+  if server:
+    await server.delete()
+  await region.delete()
+  return {"message": f"区域 {region.name} 已下线"}
+
 async def get_region_list() -> dict[str, List[Region]]:
   """
   获取区域列表
