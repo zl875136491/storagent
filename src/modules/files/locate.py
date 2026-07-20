@@ -58,7 +58,9 @@ async def _stat_on_server(server: MinioServer, bucket: str, object_key: str):
   """在指定 MinIO 节点上 stat 对象，不存在/超时则返回 None"""
 
   def _do():
-    client = get_minio_client(server.host, server.minio_port, server.access_key, server.secret_key)
+    from src.modules.storage import crud as storage_crud
+    access_key, secret_key = storage_crud.plain_minio_credentials(server)
+    client = get_minio_client(server.host, server.minio_port, access_key, secret_key)
     return client.stat_object(bucket, object_key)
 
   try:

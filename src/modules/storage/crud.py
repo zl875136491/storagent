@@ -5,6 +5,7 @@ from src.modules.public.model import Region
 from src.modules.public.model import Application
 from src.modules.storage.model import MinioBucket
 from src.core.exception import CustomException, ErrorDesc
+from src.core.crypto import encrypt_secret, minio_server_plain_credentials
 from loguru import logger
 from src.utils.helpers import try_to_obj_id
 from src.configs.configs import settings
@@ -19,20 +20,7 @@ async def create_minio_server(
   secret_key: str,
   replicate_weight: int) -> MinioServer:
   """
-  创建 Minio 服务器
-
-  Args:
-    region: 区域
-    name: 服务器名称
-    host: 服务器主机
-    server_port: 服务器端口
-    minio_port: Minio 端口
-    access_key: 访问密钥
-    secret_key: 密钥
-    replicate_weight: 复制集权重
-
-  Returns:
-    MinioServer: Minio 服务器
+  创建 Minio 服务器（凭证落库前加密）
   """
   if region.name == settings.REGION:
     master = True
@@ -45,8 +33,8 @@ async def create_minio_server(
     server_port=server_port,
     minio_port=minio_port,
     master=master,
-    access_key=access_key,
-    secret_key=secret_key,
+    access_key=encrypt_secret(access_key),
+    secret_key=encrypt_secret(secret_key),
     replicate_weight=replicate_weight
   )
   await minio_server.save()
@@ -61,16 +49,20 @@ async def update_minio_server(
   secret_key: str,
   replicate_weight: int) -> MinioServer:
   """
-  更新 Minio 服务器
+  更新 Minio 服务器（凭证落库前加密）
   """
   minio_server.host = host
   minio_server.server_port = server_port
   minio_server.minio_port = minio_port
-  minio_server.access_key = access_key
-  minio_server.secret_key = secret_key
+  minio_server.access_key = encrypt_secret(access_key)
+  minio_server.secret_key = encrypt_secret(secret_key)
   minio_server.replicate_weight = replicate_weight
   await minio_server.save()
   return minio_server
+
+def plain_minio_credentials(minio_server: MinioServer) -> tuple[str, str]:
+  """解密 Mongo 中的 MinIO 凭证。"""
+  return minio_server_plain_credentials(minio_server.access_key, minio_server.secret_key)
 
 async def read_master_minio_server() -> MinioServer | None:
   """
