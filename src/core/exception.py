@@ -69,6 +69,8 @@ class ErrorDesc(Enum):
   APP_NOT_ENABLED = ("应用未启用", 400031)
   
   # file
+  OBJECT_NOT_FOUND = ("对象不存在", 404033)
+  OBJECT_NOT_FOUND_LOCAL = ("对象在本节点不存在", 404032)
   INTERNAL_SERVER_ERROR = ("服务器内部错误", 500001)
   
 
