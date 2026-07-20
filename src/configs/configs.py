@@ -40,6 +40,10 @@ class Settings(BaseSettings):
   # 服务器名称
   SERVER_HOST: str = "localhost"
   SERVER_PORT: int = 9000
+  # 对外暴露的 API URL 协议（endpoints / locate 指引）
+  PUBLIC_SCHEME: str = "http"
+  # 跨节点 locate 单节点 stat 超时（秒）
+  OBJECT_LOCATE_TIMEOUT: float = 5.0
 
   # MongoDB
   MONGO_DB_HOST: str = "localhost"
