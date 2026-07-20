@@ -369,13 +369,14 @@ async def publish_application(app) -> None:
   app = await public_crud.read_application_by_id(app.id)
   if not app:
     return
-  client = await etcd_op.get_etcd_client()
-  try:
-    data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_APPLICATIONS, client=client)
-    data[app.name] = application_to_etcd_entry(app)
-    await etcd_op.push_to_etcd(ETCD_KEY_APPLICATIONS, data, client=client)
-  finally:
-    await client.close()
+  entry = application_to_etcd_entry(app)
+  name = app.name
+
+  def mutator(data: dict) -> dict:
+    data[name] = entry
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_APPLICATIONS, mutator)
 
 
 async def publish_api_key(api_key_obj) -> None:
@@ -385,47 +386,47 @@ async def publish_api_key(api_key_obj) -> None:
   api_key_obj = await public_crud.read_api_key_by_key_including_deleted(api_key_obj.key)
   if not api_key_obj:
     return
-  client = await etcd_op.get_etcd_client()
-  try:
-    data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_API_KEYS, client=client)
-    map_key = api_key_etcd_map_key(api_key_obj.key)
-    if api_key_obj.key in data and api_key_obj.key != map_key:
-      data.pop(api_key_obj.key, None)
-    data[map_key] = api_key_to_etcd_entry(api_key_obj)
-    await etcd_op.push_to_etcd(ETCD_KEY_API_KEYS, data, client=client)
-  finally:
-    await client.close()
+  map_key = api_key_etcd_map_key(api_key_obj.key)
+  entry = api_key_to_etcd_entry(api_key_obj)
+  plain_key = api_key_obj.key
+
+  def mutator(data: dict) -> dict:
+    if plain_key in data and plain_key != map_key:
+      data.pop(plain_key, None)
+    data[map_key] = entry
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_API_KEYS, mutator)
 
 
 async def publish_region(region_name: str, shown_name: str) -> None:
   from src.core import etcd_op
 
-  client = await etcd_op.get_etcd_client()
-  try:
-    data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_REGION, client=client)
+  def mutator(data: dict) -> dict:
     data[region_name] = shown_name
-    await etcd_op.push_to_etcd(ETCD_KEY_REGION, data, client=client)
-  finally:
-    await client.close()
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_REGION, mutator)
 
 
 async def publish_servers() -> None:
   from src.core import etcd_op
 
-  client = await etcd_op.get_etcd_client()
-  try:
-    data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_SERVERS, client=client)
-    data[settings.REGION] = encrypt_server_entry({
-      "host": settings.SERVER_HOST,
-      "server_port": settings.SERVER_PORT,
-      "minio_port": settings.MINIO_PORT,
-      "access_key": settings.MINIO_ACCESS_KEY,
-      "secret_key": settings.MINIO_SECRET_KEY,
-      "replicate_weight": settings.MINIO_REPLICATE_WEIGHT,
-    })
-    await etcd_op.push_to_etcd(ETCD_KEY_SERVERS, data, client=client)
-  finally:
-    await client.close()
+  entry = encrypt_server_entry({
+    "host": settings.SERVER_HOST,
+    "server_port": settings.SERVER_PORT,
+    "minio_port": settings.MINIO_PORT,
+    "access_key": settings.MINIO_ACCESS_KEY,
+    "secret_key": settings.MINIO_SECRET_KEY,
+    "replicate_weight": settings.MINIO_REPLICATE_WEIGHT,
+  })
+  region = settings.REGION
+
+  def mutator(data: dict) -> dict:
+    data[region] = entry
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_SERVERS, mutator)
 
 
 async def publish_server_entry(
@@ -439,20 +440,20 @@ async def publish_server_entry(
 ) -> None:
   from src.core import etcd_op
 
-  client = await etcd_op.get_etcd_client()
-  try:
-    data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_SERVERS, client=client)
-    data[region_name] = encrypt_server_entry({
-      "host": host,
-      "server_port": server_port,
-      "minio_port": minio_port,
-      "access_key": access_key,
-      "secret_key": secret_key,
-      "replicate_weight": replicate_weight,
-    })
-    await etcd_op.push_to_etcd(ETCD_KEY_SERVERS, data, client=client)
-  finally:
-    await client.close()
+  entry = encrypt_server_entry({
+    "host": host,
+    "server_port": server_port,
+    "minio_port": minio_port,
+    "access_key": access_key,
+    "secret_key": secret_key,
+    "replicate_weight": replicate_weight,
+  })
+
+  def mutator(data: dict) -> dict:
+    data[region_name] = entry
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_SERVERS, mutator)
 
 
 async def pull_all_and_sync(client=None):

@@ -34,15 +34,16 @@ async def init_service():
     )
     logger.info(f"Minio Server Tested: {settings.MINIO_HOST}:{settings.MINIO_PORT}.")
 
-    # 1. 注册本节点 Region 到 Etcd
-    region_data = await etcd_op.pull_from_etcd_by_key(sync_module.ETCD_KEY_REGION, client=etcd_client)
-    region_data[settings.REGION] = settings.REGION_NAME
-    await etcd_op.push_to_etcd(sync_module.ETCD_KEY_REGION, region_data, client=etcd_client)
+    # 1. 注册本节点 Region 到 Etcd（CAS 合并）
+    await etcd_op.merge_update_etcd_key(
+      sync_module.ETCD_KEY_REGION,
+      lambda data: {**data, settings.REGION: settings.REGION_NAME},
+      client=etcd_client,
+    )
 
-    # 2. 注册本节点 MinIO Server 到 Etcd（凭证加密）
+    # 2. 注册本节点 MinIO Server 到 Etcd（凭证加密 + CAS）
     from src.core.crypto import encrypt_server_entry
-    servers_data = await etcd_op.pull_from_etcd_by_key(sync_module.ETCD_KEY_SERVERS, client=etcd_client)
-    servers_data[settings.REGION] = encrypt_server_entry({
+    entry = encrypt_server_entry({
       "host": settings.SERVER_HOST,
       "server_port": settings.SERVER_PORT,
       "minio_port": settings.MINIO_PORT,
@@ -50,7 +51,11 @@ async def init_service():
       "secret_key": settings.MINIO_SECRET_KEY,
       "replicate_weight": settings.MINIO_REPLICATE_WEIGHT,
     })
-    await etcd_op.push_to_etcd(sync_module.ETCD_KEY_SERVERS, servers_data, client=etcd_client)
+    await etcd_op.merge_update_etcd_key(
+      sync_module.ETCD_KEY_SERVERS,
+      lambda data: {**data, settings.REGION: entry},
+      client=etcd_client,
+    )
 
     # 3. 全量同步 Etcd -> MongoDB（含 applications / api_keys）
     await sync_module.pull_all_and_sync(client=etcd_client)
