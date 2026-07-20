@@ -1,4 +1,5 @@
 from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 from src.configs.configs import settings
 
 router = APIRouter()
@@ -8,7 +9,7 @@ router = APIRouter()
   summary="健康检查")
 async def health_check():
   """
-  服务健康检查，用于负载均衡和容器编排探针
+  存活探针：进程正常即可（不依赖外部依赖）
   """
   return {
     "status": "ok",
@@ -22,14 +23,20 @@ async def health_check():
   summary="就绪检查")
 async def readiness_check():
   """
-  就绪检查，验证数据库连接是否可用
+  就绪探针：MongoDB 不可用时返回 HTTP 503，便于编排摘流
   """
   from src.core.database import get_motor_client
   client = get_motor_client()
   if client is None:
-    return {"status": "not_ready", "reason": "database not initialized"}
+    return JSONResponse(
+      status_code=503,
+      content={"status": "not_ready", "reason": "database not initialized", "region": settings.REGION},
+    )
   try:
     await client.admin.command("ping")
     return {"status": "ready", "region": settings.REGION}
   except Exception as e:
-    return {"status": "not_ready", "reason": str(e)}
+    return JSONResponse(
+      status_code=503,
+      content={"status": "not_ready", "reason": str(e), "region": settings.REGION},
+    )

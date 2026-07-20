@@ -23,6 +23,8 @@ class User(Document):
   hashed_password: str
   roles: List[Link[Role]] = Field(default=[])
   permissions: List[str] = Field(default=[])
+  """跨节点同步创建的占位用户，禁止登录"""
+  is_sync: bool = Field(default=False)
   created_at: datetime = Field(default_factory=utc_now)
   updated_at: datetime = Field(default_factory=utc_now)
   
