@@ -11,7 +11,11 @@ source="https://pypi.tuna.tsinghua.edu.cn/simple"
 
 # 启动项目
 function run() {
-  uvicorn main:app --host 0.0.0.0 --port=$SERVER_PORT --timeout-graceful-shutdown 1 --reload --reload-exclude '*/tests/*'
+  RELOAD_FLAG=""
+  if [ "${RELOAD:-true}" = "true" ]; then
+    RELOAD_FLAG="--reload --reload-exclude '*/tests/*'"
+  fi
+  uvicorn main:app --host 0.0.0.0 --port=${SERVER_PORT:-9000} --timeout-graceful-shutdown 1 $RELOAD_FLAG
 }
 
 function stop() {

@@ -1,7 +1,9 @@
+import asyncio
 from src.modules.auth.model import User, Role, DestoryedToken
 from typing import List
 from src.utils.helpers import utc_now, get_full_permissions
 from src.core.exception import CustomException, ErrorDesc
+from src.utils.logger import logger
 
 async def read_user_by_username(username: str) -> User:
   """
@@ -92,6 +94,32 @@ async def destroy_token(token: str) -> None:
   销毁 token
   """
   await DestoryedToken(token=token, expired_at=utc_now()).save()
+
+async def cleanup_expired_tokens() -> int:
+  """
+  清理已过期的黑名单 token
+  """
+  now = utc_now()
+  expired = await DestoryedToken.find(DestoryedToken.expired_at < now).to_list()
+  count = len(expired)
+  for token_obj in expired:
+    await token_obj.delete()
+  return count
+
+async def cleanup_expired_tokens_task():
+  """
+  后台任务：每小时清理过期 token
+  """
+  while True:
+    try:
+      count = await cleanup_expired_tokens()
+      if count:
+        logger.info(f"清理了 {count} 条过期 token")
+    except asyncio.CancelledError:
+      break
+    except Exception as e:
+      logger.warning(f"token 清理失败: {e}")
+    await asyncio.sleep(3600)
 
 async def get_all_permissions(roles: List[Role]) -> List[str]:
   """

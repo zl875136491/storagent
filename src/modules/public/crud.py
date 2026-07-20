@@ -249,11 +249,17 @@ async def read_api_key_by_id(api_key_id: str | ObjectId) -> APIKey | None:
   获取API密钥
   """
   api_key_id = try_to_obj_id(api_key_id)
-  return await APIKey.find_one(APIKey.id == api_key_id)
+  return await APIKey.find_one(APIKey.id == api_key_id, fetch_links=True)
 
 async def read_api_key_by_key(key: str) -> APIKey | None:
   """
-  获取API密钥
+  获取API密钥（不含已吊销）
+  """
+  return await APIKey.find_one(APIKey.key == key, APIKey.deleted == False, fetch_links=True)
+
+async def read_api_key_by_key_including_deleted(key: str) -> APIKey | None:
+  """
+  获取API密钥（含已吊销，用于跨节点同步）
   """
   return await APIKey.find_one(APIKey.key == key, fetch_links=True)
 

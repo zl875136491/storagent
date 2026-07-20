@@ -121,6 +121,7 @@ class Endpoint(BaseModel):
   shown_name: str
   master: bool
   endpoint: str
+  minio_endpoint: str
 
 class EndpointsResponse(BaseModel):
   data: List[Endpoint]

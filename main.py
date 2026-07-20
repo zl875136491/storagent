@@ -9,10 +9,13 @@ from src.utils.logger import setup_logging
 from src.core.initialization import init_project, init_service
 from src.core.etcd_op import get_etcd_client, watch_etcd_task
 from src.core.exception import register_exception
+from src.modules.auth.crud import cleanup_expired_tokens_task
 import asyncio
 
 app_description = """
-Manufacture Management Backend
+Storagent — 多区域 MinIO 对象存储管理后端
+
+提供用户认证、应用/API Key 管理、S3 分片上传下载、存储拓扑可视化等能力。
 """
 
 @asynccontextmanager
@@ -29,17 +32,29 @@ async def lifespan(app: FastAPI):
   # 3. 初始化项目
   await init_project()
 
-  # 4. 初始化服务
-  await init_service()
+  # 4. 初始化服务（Region/MinIO 注册到 Etcd 并同步 MongoDB）
+  if settings.INIT_SERVICE:
+    try:
+      await init_service()
+    except Exception as e:
+      from src.utils.logger import logger
+      logger.warning(f"init_service 失败（服务仍可启动）: {e}")
   
   # 5. Etcd 监听
   etcd_client = await get_etcd_client()
   watch_job = asyncio.create_task(watch_etcd_task(etcd_client))
 
+  # 6. 过期 token 清理后台任务
+  cleanup_job = asyncio.create_task(cleanup_expired_tokens_task())
+
   yield
   
-  # watch_job.cancel()
-  # await etcd_client.close()
+  watch_job.cancel()
+  cleanup_job.cancel()
+  try:
+    await etcd_client.close()
+  except Exception:
+    pass
 
 def create_app() -> FastAPI:
   """

@@ -19,6 +19,17 @@ async def login(
   password = payload.password.strip()
   return await auth_service.login_user(username, password)
 
+@router.post(
+  path="/refresh",
+  response_model=auth_schema.TokenResponse,
+  summary="刷新 Token")
+async def refresh_token(
+  payload: auth_schema.RefreshTokenRequest) -> auth_schema.TokenResponse:
+  """
+  使用 refresh token 获取新的 access token 和 refresh token
+  """
+  return await auth_service.refresh_token(payload.refresh_token.strip())
+
 @router.get(
   path="/profile",
   response_model=auth_schema.UserProfileResponse,
