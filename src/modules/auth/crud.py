@@ -82,15 +82,48 @@ async def get_basic_role() -> Role:
   """
   return await Role.find_one(Role.is_admin == False)
 
+def blacklist_expiry_for_token(token: str):
+  """
+  黑名单保留至 JWT exp，避免 cleanup 过早删除导致「登出后仍可用」。
+  无法解析时回退为 refresh 最长寿命。
+  """
+  from datetime import datetime, timedelta, timezone
+  from jose import jwt as jose_jwt
+  from src.configs.configs import settings
+
+  fallback = utc_now() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+  try:
+    payload = jose_jwt.decode(
+      token,
+      settings.SECRET_KEY,
+      algorithms=[settings.ALGORITHM],
+      options={"verify_exp": False},
+    )
+    exp = payload.get("exp")
+    if exp is None:
+      return fallback
+    if isinstance(exp, (int, float)):
+      return datetime.fromtimestamp(exp, tz=timezone.utc)
+    if isinstance(exp, datetime):
+      if exp.tzinfo is None:
+        return exp.replace(tzinfo=timezone.utc)
+      return exp
+  except Exception:
+    pass
+  return fallback
+
 async def destroy_token(token: str) -> None:
   """
-  销毁 token
+  销毁 token：写入黑名单，expired_at 取 JWT 自身过期时间
   """
-  await DestoryedToken(token=token, expired_at=utc_now()).save()
+  existing = await DestoryedToken.find_one(DestoryedToken.token == token)
+  if existing:
+    return
+  await DestoryedToken(token=token, expired_at=blacklist_expiry_for_token(token)).save()
 
 async def cleanup_expired_tokens() -> int:
   """
-  清理已过期的黑名单 token
+  清理已过期的黑名单 token（仅删除 JWT 已自然过期的条目）
   """
   now = utc_now()
   expired = await DestoryedToken.find(DestoryedToken.expired_at < now).to_list()
