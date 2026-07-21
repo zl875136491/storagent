@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from src.configs.configs import settings
 
 router = APIRouter()
@@ -59,3 +59,22 @@ async def readiness_check():
         pass
 
   return {"status": "ready", "region": settings.REGION}
+
+
+@router.get(
+  path="/metrics",
+  summary="运行指标",
+  response_class=Response,
+)
+async def metrics_endpoint(format: str = "prometheus"):
+  """
+  暴露进程内指标。默认 Prometheus text；`?format=json` 返回 JSON。
+  """
+  from src.core import metrics as metrics_mod
+
+  if format == "json":
+    return JSONResponse(
+      content={"region": settings.REGION, **metrics_mod.snapshot()},
+    )
+  body = metrics_mod.render_prometheus(settings.REGION)
+  return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")

@@ -118,8 +118,14 @@ async def create_minio_server(
       replicate_weight=replicate_weight,
     )
   except Exception as e:
-    from loguru import logger
-    logger.warning(f"Server 同步到 Etcd 失败: {e}")
+    await minio_server_obj.delete()
+    from src.core import audit, metrics as metrics_mod
+    from src.core.exception import CustomException, ErrorDesc
+    metrics_mod.incr("sync_failures_total")
+    audit.audit("minio_server.create", resource=region_obj.name, detail=str(e), success=False)
+    raise CustomException(ErrorDesc.SYNC_FAILED, f"Server 同步到 Etcd 失败: {e}")
+  from src.core import audit
+  audit.audit("minio_server.create", resource=region_obj.name)
   return minio_server_obj
 
 async def update_minio_server(
@@ -154,8 +160,13 @@ async def update_minio_server(
       replicate_weight=result.replicate_weight,
     )
   except Exception as e:
-    from loguru import logger
-    logger.warning(f"Server 更新同步到 Etcd 失败: {e}")
+    from src.core import audit, metrics as metrics_mod
+    from src.core.exception import CustomException, ErrorDesc
+    metrics_mod.incr("sync_failures_total")
+    audit.audit("minio_server.update", resource=str(minio_server_id), detail=str(e), success=False)
+    raise CustomException(ErrorDesc.SYNC_FAILED, f"Server 更新同步到 Etcd 失败: {e}")
+  from src.core import audit
+  audit.audit("minio_server.update", resource=str(minio_server_id))
   return result
 
 async def get_minio_server_list() -> dict[str, List[MinioServer]]:

@@ -85,7 +85,13 @@ async def create_region(
   try:
     await sync_module.publish_region(name, shown_name)
   except Exception as e:
-    logger.warning(f"Region 同步到 Etcd 失败: {e}")
+    await public_crud.delete_region_by_id(region.id)
+    from src.core import audit, metrics as metrics_mod
+    metrics_mod.incr("sync_failures_total")
+    audit.audit("region.create", resource=name, detail=str(e), success=False)
+    raise CustomException(ErrorDesc.SYNC_FAILED, f"Region 同步到 Etcd 失败: {e}")
+  from src.core import audit
+  audit.audit("region.create", resource=name, detail={"shown_name": shown_name})
   return region
 
 async def offline_region(region_id) -> dict:
@@ -104,14 +110,19 @@ async def offline_region(region_id) -> dict:
     await sync_module.unpublish_server(region.name)
     await sync_module.unpublish_region(region.name)
   except Exception as e:
-    logger.warning(f"Region 下线同步 Etcd 失败: {e}")
-    raise CustomException(ErrorDesc.DB_UPDATE_FAILED, f"Etcd 下线失败: {e}")
+    from src.core import audit, metrics as metrics_mod
+    metrics_mod.incr("sync_failures_total")
+    audit.audit("region.offline", resource=region.name, detail=str(e), success=False)
+    raise CustomException(ErrorDesc.SYNC_FAILED, f"Etcd 下线失败: {e}")
 
   server = await storage_crud.read_minio_server_by_region(region)
   if server:
     await server.delete()
+  name = region.name
   await region.delete()
-  return {"message": f"区域 {region.name} 已下线"}
+  from src.core import audit
+  audit.audit("region.offline", resource=name)
+  return {"message": f"区域 {name} 已下线"}
 
 async def get_region_list() -> dict[str, List[Region]]:
   """
@@ -147,7 +158,19 @@ async def create_application(
   try:
     await sync_module.publish_application(app)
   except Exception as e:
-    logger.warning(f"Application 同步到 Etcd 失败: {e}")
+    await app.delete()
+    from src.core import audit, metrics as metrics_mod
+    metrics_mod.incr("sync_failures_total")
+    audit.audit(
+      "application.create",
+      actor=current_user.username,
+      resource=name,
+      detail=str(e),
+      success=False,
+    )
+    raise CustomException(ErrorDesc.SYNC_FAILED, f"Application 同步到 Etcd 失败: {e}")
+  from src.core import audit
+  audit.audit("application.create", actor=current_user.username, resource=name)
   return app
 
 async def get_application_list() -> dict[str, List[Application]]:
@@ -367,6 +390,8 @@ async def enable_application(
     sync_msg = f"应用信息同步失败: {e}"
     sync_status = "failed"
     logger.warning(sync_msg)
+    from src.core import metrics as metrics_mod
+    metrics_mod.incr("sync_failures_total")
   async for chunk in _emit({
     "step": "sync",
     "server_name": None,
@@ -451,7 +476,19 @@ async def create_api_key(
   try:
     await sync_module.publish_api_key(api_key_obj)
   except Exception as e:
-    logger.warning(f"API Key 同步到 Etcd 失败: {e}")
+    await api_key_obj.delete()
+    from src.core import audit, metrics as metrics_mod
+    metrics_mod.incr("sync_failures_total")
+    audit.audit(
+      "api_key.create",
+      actor=current_user.username,
+      resource=str(application_id),
+      detail=str(e),
+      success=False,
+    )
+    raise CustomException(ErrorDesc.SYNC_FAILED, f"API Key 同步到 Etcd 失败: {e}")
+  from src.core import audit
+  audit.audit("api_key.create", actor=current_user.username, resource=str(api_key_obj.id))
   # 仅创建响应返回一次明文
   api_key_obj.key = key
   return api_key_obj
@@ -498,5 +535,10 @@ async def revoke_api_key(
     if revoked:
       await sync_module.publish_api_key(revoked)
   except Exception as e:
-    logger.warning(f"API Key 吊销同步到 Etcd 失败: {e}")
+    from src.core import audit, metrics as metrics_mod
+    metrics_mod.incr("sync_failures_total")
+    audit.audit("api_key.revoke", actor=current_user.username, resource=str(api_key_id), detail=str(e), success=False)
+    raise CustomException(ErrorDesc.SYNC_FAILED, f"API Key 吊销同步到 Etcd 失败: {e}")
+  from src.core import audit
+  audit.audit("api_key.revoke", actor=current_user.username, resource=str(api_key_id))
   return {"message": "API密钥已吊销"}
