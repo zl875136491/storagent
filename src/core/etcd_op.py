@@ -100,6 +100,8 @@ async def watch_etcd_task(client: aetcd.Client):
       raise
     except Exception as e:
       logger.warning(f"Etcd watch 异常，{backoff:.0f}s 后重连: {e}")
+      from src.core import metrics as metrics_mod
+      metrics_mod.incr("etcd_watch_reconnects_total")
       await asyncio.sleep(backoff)
       backoff = min(backoff * 2, 30.0)
       try:
@@ -236,6 +238,8 @@ async def merge_update_etcd_key(
 
       last_err = f"CAS conflict on {key} (attempt {attempt + 1}/{max_retries})"
       logger.warning(last_err)
+      from src.core import metrics as metrics_mod
+      metrics_mod.incr("etcd_cas_conflicts_total")
       await asyncio.sleep(0.05 * (attempt + 1))
 
     raise RuntimeError(last_err or f"Etcd CAS failed for {key}")

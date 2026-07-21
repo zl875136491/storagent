@@ -9,6 +9,7 @@ from src.utils.logger import setup_logging
 from src.core.initialization import init_project, init_service
 from src.core.etcd_op import get_etcd_client, watch_etcd_task
 from src.core.exception import register_exception
+from src.core.middleware import RequestContextMiddleware
 from src.modules.auth.crud import cleanup_expired_tokens_task
 import asyncio
 
@@ -80,6 +81,7 @@ def create_app() -> FastAPI:
 
   register_exception(app)
   register_api(app)
+  app.add_middleware(RequestContextMiddleware)
 
   if settings.BACKEND_CORS_ORIGINS:
     app.add_middleware(
