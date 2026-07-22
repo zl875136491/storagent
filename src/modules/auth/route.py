@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from src.modules.auth import service as auth_service
 from src.modules.auth import schema as auth_schema
 from src.core.auth import get_current_user, oauth2_scheme
+from src.core.rate_limit import rate_limit_login, rate_limit_refresh
 from src.modules.auth.model import User
 
 router = APIRouter()
@@ -11,10 +12,13 @@ router = APIRouter()
   response_model=auth_schema.TokenResponse,
   summary="用户登录")
 async def login(
-  payload: auth_schema.LoginRequest) -> auth_schema.TokenResponse:
+  payload: auth_schema.LoginRequest,
+  request: Request,
+) -> auth_schema.TokenResponse:
   """
   用户登录
   """
+  rate_limit_login(request)
   username = payload.username.strip()
   password = payload.password.strip()
   return await auth_service.login_user(username, password)
@@ -24,10 +28,13 @@ async def login(
   response_model=auth_schema.TokenResponse,
   summary="刷新 Token")
 async def refresh_token(
-  payload: auth_schema.RefreshTokenRequest) -> auth_schema.TokenResponse:
+  payload: auth_schema.RefreshTokenRequest,
+  request: Request,
+) -> auth_schema.TokenResponse:
   """
   使用 refresh token 获取新的 access token 和 refresh token
   """
+  rate_limit_refresh(request)
   return await auth_service.refresh_token(payload.refresh_token.strip())
 
 @router.get(

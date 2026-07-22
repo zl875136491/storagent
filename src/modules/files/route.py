@@ -1,7 +1,8 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile, Form
+from fastapi import APIRouter, Depends, File, Query, UploadFile, Form, Request
 from src.core.auth import get_current_app
+from src.core.rate_limit import rate_limit_locate
 from src.modules.auth.model import User
 from src.modules.files import schema as files_schema
 from src.modules.files import service as files_service
@@ -92,6 +93,7 @@ async def multipart_list_parts(
   summary="定位对象所在服务点",
 )
 async def object_locate(
+  request: Request,
   object_key: str = Query(..., description="对象键"),
   offset: int = Query(0, ge=0, description="下载起始字节（用于生成 download_url）"),
   length: int = Query(0, ge=0, description="下载长度（用于生成 download_url）"),
@@ -100,6 +102,7 @@ async def object_locate(
   """
   扫描所有 MinIO 服务点，返回对象存在的位置及对应 stat/download 指引 URL。
   """
+  rate_limit_locate(request)
   return await files_service.locate_object(app_name, object_key, offset, length)
 
 

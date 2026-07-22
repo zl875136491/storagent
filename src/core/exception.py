@@ -73,6 +73,7 @@ class ErrorDesc(Enum):
   OBJECT_NOT_FOUND_LOCAL = ("对象在本节点不存在", 404032)
   INTERNAL_SERVER_ERROR = ("服务器内部错误", 500001)
   SYNC_FAILED = ("跨节点同步失败", 503040)
+  RATE_LIMITED = ("请求过于频繁", 429041)
   
 
   

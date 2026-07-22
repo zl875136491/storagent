@@ -203,6 +203,8 @@ storagent/
 3. `SECRET_KEY` 和 `BCRYPT_SALT` 全局一致（JWT 互认）
 4. 各节点 MinIO 通过 Site Replication 互联
 
+故障处理、备份恢复与限流说明见 [docs/RUNBOOK.md](docs/RUNBOOK.md)。
+
 ## License
 
 见 [LICENSE](LICENSE) 文件。

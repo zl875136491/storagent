@@ -22,6 +22,7 @@ from ..modules.public.model import (
   SystemConfig,
   ShellCommandLog,
   APIKeyUsage,
+  AuditEvent,
 )
 
 from ..modules.storage.model import (
@@ -81,6 +82,7 @@ async def init_db():
     DestoryedToken,
     ShellCommandLog,
     APIKeyUsage,
+    AuditEvent,
     MinioEvent,
     MinioServer,
     MinioBucket,
