@@ -94,3 +94,21 @@ class ShellCommandLog(Document):
     indexes = [
       IndexModel(["date"]),
     ]
+
+class AuditEvent(Document):
+  """关键操作审计落库（与日志 [AUDIT] 互补，便于检索）"""
+  action: str
+  actor: str = Field(default="-")
+  resource: str = Field(default="-")
+  success: bool = Field(default=True)
+  detail: str = Field(default="")
+  region: str = Field(default="")
+  created_at: datetime = Field(default_factory=utc_now)
+
+  class Settings:
+    name = "audit_event"
+    indexes = [
+      IndexModel([("created_at", -1)]),
+      IndexModel(["action"]),
+      IndexModel(["actor"]),
+    ]
