@@ -16,6 +16,8 @@ pipeline {
         IMAGE_REPOSITORY = '10.17.151.187/storagent/storagent_backend'
         SOURCE_URL = 'https://github.com/zl875136491/storagent'
         DOCKERFILE_PATH = 'Dockerfile'
+        TEST_IMAGE = 'python:3.12.10-bookworm'
+        PYPI_INDEX_URL = 'https://pypi.tuna.tsinghua.edu.cn/simple'
     }
 
     stages {
@@ -47,10 +49,20 @@ pipeline {
             steps {
                 sh '''#!/usr/bin/env bash
                     set -Eeuo pipefail
-                    python3 -m venv .venv
-                    . .venv/bin/activate
-                    python -m pip install --disable-pip-version-check -r requirements-dev.txt
-                    python -m pytest -q
+                    docker run --rm \
+                        --platform linux/amd64 \
+                        --volume "$WORKSPACE:/workspace:ro" \
+                        --workdir /workspace \
+                        --env PYTHONDONTWRITEBYTECODE=1 \
+                        --env PIP_DISABLE_PIP_VERSION_CHECK=1 \
+                        --env "PIP_INDEX_URL=$PYPI_INDEX_URL" \
+                        --env LOG_PATH=/tmp/storagent-logs \
+                        "$TEST_IMAGE" \
+                        bash -c '
+                            set -Eeuo pipefail
+                            python -m pip install --no-cache-dir -r requirements-dev.txt
+                            python -m pytest -q -p no:cacheprovider
+                        '
                 '''
             }
         }
