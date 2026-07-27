@@ -1,4 +1,4 @@
-#! /bin/bash
+#!/usr/bin/env bash
 
 # venv
 # source ../venv/bin/activate
@@ -11,14 +11,14 @@ source="https://pypi.tuna.tsinghua.edu.cn/simple"
 
 # 启动项目
 function run() {
-  RELOAD_FLAG=""
+  local reload_args=()
   if [ "${RELOAD:-false}" = "true" ]; then
-    RELOAD_FLAG="--reload --reload-exclude '*/tests/*'"
+    reload_args=(--reload --reload-exclude '*/tests/*')
   fi
   # 优雅关闭需覆盖上传/下载耗时；可用 GRACEFUL_SHUTDOWN_TIMEOUT 覆盖
-  uvicorn main:app --host 0.0.0.0 --port=${SERVER_PORT:-9000} \
+  exec uvicorn main:app --host 0.0.0.0 --port="${SERVER_PORT:-9000}" \
     --timeout-graceful-shutdown "${GRACEFUL_SHUTDOWN_TIMEOUT:-30}" \
-    $RELOAD_FLAG
+    "${reload_args[@]}"
 }
 
 function stop() {
