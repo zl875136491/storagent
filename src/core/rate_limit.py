@@ -57,3 +57,8 @@ def rate_limit_refresh(request: Request) -> None:
 def rate_limit_locate(request: Request) -> None:
   ip = _client_ip(request)
   check_rate_limit(f"locate:{ip}", limit=60, window_seconds=60.0)
+
+
+def rate_limit_ai(request: Request, username: str) -> None:
+  ip = _client_ip(request)
+  check_rate_limit(f"ai:{username}:{ip}", limit=30, window_seconds=60.0)

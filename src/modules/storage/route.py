@@ -97,3 +97,16 @@ async def get_bucket_replicate_infos(
   获取存储桶复制信息（需登录）
   """
   return await storage_service.get_bucket_replicate_infos(bucket_name)
+
+@router.post(
+  path="/buckets/{bucket_name}/replicates",
+  response_model=storage_schema.BucketReplicateRuleResponse,
+  summary="创建存储桶复制连接")
+async def create_bucket_replicate(
+  bucket_name: str,
+  payload: storage_schema.BucketReplicateCreateRequest,
+  current_user: User = Depends(get_current_user),
+) -> storage_schema.BucketReplicateRuleResponse:
+  """创建一条单向 Bucket 复制规则（需 region_manage）。"""
+  await check_permissions(current_user, ["region_manage"])
+  return await storage_service.create_bucket_replicate(bucket_name, payload)

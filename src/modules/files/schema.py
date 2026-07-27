@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Literal, Optional
 from datetime import datetime
 from fastapi import UploadFile
 
@@ -73,12 +73,18 @@ class ObjectStatResponse(BaseModel):
   local: bool = Field(True, description="是否位于当前访问节点")
 
 
+class ObjectStatRequest(BaseModel):
+  object_key: str = Field(..., min_length=1, description="对象键")
+
+
 class ObjectLocationItem(BaseModel):
   region: str = Field(..., description="区域标识")
   shown_name: str = Field(..., description="区域显示名称")
   master: bool = Field(..., description="是否为该 Region 的本地主节点")
   endpoint: str = Field(..., description="Storagent API 地址")
-  stat_url: str = Field(..., description="对象元信息查询地址")
+  stat_url: str = Field(..., description="对象元信息 POST 地址")
+  stat_method: Literal["POST"] = "POST"
+  stat_body: dict[str, str] = Field(..., description="对象元信息请求体")
   download_url: str = Field(..., description="对象下载地址（需携带相同 x-api-key）")
 
 
@@ -88,4 +94,3 @@ class ObjectLocateResponse(BaseModel):
   current_region: str
   local_exists: bool
   available_at: List[ObjectLocationItem] = Field(default_factory=list)
-

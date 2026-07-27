@@ -1,10 +1,14 @@
+import asyncio
+import re
+from typing import List
+
 from bson import ObjectId
-from typing import Any, List
 
 from src.modules.public.model import Region
 from src.core.exception import CustomException, ErrorDesc
 from src.modules.public import crud as public_crud
 from src.modules.storage import crud as storage_crud
+from src.modules.storage import schema as storage_schema
 from src.modules.storage.model import MinioServer
 from src.modules.graph import crud as graph_crud
 from src.core.minio_op import (
@@ -13,11 +17,13 @@ from src.core.minio_op import (
   add_new_site,
   remove_site_alias,
   get_buckets_info,
+  check_server_bucket_existed,
   get_minio_client,
   get_server_buckets,
   get_bucket_replicate_status,
   get_bucket_replicate_info,
-  get_site_alias
+  get_site_alias,
+  create_bucket_replicate as create_minio_bucket_replicate,
 )
 from src.core import sync as sync_module
 
@@ -255,8 +261,10 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
   # 因为 mc replicate ls 命令返回的是服务器地址, 而不是服务器别名
   mappings = {}
   for alias_name, alias_data in alias_datas.items():
-    url = alias_data["URL"].split("://")[1]
-    mappings[url] = alias_name
+    raw_url = str(alias_data.get("URL") or "")
+    endpoint = raw_url.split("://", 1)[-1].rsplit("@", 1)[-1].rstrip("/")
+    if endpoint:
+      mappings[endpoint] = alias_name
   server_names = await storage_crud.read_minio_server_names()
   # 获取拓扑图的边和节点的位置信息
   nodes = {}
@@ -290,9 +298,11 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
     if not to_server_endpoints:
       continue
     for endpoint in to_server_endpoints.keys():
-      to_server_name = mappings[endpoint]
+      to_server_name = mappings.get(endpoint)
+      if not to_server_name:
+        continue
       rule_id = to_server_endpoints[endpoint]
-      status_info = await format_replicate_status(status_infos[rule_id])
+      status_info = await format_replicate_status(status_infos.get(rule_id, {}))
       temp_id = f"{server_name}-{to_server_name}"
       if temp_id in edges:
         from_position = edges[temp_id]["from_position"]
@@ -309,3 +319,130 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
         "rule_id": rule_id
       })
   return dict(servers=nodes, replicates=replicates)
+
+
+_BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+_SIDE_TO_POSITION = {
+  "top": "up",
+  "right": "right",
+  "bottom": "down",
+  "left": "left",
+}
+
+
+def _validate_bucket_name(bucket_name: str) -> str:
+  name = bucket_name.strip()
+  if (
+    not _BUCKET_NAME_RE.fullmatch(name)
+    or ".." in name
+    or ".-" in name
+    or "-." in name
+  ):
+    raise CustomException(ErrorDesc.INVALID_PARAMS, "存储桶名称不合法")
+  return name
+
+
+async def create_bucket_replicate(bucket_name: str, payload) -> dict:
+  """创建单向复制规则，并保存拓扑连线端口。"""
+  from src.core import audit
+
+  bucket = _validate_bucket_name(bucket_name)
+  from_server = payload.from_server.strip()
+  to_server = payload.to_server.strip()
+  server_names = set(await storage_crud.read_minio_server_names())
+  if from_server == to_server:
+    raise CustomException(ErrorDesc.INVALID_RULE_PARAMS, "源站点与目标站点不能相同")
+  if from_server not in server_names or to_server not in server_names:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "源站点或目标站点不存在")
+
+  source_exists, target_exists = await asyncio.gather(
+    check_server_bucket_existed(from_server, bucket),
+    check_server_bucket_existed(to_server, bucket),
+  )
+  if not source_exists or not target_exists:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "源站点或目标站点不存在该存储桶")
+
+  current = await get_bucket_replicate_infos(bucket)
+  if any(
+    item.get("from") == from_server and item.get("to") == to_server
+    for item in current.get("replicates", [])
+  ):
+    raise CustomException(ErrorDesc.RES_ALREADY_EXISTS, "复制连接已存在")
+
+  requested_status = payload.status or storage_schema.BucketReplicateRuleStatus()
+  replicate_options = ["delete"]
+  if requested_status.delete_marker_replication.lower() == "enabled":
+    replicate_options.append("delete-marker")
+  if requested_status.existing_object_replication.lower() == "enabled":
+    replicate_options.append("existing-objects")
+  if requested_status.source_selection_criteria.lower() == "enabled":
+    replicate_options.append("metadata-sync")
+
+  success, detail = await create_minio_bucket_replicate(
+    from_server,
+    to_server,
+    bucket,
+    priority=requested_status.priority,
+    enabled=requested_status.status.lower() != "disabled",
+    replicate_options=replicate_options,
+  )
+  if not success:
+    audit.audit(
+      "bucket_replicate.create",
+      resource=f"{bucket}:{from_server}->{to_server}",
+      detail=detail,
+      success=False,
+    )
+    raise CustomException(ErrorDesc.MINIO_REPLICATE_FAILED, detail)
+
+  from_position = _SIDE_TO_POSITION[payload.from_side]
+  to_position = _SIDE_TO_POSITION[payload.to_side]
+  try:
+    await graph_crud.update_bucket_edge_position(
+      bucket,
+      from_server,
+      to_server,
+      from_position,
+      to_position,
+    )
+  except Exception as e:
+    # 复制规则已经在 MinIO 生效；拓扑位置可由后续编辑补写。
+    audit.audit(
+      "bucket_replicate.position",
+      resource=f"{bucket}:{from_server}->{to_server}",
+      detail=str(e),
+      success=False,
+    )
+
+  refreshed = await get_bucket_replicate_infos(bucket)
+  created = next((
+    item for item in refreshed.get("replicates", [])
+    if item.get("from") == from_server and item.get("to") == to_server
+  ), None)
+  if not created:
+    created = {
+      "from": from_server,
+      "to": to_server,
+      "from_position": from_position,
+      "to_position": to_position,
+      "status": {
+        "status": "pending",
+        "priority": requested_status.priority,
+        "delete_marker_replication": requested_status.delete_marker_replication,
+        "existing_object_replication": requested_status.existing_object_replication,
+        "source_selection_criteria": requested_status.source_selection_criteria,
+      },
+      "rule_id": "",
+    }
+    audit.audit(
+      "bucket_replicate.readback",
+      resource=f"{bucket}:{from_server}->{to_server}",
+      detail="复制规则已创建，状态读取尚未就绪",
+      success=False,
+    )
+
+  audit.audit(
+    "bucket_replicate.create",
+    resource=f"{bucket}:{from_server}->{to_server}",
+  )
+  return created

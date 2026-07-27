@@ -21,3 +21,10 @@ def test_unpublish_helpers_exist():
   from src.core import sync as sync_module
   assert callable(sync_module.unpublish_region)
   assert callable(sync_module.unpublish_server)
+
+
+def test_ai_config_sync_helpers_exist():
+  from src.core import sync as sync_module
+  assert sync_module.ETCD_KEY_AI_CONFIG == "ai_config"
+  assert callable(sync_module.publish_ai_config)
+  assert callable(sync_module.sync_ai_config_to_mongo)

@@ -27,6 +27,7 @@ ETCD_KEY_SERVERS = "servers"
 ETCD_KEY_APPLICATIONS = "applications"
 ETCD_KEY_API_KEYS = "api_keys"
 ETCD_KEY_REVOKED_TOKENS = "revoked_tokens"
+ETCD_KEY_AI_CONFIG = "ai_config"
 
 SYNC_USER_PLACEHOLDER = "__sync__"
 
@@ -456,6 +457,24 @@ async def publish_api_key(api_key_obj) -> None:
   await etcd_op.merge_update_etcd_key(ETCD_KEY_API_KEYS, mutator)
 
 
+async def publish_ai_config(config: dict) -> None:
+  """Publish the encrypted AI provider configuration to every region."""
+  from src.core import etcd_op
+
+  def mutator(_current: dict) -> dict:
+    return dict(config)
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_AI_CONFIG, mutator)
+
+
+async def sync_ai_config_to_mongo(config: dict) -> None:
+  if not isinstance(config, dict) or not config:
+    return
+  from src.modules.ai import crud as ai_crud
+
+  await ai_crud.upsert_config(config)
+
+
 
 
 async def publish_revoked_token(token_hash: str, expired_at: datetime) -> None:
@@ -582,6 +601,10 @@ async def pull_all_and_sync(client=None):
     revoked_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_REVOKED_TOKENS, client=client)
     if revoked_data:
       await sync_revoked_tokens_to_mongo(revoked_data)
+
+    ai_config = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_AI_CONFIG, client=client)
+    if ai_config:
+      await sync_ai_config_to_mongo(ai_config)
   finally:
     if own_client:
       await client.close()

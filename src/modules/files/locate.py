@@ -42,14 +42,15 @@ def _build_location_item(
   region_name = region.name if region else server.name
   shown_name = region.shown_name if region else server.name
   download_params = {"object_key": object_key, "offset": offset, "length": length}
-  stat_params = {"object_key": object_key}
   base = f"{_scheme()}://{server.host}:{server.server_port}"
   return files_schema.ObjectLocationItem(
     region=region_name,
     shown_name=shown_name,
     master=server.master,
     endpoint=base,
-    stat_url=_build_api_url(server.host, server.server_port, "/api/files/object/stat", stat_params),
+    stat_url=f"{base}/api/files/object/stat",
+    stat_method="POST",
+    stat_body={"object_key": object_key},
     download_url=_build_api_url(server.host, server.server_port, "/api/files/object/download", download_params),
   )
 

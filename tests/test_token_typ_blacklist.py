@@ -10,7 +10,7 @@ from src.modules.auth.crud import blacklist_expiry_for_token
 
 
 def test_create_token_sets_typ():
-  tokens = asyncio.get_event_loop().run_until_complete(create_token("alice"))
+  tokens = asyncio.run(create_token("alice"))
   access = jwt.decode(
     tokens["access_token"], settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
   )

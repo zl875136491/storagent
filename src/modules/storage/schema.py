@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Literal, Optional
 from src.modules.public.schema import PydanticObjectId
 from datetime import datetime
 class MinioServerCreateRequest(BaseModel):
@@ -63,3 +63,25 @@ class BucketsResponse(BaseModel):
 class BucketReplicateResponse(BaseModel):
   servers: List[str] = Field(..., description="服务器列表")
   replicates: List[dict] = Field(..., description="复制信息")
+
+class BucketReplicateRuleStatus(BaseModel):
+  status: str = Field(default="pending", max_length=32, description="复制规则状态")
+  priority: int = Field(default=0, ge=0, le=2_147_483_647, description="规则优先级")
+  delete_marker_replication: Literal["Enabled", "Disabled"] = "Enabled"
+  existing_object_replication: Literal["Enabled", "Disabled"] = "Enabled"
+  source_selection_criteria: Literal["Enabled", "Disabled"] = "Enabled"
+
+class BucketReplicateCreateRequest(BaseModel):
+  from_server: str = Field(alias="from", min_length=1, max_length=128, description="源站点别名")
+  to_server: str = Field(alias="to", min_length=1, max_length=128, description="目标站点别名")
+  from_side: Literal["top", "right", "bottom", "left"] = "bottom"
+  to_side: Literal["top", "right", "bottom", "left"] = "top"
+  status: BucketReplicateRuleStatus | None = None
+
+class BucketReplicateRuleResponse(BaseModel):
+  from_server: str = Field(alias="from")
+  to_server: str = Field(alias="to")
+  from_position: Literal["up", "down", "left", "right"]
+  to_position: Literal["up", "down", "left", "right"]
+  status: dict
+  rule_id: str

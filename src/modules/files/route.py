@@ -106,16 +106,16 @@ async def object_locate(
   return await files_service.locate_object(app_name, object_key, offset, length)
 
 
-@router.get(
+@router.post(
   path="/object/stat",
   response_model=files_schema.ObjectStatResponse,
   summary="获取对象元信息（用于规划分片下载）",
 )
 async def object_stat(
-  object_key: str = Query(..., description="对象键"),
+  payload: files_schema.ObjectStatRequest,
   app_name: str = Depends(get_current_app),
 ) -> files_schema.ObjectStatResponse:
-  return await files_service.stat_object(app_name, object_key)
+  return await files_service.stat_object(app_name, payload.object_key)
 
 
 @router.get(

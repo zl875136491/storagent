@@ -74,6 +74,9 @@ class ErrorDesc(Enum):
   INTERNAL_SERVER_ERROR = ("服务器内部错误", 500001)
   SYNC_FAILED = ("跨节点同步失败", 503040)
   RATE_LIMITED = ("请求过于频繁", 429041)
+  AI_NOT_CONFIGURED = ("AI 助手未配置", 400042)
+  AI_UPSTREAM_FAILED = ("AI 上游服务不可用", 502043)
+  AI_CONFIG_INVALID = ("AI 配置不合法", 400044)
   
 
   

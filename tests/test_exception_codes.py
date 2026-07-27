@@ -31,3 +31,9 @@ def test_refresh_token_invalid_uses_402():
   exc = CustomException(ErrorDesc.REFRESH_TOKEN_NOT_VALID)
   assert exc.code == 402008
   assert exc.status_code == 402
+
+
+def test_ai_upstream_failure_uses_502():
+  exc = CustomException(ErrorDesc.AI_UPSTREAM_FAILED, "timeout")
+  assert exc.code == 502043
+  assert exc.status_code == 502

@@ -124,6 +124,7 @@ docker run -d --env-file .env -p 9000:9000 storagent
 | GET | `/minio-server` | 服务器列表 |
 | GET | `/buckets` | 跨节点 Bucket 汇总 |
 | GET | `/buckets/{name}/replicates` | 复制拓扑 |
+| POST | `/buckets/{name}/replicates` | 创建单向复制连接 |
 
 ### 文件 `/api/files`（需 `x-api-key`）
 
@@ -134,7 +135,7 @@ docker run -d --env-file .env -p 9000:9000 storagent
 | POST | `/multipart/complete` | 完成上传 |
 | POST | `/multipart/abort` | 中止上传 |
 | GET | `/multipart/parts` | 断点续传列表 |
-| GET | `/object/stat` | 对象元信息（本节点不存在时返回其他节点指引） |
+| POST | `/object/stat` | 对象元信息，`object_key` 放在 JSON 请求体中（本节点不存在时返回其他节点指引） |
 | GET | `/object/locate` | 主动定位对象所在服务点 |
 | GET | `/object/download` | 流式/Range 下载（本节点不存在时返回其他节点指引） |
 
@@ -144,6 +145,15 @@ docker run -d --env-file .env -p 9000:9000 storagent
 |------|------|------|
 | GET/POST | `/bucket-node-position` | 查询/更新节点位置 |
 | GET/POST | `/bucket-edge-position` | 查询/更新边位置 |
+
+### AI 助手 `/api/ai`
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/config` | 获取当前用户可用的助手运行配置 |
+| GET/PUT | `/admin/config` | 管理员读取/更新模型提供商配置 |
+| POST | `/admin/test` | 管理员测试上游模型连接 |
+| POST | `/openai/v1/chat/completions` | 已登录用户的 PageAgent 专用代理 |
 
 ## 项目结构
 
@@ -164,6 +174,7 @@ storagent/
     │   ├── storage/        # MinIO 服务器与 Bucket
     │   ├── files/          # 分片上传下载
     │   ├── graph/          # 拓扑图位置
+    │   ├── ai/             # AI 提供商配置与 PageAgent 代理
     │   └── health/         # 健康检查
     └── utils/
 ```
@@ -187,6 +198,7 @@ storagent/
 | `servers` | MinIO 节点配置 | 启动 init / 创建或更新 Server / Watch |
 | `applications` | 应用元数据（含 enabled 状态） | 创建/授权应用 / Watch |
 | `api_keys` | API 密钥（含吊销状态） | 创建/吊销 Key / Watch |
+| `ai_config` | AI 提供商配置（API Key 加密） | 管理员更新配置 / Watch |
 
 ### 同步链路
 

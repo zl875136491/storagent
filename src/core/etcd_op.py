@@ -55,6 +55,8 @@ async def _handle_etcd_put(key: str, value: str):
     await sync_module.sync_api_keys_to_mongo(data)
   elif short_key == sync_module.ETCD_KEY_REVOKED_TOKENS:
     await sync_module.sync_revoked_tokens_to_mongo(data)
+  elif short_key == sync_module.ETCD_KEY_AI_CONFIG:
+    await sync_module.sync_ai_config_to_mongo(data)
 
 
 async def _handle_etcd_delete(key: str):
@@ -81,7 +83,7 @@ async def watch_etcd_task(client: aetcd.Client):
   while True:
     try:
       encoded_prefix = ETCD_PREFIX.encode()
-      logger.info("Etcd watch 已启动（region / servers / applications / api_keys）")
+      logger.info("Etcd watch 已启动（region / servers / applications / api_keys / ai_config）")
       async for event in await client.watch_prefix(encoded_prefix):
         backoff = 1.0
         key = event.kv.key.decode("utf-8")

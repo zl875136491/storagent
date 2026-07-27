@@ -10,7 +10,11 @@ def _endpoint_params(fn):
 
 
 def test_storage_write_routes_require_user():
-  for fn in (storage_route.create_minio_server, storage_route.update_minio_server):
+  for fn in (
+    storage_route.create_minio_server,
+    storage_route.update_minio_server,
+    storage_route.create_bucket_replicate,
+  ):
     assert "current_user" in _endpoint_params(fn)
 
 

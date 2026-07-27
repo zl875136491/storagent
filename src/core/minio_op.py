@@ -1,4 +1,5 @@
 import json
+import shlex
 import subprocess
 from minio import Minio
 from typing import Any, List
@@ -83,7 +84,8 @@ async def check_server_bucket_existed(server_name: str, bucket_name: str) -> boo
   """
   检查存储桶是否存在
   """
-  success, output = await _run_cmd(f"mc ls {server_name}/{bucket_name} --json")
+  cmd = shlex.join(["mc", "ls", f"{server_name}/{bucket_name}", "--json"])
+  success, output = await _run_cmd(cmd)
   if not success:
     return False
   return True
@@ -281,7 +283,14 @@ async def enable_bucket_versioning(server_name: str, bucket_name: str):
     return False, f"开启版本控制失败:{str(_)}"
   return True, "开启版本控制成功"
 
-async def create_bucket_replicate(from_server: str, to_server: str, bucket_name: str):
+async def create_bucket_replicate(
+  from_server: str,
+  to_server: str,
+  bucket_name: str,
+  priority: int = 0,
+  enabled: bool = True,
+  replicate_options: list[str] | None = None,
+):
   """
   创建存储桶复制
   
@@ -290,9 +299,16 @@ async def create_bucket_replicate(from_server: str, to_server: str, bucket_name:
     to_server: 目标服务器名称
     bucket_name: 存储桶名称
   """
-  replicate_cmd = f"mc replicate add {from_server}/{bucket_name} --remote-bucket {to_server}/{bucket_name}"
-  replicate_args = " --replicate \"delete,delete-marker,existing-objects\""
-  cmd = replicate_cmd + replicate_args
+  options = replicate_options or ["delete", "delete-marker", "existing-objects"]
+  args = [
+    "mc", "replicate", "add", f"{from_server}/{bucket_name}",
+    "--remote-bucket", f"{to_server}/{bucket_name}",
+    "--replicate", ",".join(options),
+    "--priority", str(priority),
+  ]
+  if not enabled:
+    args.append("--disable")
+  cmd = shlex.join(args)
   success, err = await _run_cmd(cmd)
   if not success:
     return False, f"创建复制失败:{str(err)}"
@@ -315,7 +331,7 @@ async def get_bucket_replicate_status(server_name: str, bucket_name: str):
       try:
         status_item = json.loads(line)
         data[status_item["rule"]["ID"]] = status_item
-      except json.JSONDecodeError:
+      except (json.JSONDecodeError, KeyError, TypeError):
         continue
   return data
 
@@ -326,8 +342,8 @@ async def get_bucket_replicate_info(server: str, bucket: str):
   if success:
     for line in output.splitlines():
       if "Remote Bucket:" in line:
-        # 使用 strip 移除两端空格，split 分割后取最后一部分
-        bucket_endpoint = line.split("Remote Bucket:")[-1].strip().rstrip("/"+bucket)
+        remote = line.split("Remote Bucket:")[-1].strip().removesuffix(f"/{bucket}")
+        bucket_endpoint = remote.split("://", 1)[-1].rsplit("@", 1)[-1].rstrip("/")
         endpoints.append(bucket_endpoint)
       if "Rule ID:" in line:
         rule_id = line.split("Rule ID:")[-1].strip()

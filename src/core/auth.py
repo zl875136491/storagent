@@ -228,6 +228,16 @@ async def check_permissions(user: User = Depends(get_current_user), permissions:
       raise CustomException(ErrorDesc.INSUFFICIENT_PERMISSIONS, f"用户缺少权限: {permission_name}")
   return user
 
+
+async def require_admin(user: User = Depends(get_current_user)) -> User:
+  """Require the preset administrator role for sensitive system settings."""
+  admin_role = await user_crud.get_admin_role()
+  if admin_role:
+    for role in user.roles:
+      if role.to_ref().id == admin_role.id:
+        return user
+  raise CustomException(ErrorDesc.INSUFFICIENT_PERMISSIONS, "仅管理员可以管理系统配置")
+
 # 从请求头中提取 API-KEY 字段作为 App 数据源
 from fastapi.security import APIKeyHeader
 from src.modules.public import crud as public_crud
@@ -236,13 +246,18 @@ async def get_current_app(api_key: str = Depends(APIKeyHeader(name="x-api-key"))
   """
   从请求头中提取 API-KEY 字段作为输入源
   """
+  from beanie.odm.fields import Link
   from src.modules.public.model import Application
   api_key_obj = await public_crud.read_api_key_by_key(api_key)
   if not api_key_obj or api_key_obj.deleted:
     raise CustomException(ErrorDesc.API_KEY_INVALID, "API-KEY 无效")
   if before_compare(api_key_obj.expired_at) < utc_now():
     raise CustomException(ErrorDesc.API_KEY_EXPIRED, "API-KEY 已过期")
-  application_obj: Application = api_key_obj.application
+  application_obj = api_key_obj.application
+  if isinstance(application_obj, Link):
+    application_obj = await public_crud.read_application_by_id(application_obj.ref.id)
+  if not isinstance(application_obj, Application):
+    raise CustomException(ErrorDesc.API_KEY_INVALID, "API-KEY 关联的应用不存在")
   if application_obj.enabled:
     return application_obj.name
   else:
