@@ -12,8 +12,8 @@ pipeline {
     }
 
     environment {
-        HARBOR = '10.17.151.187'
-        IMAGE_REPOSITORY = '10.17.151.187/storagent/storagent_backend'
+        HARBOR = '10.17.158.118'
+        IMAGE_REPOSITORY = '10.17.158.118/storagent/storagent_backend'
         SOURCE_URL = 'https://github.com/zl875136491/storagent'
         DOCKERFILE_PATH = 'Dockerfile'
         TEST_IMAGE = 'python:3.12.10-bookworm'
