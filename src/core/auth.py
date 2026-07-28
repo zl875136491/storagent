@@ -132,7 +132,7 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
     User: 如果验证成功返回用户对象，否则返回 None
   """
   user = await user_crud.read_user_by_username(username)
-  if not user:
+  if not user or getattr(user, "is_sync", False):
     user_info = await import_user_from_springboard(username)
     if user_info is None:
       raise CustomException(ErrorDesc.LOGIN_ERR, "用户不存在")
@@ -145,14 +145,21 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
     else:
       basic_role = await user_crud.get_basic_role()
       roles = [basic_role]
-    user = await user_crud.create_user(
-      username=username,
-      name=user_info["user_info"]["l"],
-      hashed_password=hashed_password,
-      roles=roles
-    )
-  if getattr(user, "is_sync", False):
-    raise CustomException(ErrorDesc.LOGIN_ERR, "同步占位用户不可登录")
+    if user:
+      user.name = user_info["user_info"]["l"]
+      user.hashed_password = hashed_password
+      user.roles = roles
+      user.permissions = await user_crud.get_all_permissions(roles)
+      user.is_sync = False
+      user.updated_at = utc_now()
+      await user.save()
+    else:
+      user = await user_crud.create_user(
+        username=username,
+        name=user_info["user_info"]["l"],
+        hashed_password=hashed_password,
+        roles=roles
+      )
   if not verify_password(password, user.hashed_password):
     raise CustomException(ErrorDesc.LOGIN_ERR, "密码错误")
   return user
