@@ -110,6 +110,8 @@ class APIKeyDetailResponse(BaseModel):
   key: str
   application: SimpleApplicationResponse
   expired_at: datetime
+  deleted: bool = False
+  destory_by_admin: bool = False
 
 class APIKeyListResponse(BaseModel):
   data: List[APIKeyDetailResponse]

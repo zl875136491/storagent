@@ -49,6 +49,8 @@ class APIKey(Document):
   expired_at: datetime # 过期时间
   deleted: bool = Field(default=False)
   deleted_at: datetime | None = Field(default=None)
+  """由管理员吊销时为 True；所有者可见「被管理人员注销」"""
+  destory_by_admin: bool = Field(default=False)
   
   class Settings:
     name = "api_key"

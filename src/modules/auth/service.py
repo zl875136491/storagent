@@ -107,3 +107,68 @@ async def logout_user(token: str) -> dict:
   return dict[str, str](
     message="登出成功"
   )
+
+
+def _user_role_summary(user: User, admin_role) -> dict:
+  is_admin = False
+  role_name = "用户"
+  for role in user.roles or []:
+    if admin_role and getattr(role, "id", None) == admin_role.id:
+      is_admin = True
+      role_name = role.name or "管理员"
+      break
+    if getattr(role, "name", None):
+      role_name = role.name
+  return {
+    "id": str(user.id),
+    "username": user.username,
+    "name": user.name,
+    "is_admin": is_admin,
+    "role_name": role_name,
+    "created_at": convert_utc_to_local_str(user.created_at),
+    "updated_at": convert_utc_to_local_str(user.updated_at),
+  }
+
+
+async def list_users_for_admin() -> dict:
+  """管理员：列出可登录用户及其角色。"""
+  admin_role = await user_crud.get_admin_role()
+  users = await user_crud.list_local_users()
+  data = [_user_role_summary(user, admin_role) for user in users]
+  data.sort(key=lambda item: item["username"])
+  return {"data": data}
+
+
+async def update_user_role_for_admin(user_id: str, role_name: str) -> dict:
+  """管理员：将用户角色设为「用户」或「管理员」。"""
+  role_name = (role_name or "").strip()
+  if role_name not in ("用户", "管理员"):
+    raise CustomException(ErrorDesc.INVALID_PARAMS, "角色仅支持「用户」或「管理员」")
+
+  target = await user_crud.read_user_by_id(user_id)
+  if not target or getattr(target, "is_sync", False):
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "用户不存在")
+
+  admin_role = await user_crud.get_admin_role()
+  basic_role = await user_crud.get_basic_role()
+  if not admin_role or not basic_role:
+    raise CustomException(ErrorDesc.STATUS_ERR, "系统角色未初始化")
+
+  currently_admin = any(
+    getattr(role, "id", None) == admin_role.id for role in (target.roles or [])
+  )
+  if currently_admin and role_name == "用户":
+    if await user_crud.count_admin_users() <= 1:
+      raise CustomException(ErrorDesc.INVALID_PARAMS, "不能取消系统中唯一的管理员")
+
+  new_role = admin_role if role_name == "管理员" else basic_role
+  updated = await user_crud.update_user_role(target, new_role)
+  refreshed = await user_crud.read_user_by_id(updated.id)
+  summary = _user_role_summary(refreshed or updated, admin_role)
+  return {
+    "id": summary["id"],
+    "username": summary["username"],
+    "name": summary["name"],
+    "is_admin": summary["is_admin"],
+    "role_name": summary["role_name"],
+  }

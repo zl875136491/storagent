@@ -70,6 +70,7 @@ def api_key_to_etcd_entry(api_key_obj) -> dict:
     "expired_at": api_key_obj.expired_at.isoformat(),
     "deleted": api_key_obj.deleted,
     "deleted_at": api_key_obj.deleted_at.isoformat() if api_key_obj.deleted_at else None,
+    "destory_by_admin": bool(getattr(api_key_obj, "destory_by_admin", False)),
     "origin_region": settings.REGION,
   }
 
@@ -208,8 +209,14 @@ async def upsert_api_key_from_etcd(key: str, data: dict):
     if deleted and not existing.deleted:
       existing.deleted = True
       existing.deleted_at = utc_now()
+      existing.destory_by_admin = bool(data.get("destory_by_admin", False))
       await existing.save()
       logger.info(f"Etcd sync: 吊销 API Key {key[:8]}...")
+    elif deleted and existing.deleted:
+      flag = bool(data.get("destory_by_admin", False))
+      if getattr(existing, "destory_by_admin", False) != flag:
+        existing.destory_by_admin = flag
+        await existing.save()
     return existing
 
   if deleted:

@@ -88,6 +88,37 @@ async def get_basic_role() -> Role:
   """
   return await Role.find_one(Role.is_admin == False)
 
+async def list_local_users() -> List[User]:
+  """列出本系统可登录用户（排除跨区同步占位用户）。"""
+  return await User.find(User.is_sync == False, fetch_links=True).to_list()
+
+async def read_user_by_id(user_id) -> User | None:
+  from bson import ObjectId
+  if not isinstance(user_id, ObjectId):
+    user_id = ObjectId(str(user_id))
+  return await User.find_one(User.id == user_id, fetch_links=True)
+
+async def count_admin_users() -> int:
+  admin_role = await get_admin_role()
+  if not admin_role:
+    return 0
+  users = await User.find(User.is_sync == False, fetch_links=True).to_list()
+  count = 0
+  for user in users:
+    for role in user.roles or []:
+      if getattr(role, "id", None) == admin_role.id:
+        count += 1
+        break
+  return count
+
+async def update_user_role(user: User, role: Role) -> User:
+  """将用户角色替换为指定角色，并重算 permissions。"""
+  user.roles = [role]
+  user.permissions = await get_all_permissions([role])
+  user.updated_at = utc_now()
+  await user.save()
+  return user
+
 def blacklist_expiry_for_token(token: str):
   """
   黑名单保留至 JWT exp，避免 cleanup 过早删除导致「登出后仍可用」。

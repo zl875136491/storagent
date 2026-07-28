@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Query
 
-from src.core.auth import get_current_user, check_permissions
+from src.core.auth import get_current_user, check_permissions, require_admin
 from src.modules.auth.model import User
 from src.modules.storage import service as storage_service
 from src.modules.storage import schema as storage_schema
@@ -107,8 +107,8 @@ async def create_bucket_replicate(
   payload: storage_schema.BucketReplicateCreateRequest,
   current_user: User = Depends(get_current_user),
 ) -> storage_schema.BucketReplicateRuleResponse:
-  """创建一条单向 Bucket 复制规则（需 region_manage）。"""
-  await check_permissions(current_user, ["region_manage"])
+  """创建一条单向 Bucket 复制规则（需管理员）。"""
+  await require_admin(current_user)
   return await storage_service.create_bucket_replicate(bucket_name, payload)
 
 @router.delete(
@@ -121,8 +121,8 @@ async def delete_bucket_replicate(
   to_server: str = Query(..., alias="to", min_length=1, max_length=128),
   rule_id: str | None = Query(None, max_length=128),
 ):
-  """删除一条单向 Bucket 复制规则（需 region_manage）；会执行 mc replicate remove。"""
-  await check_permissions(current_user, ["region_manage"])
+  """删除一条单向 Bucket 复制规则（需管理员）；会执行 mc replicate remove。"""
+  await require_admin(current_user)
   return await storage_service.delete_bucket_replicate(
     bucket_name,
     from_server=from_server,
