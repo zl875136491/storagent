@@ -211,3 +211,233 @@ async def test_create_rejects_when_bucket_is_missing_from_either_site(monkeypatc
   with pytest.raises(CustomException) as exc_info:
     await storage_service.create_bucket_replicate("system-test", payload)
   assert exc_info.value.code == ErrorDesc.RES_NOT_FOUND.code
+
+
+@pytest.mark.asyncio
+async def test_minio_delete_replicate_uses_rule_id(monkeypatch):
+  captured = {}
+
+  async def run_cmd(command):
+    captured["command"] = command
+    return True, "ok"
+
+  monkeypatch.setattr(minio_op, "_run_cmd", run_cmd)
+  result = await minio_op.delete_bucket_replicate("hangzhou", "system-test", "rule-abc")
+  assert result == (True, "删除复制成功")
+  assert captured["command"] == (
+    "mc replicate remove --id rule-abc hangzhou/system-test"
+  )
+
+
+@pytest.mark.asyncio
+async def test_delete_bucket_replicate_calls_minio_and_clears_edge(monkeypatch):
+  deleted = {}
+
+  async def server_names():
+    return ["beijing", "hangzhou"]
+
+  async def replicate_infos(_bucket):
+    return {
+      "servers": {},
+      "replicates": [{
+        "from": "hangzhou",
+        "to": "beijing",
+        "rule_id": "rule-1",
+      }],
+    }
+
+  async def remove_rule(from_server, bucket, rule_id):
+    assert (from_server, bucket, rule_id) == ("hangzhou", "system-test", "rule-1")
+    return True, "ok"
+
+  async def clear_edge(bucket, from_server, to_server):
+    deleted.update({
+      "bucket": bucket,
+      "from": from_server,
+      "to": to_server,
+    })
+    return True
+
+  monkeypatch.setattr(storage_service.storage_crud, "read_minio_server_names", server_names)
+  monkeypatch.setattr(storage_service, "get_bucket_replicate_infos", replicate_infos)
+  monkeypatch.setattr(storage_service, "delete_minio_bucket_replicate", remove_rule)
+  monkeypatch.setattr(storage_service.graph_crud, "delete_bucket_edge_position", clear_edge)
+  monkeypatch.setattr("src.core.audit.audit", lambda *args, **kwargs: None)
+
+  result = await storage_service.delete_bucket_replicate(
+    "system-test",
+    from_server="hangzhou",
+    to_server="beijing",
+    rule_id="rule-1",
+  )
+  assert result["rule_id"] == "rule-1"
+  assert deleted == {
+    "bucket": "system-test",
+    "from": "hangzhou",
+    "to": "beijing",
+  }
+
+
+@pytest.mark.asyncio
+async def test_delete_bucket_replicate_resolves_rule_id_when_omitted(monkeypatch):
+  async def server_names():
+    return ["beijing", "hangzhou"]
+
+  async def replicate_infos(_bucket):
+    return {
+      "servers": {},
+      "replicates": [{
+        "from": "hangzhou",
+        "to": "beijing",
+        "rule_id": "rule-found",
+      }],
+    }
+
+  captured = {}
+
+  async def remove_rule(from_server, bucket, rule_id):
+    captured["rule_id"] = rule_id
+    return True, "ok"
+
+  async def clear_edge(*_args):
+    return True
+
+  monkeypatch.setattr(storage_service.storage_crud, "read_minio_server_names", server_names)
+  monkeypatch.setattr(storage_service, "get_bucket_replicate_infos", replicate_infos)
+  monkeypatch.setattr(storage_service, "delete_minio_bucket_replicate", remove_rule)
+  monkeypatch.setattr(storage_service.graph_crud, "delete_bucket_edge_position", clear_edge)
+  monkeypatch.setattr("src.core.audit.audit", lambda *args, **kwargs: None)
+
+  result = await storage_service.delete_bucket_replicate(
+    "system-test",
+    from_server="hangzhou",
+    to_server="beijing",
+  )
+  assert result["rule_id"] == "rule-found"
+  assert captured["rule_id"] == "rule-found"
+
+
+@pytest.mark.asyncio
+async def test_delete_bucket_replicate_rejects_mismatched_rule_id(monkeypatch):
+  async def server_names():
+    return ["beijing", "hangzhou"]
+
+  async def replicate_infos(_bucket):
+    return {
+      "servers": {},
+      "replicates": [{
+        "from": "hangzhou",
+        "to": "beijing",
+        "rule_id": "rule-real",
+      }],
+    }
+
+  async def should_not_remove(*_args):
+    pytest.fail("mismatched rule_id must not call mc replicate remove")
+
+  monkeypatch.setattr(storage_service.storage_crud, "read_minio_server_names", server_names)
+  monkeypatch.setattr(storage_service, "get_bucket_replicate_infos", replicate_infos)
+  monkeypatch.setattr(storage_service, "delete_minio_bucket_replicate", should_not_remove)
+
+  with pytest.raises(CustomException) as exc_info:
+    await storage_service.delete_bucket_replicate(
+      "system-test",
+      from_server="hangzhou",
+      to_server="beijing",
+      rule_id="rule-other",
+    )
+  assert exc_info.value.code == ErrorDesc.INVALID_RULE_PARAMS.code
+
+
+@pytest.mark.asyncio
+async def test_get_replicate_infos_migrates_legacy_percent_positions(monkeypatch):
+  class Node:
+    def __init__(self, server, x, y):
+      self.server = server
+      self.position_x = x
+      self.position_y = y
+
+  persisted = {}
+
+  async def aliases():
+    return {}
+
+  async def server_names():
+    return ["hangzhou", "beijing"]
+
+  async def node_positions(_bucket):
+    return [Node("hangzhou", 50, 25), Node("beijing", 10, 80)]
+
+  async def edge_positions(_bucket):
+    return []
+
+  async def replicate_info(_server, _bucket):
+    return None
+
+  async def replicate_status(_server, _bucket):
+    return {}
+
+  async def update_pos(bucket, server, x, y):
+    persisted[server] = {"bucket": bucket, "x": x, "y": y}
+
+  monkeypatch.setattr(storage_service, "get_site_alias", aliases)
+  monkeypatch.setattr(storage_service.storage_crud, "read_minio_server_names", server_names)
+  monkeypatch.setattr(
+    storage_service.graph_crud, "read_many_bucket_node_positions", node_positions
+  )
+  monkeypatch.setattr(
+    storage_service.graph_crud, "read_many_bucket_edge_positions", edge_positions
+  )
+  monkeypatch.setattr(storage_service, "get_bucket_replicate_info", replicate_info)
+  monkeypatch.setattr(storage_service, "get_bucket_replicate_status", replicate_status)
+  monkeypatch.setattr(storage_service.graph_crud, "update_bucket_node_position", update_pos)
+
+  result = await storage_service.get_bucket_replicate_infos("system-test")
+  assert result["servers"]["hangzhou"] == {"position_x": 450, "position_y": 140}
+  assert result["servers"]["beijing"] == {"position_x": 90, "position_y": 448}
+  assert persisted["hangzhou"]["x"] == 450
+  assert persisted["beijing"]["y"] == 448
+
+
+@pytest.mark.asyncio
+async def test_get_replicate_infos_omits_default_zero_positions(monkeypatch):
+  class Node:
+    def __init__(self, server, x, y):
+      self.server = server
+      self.position_x = x
+      self.position_y = y
+
+  async def aliases():
+    return {}
+
+  async def server_names():
+    return ["beijing", "hangzhou", "kunshan"]
+
+  async def node_positions(_bucket):
+    return [Node("hangzhou", 220, 340)]
+
+  async def edge_positions(_bucket):
+    return []
+
+  async def replicate_info(_server, _bucket):
+    return None
+
+  async def replicate_status(_server, _bucket):
+    return {}
+
+  monkeypatch.setattr(storage_service, "get_site_alias", aliases)
+  monkeypatch.setattr(storage_service.storage_crud, "read_minio_server_names", server_names)
+  monkeypatch.setattr(
+    storage_service.graph_crud, "read_many_bucket_node_positions", node_positions
+  )
+  monkeypatch.setattr(
+    storage_service.graph_crud, "read_many_bucket_edge_positions", edge_positions
+  )
+  monkeypatch.setattr(storage_service, "get_bucket_replicate_info", replicate_info)
+  monkeypatch.setattr(storage_service, "get_bucket_replicate_status", replicate_status)
+
+  result = await storage_service.get_bucket_replicate_infos("system-test")
+  assert result["servers"] == {"hangzhou": {"position_x": 220, "position_y": 340}}
+  assert result["server_ids"] == ["beijing", "hangzhou", "kunshan"]
+  assert "beijing" not in result["servers"]
+  assert "kunshan" not in result["servers"]

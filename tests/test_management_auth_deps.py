@@ -14,6 +14,7 @@ def test_storage_write_routes_require_user():
     storage_route.create_minio_server,
     storage_route.update_minio_server,
     storage_route.create_bucket_replicate,
+    storage_route.delete_bucket_replicate,
   ):
     assert "current_user" in _endpoint_params(fn)
 

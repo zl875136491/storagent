@@ -85,3 +85,8 @@ class BucketReplicateRuleResponse(BaseModel):
   to_position: Literal["up", "down", "left", "right"]
   status: dict
   rule_id: str
+
+class BucketReplicateDeleteRequest(BaseModel):
+  from_server: str = Field(alias="from", min_length=1, max_length=128, description="源站点别名")
+  to_server: str = Field(alias="to", min_length=1, max_length=128, description="目标站点别名")
+  rule_id: str | None = Field(None, max_length=128, description="复制规则 ID；缺省时按 from/to 查找")

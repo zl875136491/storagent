@@ -21,6 +21,7 @@ from src.core.minio_op import (
   get_bucket_replicate_info,
   get_site_alias,
   create_bucket_replicate as create_minio_bucket_replicate,
+  delete_bucket_replicate as delete_minio_bucket_replicate,
 )
 from src.core import sync as sync_module
 
@@ -257,16 +258,12 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
   node_objs = await graph_crud.read_many_bucket_node_positions(bucket_name)
   edge_objs = await graph_crud.read_many_bucket_edge_positions(bucket_name)
   for node_item in node_objs:
+    # 仅返回 Mongo 中真实落盘的坐标；缺失节点由前端做环形默认布局。
+    # 切勿用 (0,0) 填充未布局节点：会把未布局站点叠在原点，并干扰像素/百分比坐标推断。
     nodes[node_item.server] = {
       "position_x": node_item.position_x,
       "position_y": node_item.position_y
     }
-  for server_name in server_names:
-    if server_name not in nodes.keys():
-      nodes[server_name] = {
-        "position_x": 0,
-        "position_y": 0
-      }
   for edge_item in edge_objs:
     from_server = edge_item.from_server
     to_server = edge_item.to_server
@@ -303,7 +300,21 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
         "status": status_info,
         "rule_id": rule_id
       })
-  return dict(servers=nodes, replicates=replicates)
+  # 遗留百分比坐标（全部落在 0–100）迁移为像素，避免前后端启发式互相误判。
+  if _looks_like_percent_positions(nodes):
+    migrated = _percent_nodes_to_pixels(nodes)
+    for server, pos in migrated.items():
+      try:
+        await graph_crud.update_bucket_node_position(
+          bucket_name,
+          server,
+          pos["position_x"],
+          pos["position_y"],
+        )
+      except Exception:
+        pass
+    nodes = migrated
+  return dict(servers=nodes, replicates=replicates, server_ids=server_names)
 
 
 _BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
@@ -313,6 +324,29 @@ _SIDE_TO_POSITION = {
   "bottom": "down",
   "left": "left",
 }
+# 与前端画布基准一致：遗留百分比坐标迁移为像素
+_GRAPH_AREA_W = 900
+_GRAPH_AREA_H = 560
+
+
+def _looks_like_percent_positions(nodes: dict) -> bool:
+  vals = list(nodes.values())
+  if not vals:
+    return False
+  return all(
+    0 <= int(v.get("position_x", -1)) <= 100 and 0 <= int(v.get("position_y", -1)) <= 100
+    for v in vals
+  )
+
+
+def _percent_nodes_to_pixels(nodes: dict) -> dict:
+  converted = {}
+  for server, pos in nodes.items():
+    converted[server] = {
+      "position_x": round(int(pos["position_x"]) / 100 * _GRAPH_AREA_W),
+      "position_y": round(int(pos["position_y"]) / 100 * _GRAPH_AREA_H),
+    }
+  return converted
 
 
 def _validate_bucket_name(bucket_name: str) -> str:
@@ -431,3 +465,75 @@ async def create_bucket_replicate(bucket_name: str, payload) -> dict:
     resource=f"{bucket}:{from_server}->{to_server}",
   )
   return created
+
+
+async def delete_bucket_replicate(
+  bucket_name: str,
+  from_server: str,
+  to_server: str,
+  rule_id: str | None = None,
+) -> dict:
+  """删除单向复制规则，并清理拓扑边位置。"""
+  from src.core import audit
+
+  bucket = _validate_bucket_name(bucket_name)
+  from_server = from_server.strip()
+  to_server = to_server.strip()
+  if from_server == to_server:
+    raise CustomException(ErrorDesc.INVALID_RULE_PARAMS, "源站点与目标站点不能相同")
+
+  server_names = set(await storage_crud.read_minio_server_names())
+  if from_server not in server_names or to_server not in server_names:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "源站点或目标站点不存在")
+
+  resolved_rule_id = (rule_id or "").strip()
+  current = await get_bucket_replicate_infos(bucket)
+  match = next((
+    item for item in current.get("replicates", [])
+    if item.get("from") == from_server and item.get("to") == to_server
+  ), None)
+  if not match or not match.get("rule_id"):
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "复制连接不存在")
+  matched_rule_id = str(match["rule_id"])
+  if resolved_rule_id and resolved_rule_id != matched_rule_id:
+    raise CustomException(
+      ErrorDesc.INVALID_RULE_PARAMS,
+      "rule_id 与 from/to 对应的复制规则不一致",
+    )
+  resolved_rule_id = matched_rule_id
+
+  success, detail = await delete_minio_bucket_replicate(
+    from_server,
+    bucket,
+    resolved_rule_id,
+  )
+  if not success:
+    audit.audit(
+      "bucket_replicate.delete",
+      resource=f"{bucket}:{from_server}->{to_server}",
+      detail=detail,
+      success=False,
+    )
+    raise CustomException(ErrorDesc.MINIO_REPLICATE_FAILED, detail)
+
+  try:
+    await graph_crud.delete_bucket_edge_position(bucket, from_server, to_server)
+  except Exception as e:
+    audit.audit(
+      "bucket_replicate.edge_position_delete",
+      resource=f"{bucket}:{from_server}->{to_server}",
+      detail=str(e),
+      success=False,
+    )
+
+  audit.audit(
+    "bucket_replicate.delete",
+    resource=f"{bucket}:{from_server}->{to_server}",
+    detail=resolved_rule_id,
+  )
+  return {
+    "message": "ok",
+    "from": from_server,
+    "to": to_server,
+    "rule_id": resolved_rule_id,
+  }
