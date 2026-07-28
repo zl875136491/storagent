@@ -4,7 +4,6 @@ from typing import List
 
 from bson import ObjectId
 
-from src.modules.public.model import Region
 from src.core.exception import CustomException, ErrorDesc
 from src.modules.public import crud as public_crud
 from src.modules.storage import crud as storage_crud
@@ -14,8 +13,6 @@ from src.modules.graph import crud as graph_crud
 from src.core.minio_op import (
   test_minio_server,
   set_site_alias,
-  add_new_site,
-  remove_site_alias,
   get_buckets_info,
   check_server_bucket_existed,
   get_minio_client,
@@ -90,18 +87,6 @@ async def create_minio_server(
   )
   if not success:
     raise CustomException(ErrorDesc.MINIO_ALIAS_FAILED, res)
-  master_minio_server_obj = await storage_crud.read_master_minio_server()
-  if master_minio_server_obj:
-    master_region_obj: Region = master_minio_server_obj.region
-    # 已有主节点, 需要执行加入复制集的操作
-    set_success, set_res = await add_new_site(
-      master_name=master_region_obj.name,
-      site_name=region_obj.name
-    )
-    if not set_success:
-      # 加入复制集失败, 需要删除别名
-      remove_success, _ = await remove_site_alias(region_obj.name)
-      raise CustomException(ErrorDesc.MINIO_REPLICATE_FAILED, set_res)
   # 创建 Minio 服务器数据
   minio_server_obj = await storage_crud.create_minio_server(
     region=region_obj,

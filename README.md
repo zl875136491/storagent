@@ -126,6 +126,9 @@ docker run -d --env-file .env -p 9000:9000 storagent
 | GET | `/buckets/{name}/replicates` | 复制拓扑 |
 | POST | `/buckets/{name}/replicates` | 创建单向复制连接 |
 
+存储服务统一使用 Bucket Replication 管理单向复制连接。不要同时为受管
+MinIO 节点启用 Site Replication；MinIO 不允许两种复制模式混用。
+
 ### 文件 `/api/files`（需 `x-api-key`）
 
 | 方法 | 路径 | 说明 |

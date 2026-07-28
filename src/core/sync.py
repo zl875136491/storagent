@@ -364,27 +364,6 @@ async def setup_mc_aliases(servers_data: dict):
       logger.warning(f"mc alias 设置失败 {server_region_name}: {res}")
 
 
-async def join_site_replication_for_new_servers(new_server_names: list[str]):
-  from src.core import minio_op
-  from src.modules.storage import crud as storage_crud
-
-  if not new_server_names:
-    return
-  master = await storage_crud.read_master_minio_server()
-  if not master:
-    return
-  master_region = master.region
-  master_name = master_region.name if hasattr(master_region, "name") else master.name
-  for site_name in new_server_names:
-    if site_name == settings.REGION:
-      continue
-    success, res = await minio_op.add_new_site(master_name, site_name)
-    if success:
-      logger.info(f"Site Replication: {site_name} 已加入 {master_name}")
-    else:
-      logger.warning(f"Site Replication 加入失败 {site_name}: {res}")
-
-
 async def setup_bucket_replication(bucket_name: str, server_names: list[str] | None = None):
   from src.core import minio_op
   from src.modules.storage import crud as storage_crud
@@ -583,9 +562,8 @@ async def pull_all_and_sync(client=None):
 
     servers_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_SERVERS, client=client)
     if servers_data:
-      new_servers = await sync_servers_to_mongo(servers_data)
+      await sync_servers_to_mongo(servers_data)
       await setup_mc_aliases(servers_data)
-      await join_site_replication_for_new_servers(new_servers)
 
     apps_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_APPLICATIONS, client=client)
     if apps_data:

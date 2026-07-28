@@ -43,9 +43,8 @@ async def _handle_etcd_put(key: str, value: str):
   if short_key == sync_module.ETCD_KEY_REGION:
     await sync_module.sync_region_to_mongo(data)
   elif short_key == sync_module.ETCD_KEY_SERVERS:
-    new_servers = await sync_module.sync_servers_to_mongo(data)
+    await sync_module.sync_servers_to_mongo(data)
     await sync_module.setup_mc_aliases(data)
-    await sync_module.join_site_replication_for_new_servers(new_servers)
   elif short_key == sync_module.ETCD_KEY_APPLICATIONS:
     await sync_module.sync_applications_to_mongo(data)
     for app_name, app_data in data.items():

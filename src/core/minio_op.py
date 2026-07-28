@@ -311,6 +311,11 @@ async def create_bucket_replicate(
   cmd = shlex.join(args)
   success, err = await _run_cmd(cmd)
   if not success:
+    if "cluster replication setup" in str(err).lower():
+      return False, (
+        "源站点已启用 Site Replication，无法创建 Bucket Replication；"
+        "请先将受管 MinIO 节点迁移为桶复制模式"
+      )
     return False, f"创建复制失败:{str(err)}"
   return True, "创建复制成功"
 

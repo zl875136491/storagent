@@ -121,6 +121,29 @@ async def test_minio_replicate_command_applies_requested_options(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_minio_replicate_translates_site_replication_conflict(monkeypatch):
+  async def run_cmd(_command):
+    return False, (
+      "mc: <ERROR> unable to configure remote target. Cannot add remote target "
+      "endpoint since this server is in a cluster replication setup."
+    )
+
+  monkeypatch.setattr(minio_op, "_run_cmd", run_cmd)
+
+  success, reason = await minio_op.create_bucket_replicate(
+    "hangzhou",
+    "beijing",
+    "system-test",
+  )
+
+  assert success is False
+  assert reason == (
+    "源站点已启用 Site Replication，无法创建 Bucket Replication；"
+    "请先将受管 MinIO 节点迁移为桶复制模式"
+  )
+
+
+@pytest.mark.asyncio
 async def test_remote_bucket_suffix_is_removed_exactly(monkeypatch):
   async def run_cmd(_command):
     return True, (
