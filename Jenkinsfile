@@ -75,6 +75,7 @@ pipeline {
                 sh '''#!/usr/bin/env bash
                     set -Eeuo pipefail
                     docker build \
+                        --provenance=false \
                         --platform linux/amd64 \
                         --file "$DOCKERFILE_PATH" \
                         --build-arg "VCS_REF=$GIT_COMMIT" \
