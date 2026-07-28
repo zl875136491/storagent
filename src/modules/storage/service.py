@@ -300,6 +300,20 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
         "status": status_info,
         "rule_id": rule_id
       })
+  # 遗留百分比坐标（全部落在 0–100）迁移为像素，避免前后端启发式互相误判。
+  if _looks_like_percent_positions(nodes):
+    migrated = _percent_nodes_to_pixels(nodes)
+    for server, pos in migrated.items():
+      try:
+        await graph_crud.update_bucket_node_position(
+          bucket_name,
+          server,
+          pos["position_x"],
+          pos["position_y"],
+        )
+      except Exception:
+        pass
+    nodes = migrated
   return dict(servers=nodes, replicates=replicates, server_ids=server_names)
 
 
@@ -310,6 +324,29 @@ _SIDE_TO_POSITION = {
   "bottom": "down",
   "left": "left",
 }
+# 与前端画布基准一致：遗留百分比坐标迁移为像素
+_GRAPH_AREA_W = 900
+_GRAPH_AREA_H = 560
+
+
+def _looks_like_percent_positions(nodes: dict) -> bool:
+  vals = list(nodes.values())
+  if not vals:
+    return False
+  return all(
+    0 <= int(v.get("position_x", -1)) <= 100 and 0 <= int(v.get("position_y", -1)) <= 100
+    for v in vals
+  )
+
+
+def _percent_nodes_to_pixels(nodes: dict) -> dict:
+  converted = {}
+  for server, pos in nodes.items():
+    converted[server] = {
+      "position_x": round(int(pos["position_x"]) / 100 * _GRAPH_AREA_W),
+      "position_y": round(int(pos["position_y"]) / 100 * _GRAPH_AREA_H),
+    }
+  return converted
 
 
 def _validate_bucket_name(bucket_name: str) -> str:
@@ -450,15 +487,20 @@ async def delete_bucket_replicate(
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "源站点或目标站点不存在")
 
   resolved_rule_id = (rule_id or "").strip()
-  if not resolved_rule_id:
-    current = await get_bucket_replicate_infos(bucket)
-    match = next((
-      item for item in current.get("replicates", [])
-      if item.get("from") == from_server and item.get("to") == to_server
-    ), None)
-    if not match or not match.get("rule_id"):
-      raise CustomException(ErrorDesc.RES_NOT_FOUND, "复制连接不存在")
-    resolved_rule_id = str(match["rule_id"])
+  current = await get_bucket_replicate_infos(bucket)
+  match = next((
+    item for item in current.get("replicates", [])
+    if item.get("from") == from_server and item.get("to") == to_server
+  ), None)
+  if not match or not match.get("rule_id"):
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "复制连接不存在")
+  matched_rule_id = str(match["rule_id"])
+  if resolved_rule_id and resolved_rule_id != matched_rule_id:
+    raise CustomException(
+      ErrorDesc.INVALID_RULE_PARAMS,
+      "rule_id 与 from/to 对应的复制规则不一致",
+    )
+  resolved_rule_id = matched_rule_id
 
   success, detail = await delete_minio_bucket_replicate(
     from_server,
