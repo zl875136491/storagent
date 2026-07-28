@@ -5,8 +5,8 @@ from beanie.odm.fields import Link
 from bson import DBRef, ObjectId
 
 from src.core.auth import get_current_app
-from src.modules.files import route as files_route
-from src.modules.public.model import Application
+from src.modules.files import route as files_route, service as files_service
+from src.modules.public.model import Application, Region
 from src.utils.helpers import utc_now
 
 
@@ -37,3 +37,26 @@ async def test_api_key_application_link_is_resolved(monkeypatch):
   monkeypatch.setattr("src.modules.public.crud.read_api_key_by_key", read_key)
   monkeypatch.setattr("src.modules.public.crud.read_application_by_id", read_app)
   assert await get_current_app("secret") == "system-test"
+
+
+@pytest.mark.asyncio
+async def test_object_stat_does_not_dereference_server_region_link(monkeypatch):
+  unresolved_region = Link(DBRef("region", ObjectId()), Region)
+  server = type("Server", (), {"region": unresolved_region})()
+  stat = type("Stat", (), {
+    "size": 12,
+    "etag": "etag",
+    "content_type": "application/octet-stream",
+    "last_modified": utc_now(),
+  })()
+
+  async def stat_object_local(_app_name, _object_key):
+    return stat, server
+
+  monkeypatch.setattr(files_service.files_locate, "stat_object_local", stat_object_local)
+  monkeypatch.setattr(files_service.settings, "REGION", "beijing")
+
+  result = await files_service.stat_object("system-test", "object-key")
+
+  assert result.region == "beijing"
+  assert result.local is True

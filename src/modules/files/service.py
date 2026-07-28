@@ -193,8 +193,7 @@ async def stat_object(
 ) -> files_schema.ObjectStatResponse:
   b = app_name
   key = object_key.strip()
-  stat, server = await files_locate.stat_object_local(b, key)
-  region = server.region
+  stat, _server = await files_locate.stat_object_local(b, key)
   return files_schema.ObjectStatResponse(
     bucket=b,
     object_key=key,
@@ -202,7 +201,7 @@ async def stat_object(
     etag=stat.etag,
     content_type=stat.content_type,
     last_modified=stat.last_modified,
-    region=region.name if region else settings.REGION,
+    region=settings.REGION,
     local=True,
   )
 
