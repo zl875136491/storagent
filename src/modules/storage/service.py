@@ -21,6 +21,7 @@ from src.core.minio_op import (
   get_bucket_replicate_info,
   get_site_alias,
   create_bucket_replicate as create_minio_bucket_replicate,
+  delete_bucket_replicate as delete_minio_bucket_replicate,
 )
 from src.core import sync as sync_module
 
@@ -257,16 +258,12 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
   node_objs = await graph_crud.read_many_bucket_node_positions(bucket_name)
   edge_objs = await graph_crud.read_many_bucket_edge_positions(bucket_name)
   for node_item in node_objs:
+    # 仅返回 Mongo 中真实落盘的坐标；缺失节点由前端做环形默认布局。
+    # 切勿用 (0,0) 填充未布局节点：会把未布局站点叠在原点，并干扰像素/百分比坐标推断。
     nodes[node_item.server] = {
       "position_x": node_item.position_x,
       "position_y": node_item.position_y
     }
-  for server_name in server_names:
-    if server_name not in nodes.keys():
-      nodes[server_name] = {
-        "position_x": 0,
-        "position_y": 0
-      }
   for edge_item in edge_objs:
     from_server = edge_item.from_server
     to_server = edge_item.to_server
@@ -303,7 +300,7 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
         "status": status_info,
         "rule_id": rule_id
       })
-  return dict(servers=nodes, replicates=replicates)
+  return dict(servers=nodes, replicates=replicates, server_ids=server_names)
 
 
 _BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
@@ -431,3 +428,70 @@ async def create_bucket_replicate(bucket_name: str, payload) -> dict:
     resource=f"{bucket}:{from_server}->{to_server}",
   )
   return created
+
+
+async def delete_bucket_replicate(
+  bucket_name: str,
+  from_server: str,
+  to_server: str,
+  rule_id: str | None = None,
+) -> dict:
+  """删除单向复制规则，并清理拓扑边位置。"""
+  from src.core import audit
+
+  bucket = _validate_bucket_name(bucket_name)
+  from_server = from_server.strip()
+  to_server = to_server.strip()
+  if from_server == to_server:
+    raise CustomException(ErrorDesc.INVALID_RULE_PARAMS, "源站点与目标站点不能相同")
+
+  server_names = set(await storage_crud.read_minio_server_names())
+  if from_server not in server_names or to_server not in server_names:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "源站点或目标站点不存在")
+
+  resolved_rule_id = (rule_id or "").strip()
+  if not resolved_rule_id:
+    current = await get_bucket_replicate_infos(bucket)
+    match = next((
+      item for item in current.get("replicates", [])
+      if item.get("from") == from_server and item.get("to") == to_server
+    ), None)
+    if not match or not match.get("rule_id"):
+      raise CustomException(ErrorDesc.RES_NOT_FOUND, "复制连接不存在")
+    resolved_rule_id = str(match["rule_id"])
+
+  success, detail = await delete_minio_bucket_replicate(
+    from_server,
+    bucket,
+    resolved_rule_id,
+  )
+  if not success:
+    audit.audit(
+      "bucket_replicate.delete",
+      resource=f"{bucket}:{from_server}->{to_server}",
+      detail=detail,
+      success=False,
+    )
+    raise CustomException(ErrorDesc.MINIO_REPLICATE_FAILED, detail)
+
+  try:
+    await graph_crud.delete_bucket_edge_position(bucket, from_server, to_server)
+  except Exception as e:
+    audit.audit(
+      "bucket_replicate.edge_position_delete",
+      resource=f"{bucket}:{from_server}->{to_server}",
+      detail=str(e),
+      success=False,
+    )
+
+  audit.audit(
+    "bucket_replicate.delete",
+    resource=f"{bucket}:{from_server}->{to_server}",
+    detail=resolved_rule_id,
+  )
+  return {
+    "message": "ok",
+    "from": from_server,
+    "to": to_server,
+    "rule_id": resolved_rule_id,
+  }

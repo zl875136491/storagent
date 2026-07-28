@@ -319,6 +319,26 @@ async def create_bucket_replicate(
     return False, f"创建复制失败:{str(err)}"
   return True, "创建复制成功"
 
+
+async def delete_bucket_replicate(
+  from_server: str,
+  bucket_name: str,
+  rule_id: str,
+):
+  """
+  删除存储桶复制规则（mc replicate remove --id）。
+  """
+  args = [
+    "mc", "replicate", "remove",
+    "--id", rule_id,
+    f"{from_server}/{bucket_name}",
+  ]
+  cmd = shlex.join(args)
+  success, err = await _run_cmd(cmd)
+  if not success:
+    return False, f"删除复制失败:{str(err)}"
+  return True, "删除复制成功"
+
 async def get_bucket_replicate_status(server_name: str, bucket_name: str):
   """
   获取存储桶复制状态
