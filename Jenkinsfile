@@ -23,9 +23,22 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
-                deleteDir()
                 script {
-                    def scmVars = checkout(scm) ?: [:]
+                    int checkoutAttempt = 0
+                    def scmVars = [:]
+
+                    retry(3) {
+                        checkoutAttempt++
+                        if (checkoutAttempt > 1) {
+                            int backoffSeconds = checkoutAttempt == 2 ? 5 : 10
+                            echo "Checkout attempt ${checkoutAttempt}/3 starts in ${backoffSeconds}s."
+                            sleep time: backoffSeconds, unit: 'SECONDS'
+                        }
+
+                        deleteDir()
+                        echo "Checkout attempt ${checkoutAttempt}/3."
+                        scmVars = checkout(scm) ?: [:]
+                    }
 
                     env.GIT_COMMIT = scmVars.GIT_COMMIT ?: sh(
                         script: 'git rev-parse HEAD',
