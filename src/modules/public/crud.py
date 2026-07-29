@@ -237,16 +237,49 @@ async def create_api_key(
   await api_key.save()
   return api_key
 
-async def read_api_key_by_app(applications: List[Application]) -> List[APIKey]:
+async def read_api_key_by_app(
+  applications: List[Application],
+  *,
+  include_admin_destroyed: bool = False,
+) -> List[APIKey]:
   """
-  获取API密钥
+  获取应用下的 API 密钥。
+  include_admin_destroyed=True 时额外返回被管理员吊销的密钥（供所有者展示状态）。
   """
   application_ids = [app.id for app in applications]
+  if not application_ids:
+    return []
+  if include_admin_destroyed:
+    return await APIKey.find(
+      In(APIKey.application.id, application_ids),
+      {
+        "$or": [
+          {"deleted": False},
+          {"destory_by_admin": True},
+        ]
+      },
+      fetch_links=True,
+    ).to_list()
   return await APIKey.find(
     In(APIKey.application.id, application_ids),
     APIKey.deleted == False,
     fetch_links=True
   ).to_list()
+
+
+async def read_all_api_keys(*, include_admin_destroyed: bool = False) -> List[APIKey]:
+  """管理员视角：全部有效密钥，可选含管理员吊销记录。"""
+  if include_admin_destroyed:
+    return await APIKey.find(
+      {
+        "$or": [
+          {"deleted": False},
+          {"destory_by_admin": True},
+        ]
+      },
+      fetch_links=True,
+    ).to_list()
+  return await APIKey.find(APIKey.deleted == False, fetch_links=True).to_list()
 
 async def read_api_key_by_id(api_key_id: str | ObjectId) -> APIKey | None:
   """
@@ -299,15 +332,20 @@ async def read_api_key_by_key_including_deleted(key: str) -> APIKey | None:
   return None
 
 
-async def delete_api_key_by_id(api_key_id: str | ObjectId) -> bool:
+async def delete_api_key_by_id(
+  api_key_id: str | ObjectId,
+  *,
+  destory_by_admin: bool = False,
+) -> bool:
   """
-  删除API密钥
+  删除API密钥（软删除）
   """
   api_key = await read_api_key_by_id(api_key_id)
   if not api_key:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "API密钥不存在")
   api_key.deleted = True
   api_key.deleted_at = utc_now()
+  api_key.destory_by_admin = bool(destory_by_admin)
   await api_key.save()
   return True
 

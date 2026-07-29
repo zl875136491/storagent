@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Request
 from src.modules.auth import service as auth_service
 from src.modules.auth import schema as auth_schema
-from src.core.auth import get_current_user, oauth2_scheme
+from src.core.auth import get_current_user, oauth2_scheme, require_admin
 from src.core.rate_limit import rate_limit_login, rate_limit_refresh
 from src.modules.auth.model import User
 
@@ -58,3 +58,25 @@ async def logout(
   用户登出
   """
   return await auth_service.logout_user(token)
+
+@router.get(
+  path="/users",
+  response_model=auth_schema.AdminUserListResponse,
+  summary="管理员：用户与角色列表")
+async def list_users(
+  current_user: User = Depends(get_current_user),
+) -> auth_schema.AdminUserListResponse:
+  await require_admin(current_user)
+  return await auth_service.list_users_for_admin()
+
+@router.put(
+  path="/users/{user_id}/role",
+  response_model=auth_schema.UpdateUserRoleResponse,
+  summary="管理员：设置用户角色")
+async def update_user_role(
+  user_id: str,
+  payload: auth_schema.UpdateUserRoleRequest,
+  current_user: User = Depends(get_current_user),
+) -> auth_schema.UpdateUserRoleResponse:
+  await require_admin(current_user)
+  return await auth_service.update_user_role_for_admin(user_id, payload.role)

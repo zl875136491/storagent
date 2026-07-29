@@ -496,10 +496,25 @@ async def create_api_key(
 async def get_api_key_list(
   current_user: User) -> List[APIKey]:
   """
-  获取API密钥列表
+  获取API密钥列表。
+  普通用户：本人启用应用下的有效密钥 + 被管理员吊销的密钥。
+  管理员：全部有效密钥 + 管理员吊销记录（可吊销他人密钥）。
   """
-  users_app_objs = await public_crud.read_users_enabled_application_list(current_user)
-  api_key_objs = await public_crud.read_api_key_by_app(users_app_objs)
+  from src.modules.auth import crud as user_crud
+
+  admin_role = await user_crud.get_admin_role()
+  is_admin = bool(
+    admin_role
+    and any(getattr(role, "id", None) == admin_role.id for role in (current_user.roles or []))
+  )
+  if is_admin:
+    api_key_objs = await public_crud.read_all_api_keys(include_admin_destroyed=True)
+  else:
+    users_app_objs = await public_crud.read_users_enabled_application_list(current_user)
+    api_key_objs = await public_crud.read_api_key_by_app(
+      users_app_objs,
+      include_admin_destroyed=True,
+    )
   data = []
   for api_key_obj in api_key_objs:
     hint = api_key_obj.key_hint or "************"
@@ -511,7 +526,9 @@ async def get_api_key_list(
         "name": api_key_obj.application.name,
         "shown_name": api_key_obj.application.shown_name
       },
-      "expired_at": api_key_obj.expired_at
+      "expired_at": api_key_obj.expired_at,
+      "deleted": bool(api_key_obj.deleted),
+      "destory_by_admin": bool(getattr(api_key_obj, "destory_by_admin", False)),
     })
   return dict[str, List[APIKey]](data=data)
 
@@ -519,17 +536,26 @@ async def revoke_api_key(
   api_key_id: ObjectId,
   current_user: User) -> dict:
   """
-  吊销 API 密钥
+  吊销 API 密钥。所有者可吊销本人密钥；管理员可吊销任意密钥（标注 destory_by_admin）。
   """
+  from src.modules.auth import crud as user_crud
+
   api_key_obj = await public_crud.read_api_key_by_id(api_key_id)
   if not api_key_obj:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "API密钥不存在")
   application_obj = await public_crud.read_application_by_id(api_key_obj.application.id)
-  if not application_obj or application_obj.author.id != current_user.id:
+  is_owner = bool(application_obj and application_obj.author.id == current_user.id)
+  admin_role = await user_crud.get_admin_role()
+  is_admin = bool(
+    admin_role
+    and any(getattr(role, "id", None) == admin_role.id for role in (current_user.roles or []))
+  )
+  if not is_owner and not is_admin:
     raise CustomException(ErrorDesc.RES_NOT_BELONG_TO_USER, "API密钥不属于当前用户")
   if api_key_obj.deleted:
     raise CustomException(ErrorDesc.STATUS_ERR, "API密钥已吊销")
-  await public_crud.delete_api_key_by_id(api_key_id)
+  destory_by_admin = bool(is_admin and not is_owner)
+  await public_crud.delete_api_key_by_id(api_key_id, destory_by_admin=destory_by_admin)
   try:
     revoked = await public_crud.read_api_key_by_id(api_key_id)
     if revoked:
@@ -540,5 +566,10 @@ async def revoke_api_key(
     audit.audit("api_key.revoke", actor=current_user.username, resource=str(api_key_id), detail=str(e), success=False)
     raise CustomException(ErrorDesc.SYNC_FAILED, f"API Key 吊销同步到 Etcd 失败: {e}")
   from src.core import audit
-  audit.audit("api_key.revoke", actor=current_user.username, resource=str(api_key_id))
+  audit.audit(
+    "api_key.revoke",
+    actor=current_user.username,
+    resource=str(api_key_id),
+    detail="destory_by_admin" if destory_by_admin else "owner",
+  )
   return {"message": "API密钥已吊销"}
