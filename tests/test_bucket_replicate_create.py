@@ -62,7 +62,7 @@ async def test_create_bucket_replicate_calls_minio_and_persists_ports(monkeypatc
   monkeypatch.setattr(storage_service, "check_server_bucket_existed", bucket_exists)
   monkeypatch.setattr(storage_service, "get_bucket_replicate_infos", replicate_infos)
   monkeypatch.setattr(storage_service, "create_minio_bucket_replicate", create_rule)
-  monkeypatch.setattr(storage_service.graph_crud, "update_bucket_edge_position", persist)
+  monkeypatch.setattr(storage_service.graph_service, "set_bucket_edge_position", persist)
   monkeypatch.setattr("src.core.audit.audit", lambda *args, **kwargs: None)
 
   payload = storage_schema.BucketReplicateCreateRequest.model_validate({
@@ -177,7 +177,7 @@ async def test_create_returns_pending_when_minio_readback_lags(monkeypatch):
   monkeypatch.setattr(storage_service, "check_server_bucket_existed", bucket_exists)
   monkeypatch.setattr(storage_service, "get_bucket_replicate_infos", replicate_infos)
   monkeypatch.setattr(storage_service, "create_minio_bucket_replicate", create_rule)
-  monkeypatch.setattr(storage_service.graph_crud, "update_bucket_edge_position", persist)
+  monkeypatch.setattr(storage_service.graph_service, "set_bucket_edge_position", persist)
   monkeypatch.setattr("src.core.audit.audit", lambda *args, **kwargs: None)
 
   payload = storage_schema.BucketReplicateCreateRequest.model_validate({
@@ -261,7 +261,7 @@ async def test_delete_bucket_replicate_calls_minio_and_clears_edge(monkeypatch):
   monkeypatch.setattr(storage_service.storage_crud, "read_minio_server_names", server_names)
   monkeypatch.setattr(storage_service, "get_bucket_replicate_infos", replicate_infos)
   monkeypatch.setattr(storage_service, "delete_minio_bucket_replicate", remove_rule)
-  monkeypatch.setattr(storage_service.graph_crud, "delete_bucket_edge_position", clear_edge)
+  monkeypatch.setattr(storage_service.graph_service, "delete_bucket_edge_position", clear_edge)
   monkeypatch.setattr("src.core.audit.audit", lambda *args, **kwargs: None)
 
   result = await storage_service.delete_bucket_replicate(
@@ -305,7 +305,7 @@ async def test_delete_bucket_replicate_resolves_rule_id_when_omitted(monkeypatch
   monkeypatch.setattr(storage_service.storage_crud, "read_minio_server_names", server_names)
   monkeypatch.setattr(storage_service, "get_bucket_replicate_infos", replicate_infos)
   monkeypatch.setattr(storage_service, "delete_minio_bucket_replicate", remove_rule)
-  monkeypatch.setattr(storage_service.graph_crud, "delete_bucket_edge_position", clear_edge)
+  monkeypatch.setattr(storage_service.graph_service, "delete_bucket_edge_position", clear_edge)
   monkeypatch.setattr("src.core.audit.audit", lambda *args, **kwargs: None)
 
   result = await storage_service.delete_bucket_replicate(
@@ -390,7 +390,7 @@ async def test_get_replicate_infos_migrates_legacy_percent_positions(monkeypatch
   )
   monkeypatch.setattr(storage_service, "get_bucket_replicate_info", replicate_info)
   monkeypatch.setattr(storage_service, "get_bucket_replicate_status", replicate_status)
-  monkeypatch.setattr(storage_service.graph_crud, "update_bucket_node_position", update_pos)
+  monkeypatch.setattr(storage_service.graph_service, "set_bucket_node_position", update_pos)
 
   result = await storage_service.get_bucket_replicate_infos("system-test")
   assert result["servers"]["hangzhou"] == {"position_x": 450, "position_y": 140}

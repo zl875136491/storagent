@@ -1,5 +1,67 @@
 from src.modules.graph import crud as graph_crud
 from src.modules.graph import schema as graph_schema
+from src.core import sync as sync_module
+
+
+async def set_bucket_node_position(
+  bucket: str,
+  server: str,
+  position_x: int,
+  position_y: int,
+):
+  """Publish first so Etcd remains the source of truth for UI layout."""
+  await sync_module.publish_topology_node_position(
+    bucket,
+    server,
+    position_x,
+    position_y,
+  )
+  return await graph_crud.update_bucket_node_position(
+    bucket,
+    server,
+    position_x,
+    position_y,
+  )
+
+
+async def set_bucket_edge_position(
+  bucket: str,
+  from_server: str,
+  to_server: str,
+  from_position: str,
+  to_position: str,
+):
+  await sync_module.publish_topology_edge_position(
+    bucket,
+    from_server,
+    to_server,
+    from_position,
+    to_position,
+  )
+  return await graph_crud.update_bucket_edge_position(
+    bucket,
+    from_server,
+    to_server,
+    from_position,
+    to_position,
+  )
+
+
+async def delete_bucket_edge_position(
+  bucket: str,
+  from_server: str,
+  to_server: str,
+) -> bool:
+  await sync_module.unpublish_topology_edge_position(
+    bucket,
+    from_server,
+    to_server,
+  )
+  return await graph_crud.delete_bucket_edge_position(
+    bucket,
+    from_server,
+    to_server,
+  )
 
 async def update_bucket_node_position(
   payload: graph_schema.BucketNodePositionRequest):
@@ -10,7 +72,7 @@ async def update_bucket_node_position(
   server = payload.server
   position_x = payload.position_x
   position_y = payload.position_y
-  return await graph_crud.update_bucket_node_position(bucket, server, position_x, position_y)
+  return await set_bucket_node_position(bucket, server, position_x, position_y)
 
 async def update_bucket_edge_position(
   payload: graph_schema.BucketEdgePositionRequest):
@@ -22,7 +84,13 @@ async def update_bucket_edge_position(
   to_server = payload.to_server
   from_position = payload.from_position
   to_position = payload.to_position
-  return await graph_crud.update_bucket_edge_position(bucket, from_server, to_server, from_position, to_position)
+  return await set_bucket_edge_position(
+    bucket,
+    from_server,
+    to_server,
+    from_position,
+    to_position,
+  )
 
 async def get_bucket_node_positions(bucket: str):
   """

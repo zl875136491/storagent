@@ -57,7 +57,14 @@ async def init_service():
       client=etcd_client,
     )
 
-    # 3. 全量同步 Etcd -> MongoDB（含 applications / api_keys）
+    # 3. 合并本地身份数据。用户按 username 合并，不会覆盖其他区域独有用户。
+    await sync_module.publish_roles(client=etcd_client)
+    await sync_module.publish_local_users(client=etcd_client)
+
+    # 4. 拓扑布局仅首次由权威区域写入；后续所有区域均走共享 CAS 更新。
+    await sync_module.bootstrap_topology_layout(client=etcd_client)
+
+    # 5. 全量同步 Etcd -> MongoDB（含身份、应用、API Key、拓扑布局）
     await sync_module.pull_all_and_sync(client=etcd_client)
 
     logger.info(f"Service Initialized: {settings.REGION_NAME} ({settings.REGION}).")

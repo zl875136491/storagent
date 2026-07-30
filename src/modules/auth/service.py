@@ -162,7 +162,22 @@ async def update_user_role_for_admin(user_id: str, role_name: str) -> dict:
       raise CustomException(ErrorDesc.INVALID_PARAMS, "不能取消系统中唯一的管理员")
 
   new_role = admin_role if role_name == "管理员" else basic_role
+  previous_roles = list(target.roles or [])
+  previous_permissions = list(getattr(target, "permissions", []) or [])
+  previous_updated_at = getattr(target, "updated_at", None)
   updated = await user_crud.update_user_role(target, new_role)
+  try:
+    from src.core import sync as sync_module
+    await sync_module.publish_user(updated)
+  except Exception as e:
+    target.roles = previous_roles
+    target.permissions = previous_permissions
+    target.updated_at = previous_updated_at
+    await target.save()
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "用户角色未能同步到所有区域，请稍后重试",
+    ) from e
   refreshed = await user_crud.read_user_by_id(updated.id)
   summary = _user_role_summary(refreshed or updated, admin_role)
   return {

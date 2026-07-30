@@ -10,8 +10,8 @@
 |------|------|----------|
 | Storagent API | 本区控制面 | `GET /health` 存活；`GET /ready` 含 Mongo + Etcd |
 | MongoDB | 本区元数据 / 会话黑名单 / 审计 | `/ready` |
-| Etcd | 跨区拓扑、应用、API Key、吊销 token | `/ready` |
-| MinIO | 对象数据；Site / Bucket Replication | 业务侧探测 |
+| Etcd | 跨区身份、节点清单、拓扑布局、应用、API Key、吊销 token | `/ready` |
+| MinIO | 对象数据与 Bucket Replication 事实状态 | 业务侧探测 |
 
 约定：**一 Region 一 Storagent 主实例**（同区水平扩展需另行设计实例 ID）。
 
@@ -34,7 +34,7 @@
 
 1. 确认各节点 `ETCD_*` 与 `SECRET_KEY` 一致。
 2. 恢复 Etcd 多数派；查看 Storagent 日志中 `Etcd watch 异常` / `CAS conflict`。
-3. Etcd 恢复后依赖 watch 收敛；必要时重启节点触发全量 pull。
+3. Etcd 恢复后由 Watch 和默认 30 秒周期全量校准自动收敛；关注 `sync_reconcile_failures_total`。
 4. 勿在 Etcd 未恢复时强行改拓扑（易造成本地孤儿数据）。
 
 ### 3.2 幽灵节点 / 拓扑不收敛
@@ -44,22 +44,33 @@
 **处理**：
 
 1. 管理面调用区域下线 API（`DELETE /api/public/region/{id}`，需 `region_manage`）。
-2. 确认 Etcd `region` / `servers` map 中已移除该 key。
+2. 确认 Etcd `region` / `servers` map 中已移除该 key，`topology_layout` 中也没有该节点的布局记录。
 3. 其他节点应通过 PUT 收敛删除远程条目；若整 key 被 DELETE，会按空 map 收敛远程拓扑。
 
 ### 3.3 登出后他区仍可用
 
 **现象**：A 区 logout，B 区 access 仍短暂有效。
 
-**处理**：吊销依赖 Etcd `revoked_tokens`。检查 B 区 watch 是否运行；确认 `SECRET_KEY` 一致以便校验 JWT。黑名单保留至 JWT `exp`。
+**处理**：吊销依赖 Etcd `revoked_tokens`。检查 B 区 Watch 与周期校准指标；确认 `SECRET_KEY` 一致以便校验 JWT。黑名单保留至 JWT `exp`。
 
-### 3.4 应用启用但他区未建桶
+### 3.4 用户、角色或拓扑布局不一致
+
+**现象**：不同 Region 的用户列表、角色或 Bucket 图形位置不同。
+
+**处理**：
+
+1. 确认 Etcd 中存在 `roles`、`users` 和 `topology_layout`；后者 `_meta.authority_region` 应为北京。
+2. 检查 `/metrics?format=json` 中 `sync_last_success_timestamp_seconds` 持续更新，且 `sync_reconcile_failures_total` 未增长。
+3. 不要直接修改各区 Mongo；用户按用户名、布局按 Bucket/Server/Edge 组合键由 Etcd 收敛。
+4. `master`、Mongo `_id`、审计和访问统计是本地数据，出现差异属于预期。
+
+### 3.5 应用启用但他区未建桶
 
 **现象**：授权 SSE 中 sync 失败；或对象只在单区。
 
-**处理**：查看授权流 `sync` 步骤与 MinIO Site/Bucket Replication 日志；修复后重新授权或手动 `ensure` 桶与复制规则。
+**处理**：查看授权流 `sync` 步骤与 MinIO Bucket Replication 日志；修复后重新授权或手动 `ensure` 桶与复制规则。
 
-### 3.5 SECRET_KEY / 加密凭证异常
+### 3.6 SECRET_KEY / 加密凭证异常
 
 **现象**：解密失败、同步用户/服务器密钥无法使用。
 

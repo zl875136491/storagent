@@ -109,6 +109,7 @@ async def offline_region(region_id) -> dict:
   try:
     await sync_module.unpublish_server(region.name)
     await sync_module.unpublish_region(region.name)
+    await sync_module.unpublish_topology_server(region.name)
   except Exception as e:
     from src.core import audit, metrics as metrics_mod
     metrics_mod.incr("sync_failures_total")

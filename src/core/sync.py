@@ -2,12 +2,14 @@
 跨节点数据同步模块
 
 通过 Etcd 在多地 Storagent 节点间同步：
+- roles / users（身份按稳定业务键关联，密码哈希加密存储）
 - region / servers（拓扑；MinIO 凭证加密存储）
+- topology_layout（图形布局；不包含 MinIO Bucket Replication 规则）
 - applications（应用元数据）
 - api_keys（API 密钥；字典键为哈希，值为加密后的 Key）
 """
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger
@@ -24,12 +26,250 @@ from src.utils.helpers import utc_now
 
 ETCD_KEY_REGION = "region"
 ETCD_KEY_SERVERS = "servers"
+ETCD_KEY_ROLES = "roles"
+ETCD_KEY_USERS = "users"
 ETCD_KEY_APPLICATIONS = "applications"
 ETCD_KEY_API_KEYS = "api_keys"
 ETCD_KEY_REVOKED_TOKENS = "revoked_tokens"
 ETCD_KEY_AI_CONFIG = "ai_config"
+ETCD_KEY_TOPOLOGY_LAYOUT = "topology_layout"
+
+TOPOLOGY_LAYOUT_SCHEMA_VERSION = 1
 
 SYNC_USER_PLACEHOLDER = "__sync__"
+
+
+def _parse_sync_datetime(value: Any) -> datetime | None:
+  if not value:
+    return None
+  try:
+    parsed = datetime.fromisoformat(str(value))
+  except (TypeError, ValueError):
+    return None
+  if parsed.tzinfo is None:
+    return parsed.replace(tzinfo=timezone.utc)
+  return parsed
+
+
+def _same_sync_datetime(left: datetime | None, right: datetime | None) -> bool:
+  if left is None or right is None:
+    return left is right
+  if left.tzinfo is None:
+    left = left.replace(tzinfo=timezone.utc)
+  if right.tzinfo is None:
+    right = right.replace(tzinfo=timezone.utc)
+  return left.astimezone(timezone.utc) == right.astimezone(timezone.utc)
+
+
+def _prefer_user_entry(current: dict | None, candidate: dict) -> bool:
+  """Resolve same-username startup conflicts deterministically."""
+  if not current:
+    return True
+  current_updated = _parse_sync_datetime(current.get("updated_at"))
+  candidate_updated = _parse_sync_datetime(candidate.get("updated_at"))
+  if candidate_updated and (not current_updated or candidate_updated > current_updated):
+    return True
+  if current_updated and (not candidate_updated or candidate_updated < current_updated):
+    return False
+
+  authority = settings.SYNC_AUTHORITY_REGION
+  current_origin = str(current.get("origin_region") or "")
+  candidate_origin = str(candidate.get("origin_region") or "")
+  if candidate_origin == authority and current_origin != authority:
+    return True
+  if current_origin == authority and candidate_origin != authority:
+    return False
+  return candidate_origin < current_origin
+
+
+def role_to_etcd_entry(role) -> dict:
+  return {
+    "name": role.name,
+    "is_admin": bool(role.is_admin),
+    "permissions": sorted(set(role.permissions or [])),
+    "origin_region": settings.REGION,
+  }
+
+
+def _prefer_authority_entry(current: dict | None, candidate: dict) -> bool:
+  if not current:
+    return True
+  authority = settings.SYNC_AUTHORITY_REGION
+  current_origin = str(current.get("origin_region") or "")
+  candidate_origin = str(candidate.get("origin_region") or "")
+  if candidate_origin == authority and current_origin != authority:
+    return True
+  if current_origin == authority and candidate_origin != authority:
+    return False
+  return candidate_origin < current_origin
+
+
+def user_to_etcd_entry(user) -> dict:
+  role_names = sorted({
+    role.name
+    for role in (user.roles or [])
+    if getattr(role, "name", None)
+  })
+  return {
+    "name": user.name,
+    "hashed_password_enc": encrypt_secret(user.hashed_password),
+    "role_names": role_names,
+    "created_at": user.created_at.isoformat() if user.created_at else None,
+    "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+    "origin_region": settings.REGION,
+  }
+
+
+async def sync_roles_to_mongo(roles_data: dict) -> None:
+  from src.modules.auth.model import Role
+
+  for role_name, data in roles_data.items():
+    if not role_name or not isinstance(data, dict):
+      continue
+    permissions = sorted({
+      str(item) for item in (data.get("permissions") or []) if item
+    })
+    is_admin = bool(data.get("is_admin", False))
+    role = await Role.find_one(Role.name == role_name)
+    if not role:
+      await Role(
+        name=role_name,
+        is_admin=is_admin,
+        permissions=permissions,
+      ).save()
+      logger.info(f"Etcd sync: 创建 Role {role_name}")
+      continue
+    if role.is_admin != is_admin or sorted(role.permissions or []) != permissions:
+      role.is_admin = is_admin
+      role.permissions = permissions
+      await role.save()
+      logger.info(f"Etcd sync: 更新 Role {role_name}")
+
+
+async def sync_users_to_mongo(users_data: dict) -> None:
+  from src.modules.auth import crud as user_crud
+  from src.modules.auth.model import Role
+
+  for username, data in users_data.items():
+    if not username or not isinstance(data, dict):
+      continue
+    encrypted_hash = str(data.get("hashed_password_enc") or "")
+    if not encrypted_hash:
+      logger.warning(f"Etcd sync: User {username} 缺少密码哈希，已跳过")
+      continue
+    try:
+      hashed_password = decrypt_secret(encrypted_hash)
+    except ValueError as e:
+      logger.warning(f"Etcd sync: User {username} 密码哈希解密失败: {e}")
+      continue
+
+    roles = []
+    for role_name in data.get("role_names") or []:
+      role = await Role.find_one(Role.name == str(role_name))
+      if role:
+        roles.append(role)
+    if not roles:
+      basic_role = await user_crud.get_basic_role()
+      if basic_role:
+        roles = [basic_role]
+    permissions = await user_crud.get_all_permissions(roles)
+    created_at = _parse_sync_datetime(data.get("created_at")) or utc_now()
+    updated_at = _parse_sync_datetime(data.get("updated_at")) or created_at
+
+    user = await user_crud.read_user_by_username(username)
+    if not user:
+      user = await user_crud.create_user(
+        username=username,
+        name=str(data.get("name") or username),
+        hashed_password=hashed_password,
+        roles=roles,
+        is_sync=False,
+      )
+      user.created_at = created_at
+      user.updated_at = updated_at
+      await user.save()
+      logger.info(f"Etcd sync: 创建可登录 User {username}")
+      continue
+
+    current_role_names = sorted({
+      role.name
+      for role in (user.roles or [])
+      if getattr(role, "name", None)
+    })
+    desired_role_names = sorted(role.name for role in roles)
+    changed = any((
+      user.name != str(data.get("name") or username),
+      user.hashed_password != hashed_password,
+      current_role_names != desired_role_names,
+      sorted(user.permissions or []) != sorted(permissions),
+      bool(getattr(user, "is_sync", False)),
+      not _same_sync_datetime(user.created_at, created_at),
+      not _same_sync_datetime(user.updated_at, updated_at),
+    ))
+    if not changed:
+      continue
+    user.name = str(data.get("name") or username)
+    user.hashed_password = hashed_password
+    user.roles = roles
+    user.permissions = permissions
+    user.is_sync = False
+    user.created_at = created_at
+    user.updated_at = updated_at
+    await user.save()
+    logger.info(f"Etcd sync: 更新可登录 User {username}")
+
+
+async def publish_roles(client=None) -> None:
+  from src.core import etcd_op
+  from src.modules.auth.model import Role
+
+  roles = await Role.find_all().to_list()
+  entries = {role.name: role_to_etcd_entry(role) for role in roles}
+
+  def mutator(data: dict) -> dict:
+    for role_name, entry in entries.items():
+      if _prefer_authority_entry(data.get(role_name), entry):
+        data[role_name] = entry
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_ROLES, mutator, client=client)
+
+
+async def publish_user(user, client=None) -> None:
+  from src.core import etcd_op
+  from src.modules.auth import crud as user_crud
+
+  refreshed = await user_crud.read_user_by_id(user.id)
+  if not refreshed or getattr(refreshed, "is_sync", False):
+    return
+  username = refreshed.username
+  entry = user_to_etcd_entry(refreshed)
+
+  def mutator(data: dict) -> dict:
+    if _prefer_user_entry(data.get(username), entry):
+      data[username] = entry
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_USERS, mutator, client=client)
+
+
+async def publish_local_users(client=None) -> None:
+  from src.core import etcd_op
+  from src.modules.auth import crud as user_crud
+
+  users = await user_crud.list_local_users()
+  entries = {
+    user.username: user_to_etcd_entry(user)
+    for user in users
+  }
+
+  def mutator(data: dict) -> dict:
+    for username, entry in entries.items():
+      if _prefer_user_entry(data.get(username), entry):
+        data[username] = entry
+    return data
+
+  await etcd_op.merge_update_etcd_key(ETCD_KEY_USERS, mutator, client=client)
 
 
 def application_to_etcd_entry(app) -> dict:
@@ -328,6 +568,290 @@ async def sync_servers_to_mongo(servers_data: dict) -> list[str]:
   return new_servers
 
 
+def _topology_entry_timestamp() -> str:
+  return utc_now().isoformat()
+
+
+def _topology_layout_initialized(layout: dict) -> bool:
+  meta = layout.get("_meta") if isinstance(layout, dict) else None
+  return bool(
+    isinstance(meta, dict)
+    and meta.get("initialized") is True
+    and meta.get("schema_version") == TOPOLOGY_LAYOUT_SCHEMA_VERSION
+    and meta.get("authority_region") == settings.SYNC_AUTHORITY_REGION
+  )
+
+
+async def build_topology_layout_snapshot() -> dict:
+  """Build UI layout metadata only; MinIO replication rules are not copied."""
+  from src.modules.graph.model import BucketEdgePosition, BucketNodePosition
+
+  now = _topology_entry_timestamp()
+  nodes: dict[str, dict[str, dict]] = {}
+  for item in await BucketNodePosition.find_all().to_list():
+    nodes.setdefault(item.bucket, {})[item.server] = {
+      "position_x": int(item.position_x),
+      "position_y": int(item.position_y),
+      "updated_at": now,
+      "origin_region": settings.REGION,
+    }
+
+  edges: dict[str, dict[str, dict[str, dict]]] = {}
+  for item in await BucketEdgePosition.find_all().to_list():
+    edges.setdefault(item.bucket, {}).setdefault(item.from_server, {})[
+      item.to_server
+    ] = {
+      "from_position": item.from_position,
+      "to_position": item.to_position,
+      "updated_at": now,
+      "origin_region": settings.REGION,
+    }
+
+  return {
+    "_meta": {
+      "initialized": True,
+      "schema_version": TOPOLOGY_LAYOUT_SCHEMA_VERSION,
+      "authority_region": settings.SYNC_AUTHORITY_REGION,
+      "initialized_at": now,
+    },
+    "nodes": nodes,
+    "edges": edges,
+  }
+
+
+async def bootstrap_topology_layout(client=None) -> bool:
+  """Initialize topology layout exactly once, and only from the authority region."""
+  if settings.REGION != settings.SYNC_AUTHORITY_REGION:
+    return False
+
+  from src.core import etcd_op
+
+  current = await etcd_op.pull_from_etcd_by_key(
+    ETCD_KEY_TOPOLOGY_LAYOUT,
+    client=client,
+  )
+  if _topology_layout_initialized(current):
+    return False
+  snapshot = await build_topology_layout_snapshot()
+
+  def mutator(data: dict) -> dict:
+    if _topology_layout_initialized(data):
+      return data
+    return snapshot
+
+  await etcd_op.merge_update_etcd_key(
+    ETCD_KEY_TOPOLOGY_LAYOUT,
+    mutator,
+    client=client,
+  )
+  logger.info(
+    f"Etcd sync: 已由 {settings.REGION} 初始化拓扑布局权威快照"
+  )
+  return True
+
+
+def _validated_topology_records(
+  layout: dict,
+) -> tuple[dict[tuple[str, str], dict], dict[tuple[str, str, str], dict]]:
+  if not _topology_layout_initialized(layout):
+    raise ValueError("拓扑布局尚未由权威区域初始化")
+  nodes_data = layout.get("nodes")
+  edges_data = layout.get("edges")
+  if not isinstance(nodes_data, dict) or not isinstance(edges_data, dict):
+    raise ValueError("拓扑布局 nodes/edges 格式错误")
+
+  nodes: dict[tuple[str, str], dict] = {}
+  for bucket, server_map in nodes_data.items():
+    if not isinstance(bucket, str) or not isinstance(server_map, dict):
+      raise ValueError("拓扑节点层级格式错误")
+    for server, entry in server_map.items():
+      if not isinstance(server, str) or not isinstance(entry, dict):
+        raise ValueError("拓扑节点条目格式错误")
+      position_x = entry.get("position_x")
+      position_y = entry.get("position_y")
+      if isinstance(position_x, bool) or not isinstance(position_x, int):
+        raise ValueError("拓扑节点 position_x 格式错误")
+      if isinstance(position_y, bool) or not isinstance(position_y, int):
+        raise ValueError("拓扑节点 position_y 格式错误")
+      nodes[(bucket, server)] = {
+        "position_x": position_x,
+        "position_y": position_y,
+      }
+
+  valid_positions = {"up", "down", "left", "right"}
+  edges: dict[tuple[str, str, str], dict] = {}
+  for bucket, from_map in edges_data.items():
+    if not isinstance(bucket, str) or not isinstance(from_map, dict):
+      raise ValueError("拓扑连线层级格式错误")
+    for from_server, to_map in from_map.items():
+      if not isinstance(from_server, str) or not isinstance(to_map, dict):
+        raise ValueError("拓扑连线源节点格式错误")
+      for to_server, entry in to_map.items():
+        if not isinstance(to_server, str) or not isinstance(entry, dict):
+          raise ValueError("拓扑连线条目格式错误")
+        from_position = entry.get("from_position")
+        to_position = entry.get("to_position")
+        if from_position not in valid_positions or to_position not in valid_positions:
+          raise ValueError("拓扑连线端点格式错误")
+        edges[(bucket, from_server, to_server)] = {
+          "from_position": from_position,
+          "to_position": to_position,
+        }
+  return nodes, edges
+
+
+async def sync_topology_layout_to_mongo(layout: dict) -> None:
+  """Converge Mongo UI layout to Etcd without touching MinIO replication rules."""
+  from src.modules.graph import crud as graph_crud
+  from src.modules.graph.model import BucketEdgePosition, BucketNodePosition
+
+  desired_nodes, desired_edges = _validated_topology_records(layout)
+  for (bucket, server), entry in desired_nodes.items():
+    await graph_crud.update_bucket_node_position(
+      bucket,
+      server,
+      entry["position_x"],
+      entry["position_y"],
+    )
+  for item in await BucketNodePosition.find_all().to_list():
+    if (item.bucket, item.server) not in desired_nodes:
+      await item.delete()
+
+  for (bucket, from_server, to_server), entry in desired_edges.items():
+    await graph_crud.update_bucket_edge_position(
+      bucket,
+      from_server,
+      to_server,
+      entry["from_position"],
+      entry["to_position"],
+    )
+  for item in await BucketEdgePosition.find_all().to_list():
+    if (item.bucket, item.from_server, item.to_server) not in desired_edges:
+      await item.delete()
+
+
+def _require_topology_layout(layout: dict) -> None:
+  if not _topology_layout_initialized(layout):
+    raise RuntimeError(
+      f"拓扑布局尚未由权威区域 {settings.SYNC_AUTHORITY_REGION} 初始化"
+    )
+
+
+async def publish_topology_node_position(
+  bucket: str,
+  server: str,
+  position_x: int,
+  position_y: int,
+  client=None,
+) -> None:
+  from src.core import etcd_op
+
+  entry = {
+    "position_x": int(position_x),
+    "position_y": int(position_y),
+    "updated_at": _topology_entry_timestamp(),
+    "origin_region": settings.REGION,
+  }
+
+  def mutator(layout: dict) -> dict:
+    _require_topology_layout(layout)
+    layout.setdefault("nodes", {}).setdefault(bucket, {})[server] = entry
+    return layout
+
+  await etcd_op.merge_update_etcd_key(
+    ETCD_KEY_TOPOLOGY_LAYOUT,
+    mutator,
+    client=client,
+  )
+
+
+async def publish_topology_edge_position(
+  bucket: str,
+  from_server: str,
+  to_server: str,
+  from_position: str,
+  to_position: str,
+  client=None,
+) -> None:
+  from src.core import etcd_op
+
+  entry = {
+    "from_position": from_position,
+    "to_position": to_position,
+    "updated_at": _topology_entry_timestamp(),
+    "origin_region": settings.REGION,
+  }
+
+  def mutator(layout: dict) -> dict:
+    _require_topology_layout(layout)
+    layout.setdefault("edges", {}).setdefault(bucket, {}).setdefault(
+      from_server,
+      {},
+    )[to_server] = entry
+    return layout
+
+  await etcd_op.merge_update_etcd_key(
+    ETCD_KEY_TOPOLOGY_LAYOUT,
+    mutator,
+    client=client,
+  )
+
+
+async def unpublish_topology_edge_position(
+  bucket: str,
+  from_server: str,
+  to_server: str,
+  client=None,
+) -> None:
+  from src.core import etcd_op
+
+  def mutator(layout: dict) -> dict:
+    _require_topology_layout(layout)
+    bucket_edges = layout.setdefault("edges", {}).get(bucket, {})
+    targets = bucket_edges.get(from_server, {})
+    targets.pop(to_server, None)
+    if not targets:
+      bucket_edges.pop(from_server, None)
+    if not bucket_edges:
+      layout["edges"].pop(bucket, None)
+    return layout
+
+  await etcd_op.merge_update_etcd_key(
+    ETCD_KEY_TOPOLOGY_LAYOUT,
+    mutator,
+    client=client,
+  )
+
+
+async def unpublish_topology_server(server: str, client=None) -> None:
+  """Remove layout metadata for an offline server, not MinIO data or rules."""
+  from src.core import etcd_op
+
+  def mutator(layout: dict) -> dict:
+    _require_topology_layout(layout)
+    nodes = layout.setdefault("nodes", {})
+    for bucket in list(nodes):
+      nodes[bucket].pop(server, None)
+      if not nodes[bucket]:
+        nodes.pop(bucket, None)
+    edges = layout.setdefault("edges", {})
+    for bucket in list(edges):
+      edges[bucket].pop(server, None)
+      for from_server in list(edges[bucket]):
+        edges[bucket][from_server].pop(server, None)
+        if not edges[bucket][from_server]:
+          edges[bucket].pop(from_server, None)
+      if not edges[bucket]:
+        edges.pop(bucket, None)
+    return layout
+
+  await etcd_op.merge_update_etcd_key(
+    ETCD_KEY_TOPOLOGY_LAYOUT,
+    mutator,
+    client=client,
+  )
+
+
 async def unpublish_region(region_name: str) -> None:
   """从 Etcd region map 移除区域（跨节点下线）。"""
   from src.core import etcd_op
@@ -563,6 +1087,14 @@ async def pull_all_and_sync(client=None):
   if own_client:
     client = await etcd_op.get_etcd_client()
   try:
+    roles_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_ROLES, client=client)
+    if roles_data:
+      await sync_roles_to_mongo(roles_data)
+
+    users_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_USERS, client=client)
+    if users_data:
+      await sync_users_to_mongo(users_data)
+
     region_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_REGION, client=client)
     if region_data:
       await sync_region_to_mongo(region_data)
@@ -571,6 +1103,13 @@ async def pull_all_and_sync(client=None):
     if servers_data:
       await sync_servers_to_mongo(servers_data)
       await setup_mc_aliases(servers_data)
+
+    topology_layout = await etcd_op.pull_from_etcd_by_key(
+      ETCD_KEY_TOPOLOGY_LAYOUT,
+      client=client,
+    )
+    if topology_layout:
+      await sync_topology_layout_to_mongo(topology_layout)
 
     apps_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_APPLICATIONS, client=client)
     if apps_data:

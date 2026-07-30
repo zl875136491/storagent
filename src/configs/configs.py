@@ -77,6 +77,12 @@ class Settings(BaseSettings):
   ETCD_USERNAME: str = "admin"
   ETCD_PASSWORD: str = "passwd"
 
+  # Control-plane synchronization
+  # The authority is used only for the first topology-layout snapshot. After
+  # initialization, every region may update the shared layout through Etcd CAS.
+  SYNC_AUTHORITY_REGION: str = "beijing"
+  SYNC_RECONCILE_INTERVAL_SECONDS: float = 30.0
+
   LOG_PATH: str = "logs/"
   LOG_STD_LEVEL: str = "INFO"
   LOG_STORAGE_LEVEL: str = "INFO"

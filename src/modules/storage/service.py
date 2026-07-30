@@ -10,6 +10,7 @@ from src.modules.storage import crud as storage_crud
 from src.modules.storage import schema as storage_schema
 from src.modules.storage.model import MinioServer
 from src.modules.graph import crud as graph_crud
+from src.modules.graph import service as graph_service
 from src.core.minio_op import (
   test_minio_server,
   set_site_alias,
@@ -305,7 +306,7 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
     migrated = _percent_nodes_to_pixels(nodes)
     for server, pos in migrated.items():
       try:
-        await graph_crud.update_bucket_node_position(
+        await graph_service.set_bucket_node_position(
           bucket_name,
           server,
           pos["position_x"],
@@ -417,7 +418,7 @@ async def create_bucket_replicate(bucket_name: str, payload) -> dict:
   from_position = _SIDE_TO_POSITION[payload.from_side]
   to_position = _SIDE_TO_POSITION[payload.to_side]
   try:
-    await graph_crud.update_bucket_edge_position(
+    await graph_service.set_bucket_edge_position(
       bucket,
       from_server,
       to_server,
@@ -517,7 +518,7 @@ async def delete_bucket_replicate(
     raise CustomException(ErrorDesc.MINIO_REPLICATE_FAILED, detail)
 
   try:
-    await graph_crud.delete_bucket_edge_position(bucket, from_server, to_server)
+    await graph_service.delete_bucket_edge_position(bucket, from_server, to_server)
   except Exception as e:
     audit.audit(
       "bucket_replicate.edge_position_delete",

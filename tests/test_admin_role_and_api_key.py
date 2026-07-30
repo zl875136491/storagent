@@ -37,11 +37,15 @@ async def test_update_user_role_promotes_to_admin(monkeypatch):
     user.roles = [role]
     return user
 
+  async def publish_user(_user):
+    return None
+
   monkeypatch.setattr(auth_service.user_crud, "read_user_by_id", read_user_by_id)
   monkeypatch.setattr(auth_service.user_crud, "get_admin_role", get_admin_role)
   monkeypatch.setattr(auth_service.user_crud, "get_basic_role", get_basic_role)
   monkeypatch.setattr(auth_service.user_crud, "count_admin_users", count_admin_users)
   monkeypatch.setattr(auth_service.user_crud, "update_user_role", update_user_role)
+  monkeypatch.setattr("src.core.sync.publish_user", publish_user)
   monkeypatch.setattr(
     auth_service,
     "convert_utc_to_local_str",

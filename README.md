@@ -197,26 +197,36 @@ storagent/
 
 | Etcd Key | 同步内容 | 触发时机 |
 |----------|---------|---------|
+| `roles` | 角色定义（按角色名关联） | 启动合并 / 周期校准 / Watch |
+| `users` | 可登录用户、加密密码哈希和角色（按用户名关联） | 首次登录 / 角色变更 / 周期校准 / Watch |
 | `region` | 区域名称映射 | 启动 init / 创建 Region / Watch |
 | `servers` | MinIO 节点配置 | 启动 init / 创建或更新 Server / Watch |
+| `topology_layout` | Bucket 拓扑节点坐标和连线端点 | 北京首次引导 / 拓扑编辑 / Watch |
 | `applications` | 应用元数据（含 enabled 状态） | 创建/授权应用 / Watch |
 | `api_keys` | API 密钥（含吊销状态） | 创建/吊销 Key / Watch |
+| `revoked_tokens` | JWT 吊销哈希 | 登出 / Watch |
 | `ai_config` | AI 提供商配置（API Key 加密） | 管理员更新配置 / Watch |
 
 ### 同步链路
 
-1. **拓扑同步**：各节点启动时将 Region/Server 注册到 Etcd，Watch 自动同步到其他节点 MongoDB，并更新 mc alias
-2. **Site Replication**：Watch 发现新 Server 时自动尝试加入 MinIO Site Replication
-3. **应用同步**：应用授权（enabled）后发布到 Etcd，远端节点自动建桶、开版本控制、配置 Bucket Replication
-4. **API Key 同步**：任一节点创建的 Key 通过 Etcd 广播，所有节点均可鉴权
-5. **客户端发现**：`GET /api/public/endpoints` 返回各 Region 的 API 地址和 MinIO 地址
+1. **身份同步**：角色按名称、用户按用户名合并；密码哈希加密后写入 Etcd，远端使用本地 ObjectId 重建关联
+2. **节点清单**：各节点启动时将 Region/Server 注册到 Etcd，Watch 同步到其他节点 MongoDB，并更新 mc alias
+3. **布局同步**：`topology_layout` 首次仅由 `SYNC_AUTHORITY_REGION`（默认北京）写入完整快照；之后任一区域的布局编辑均通过 Etcd CAS 合并
+4. **数据面隔离**：MinIO Bucket Replication 规则始终从 MinIO 实时读取；Mongo/Etcd 只同步图形布局，不会因布局同步创建或删除复制规则
+5. **应用与密钥**：应用、API Key、吊销 token 和 AI 配置通过 Etcd 广播，所有节点均可使用
+6. **漏事件修复**：Watch 提供实时同步，后台按 `SYNC_RECONCILE_INTERVAL_SECONDS`（默认 30 秒）执行全量校准
+
+Mongo `_id`、审计事件、API Key 使用统计、Shell 命令日志及本节点 `master`
+标记属于本地数据，不要求字节级一致。全局数据使用用户名、角色名、Region 名、
+应用名以及 Bucket/Server/Edge 组合键判断一致性。
 
 ### 部署要求
 
 1. 各节点设置不同的 `REGION` 值
 2. 共享同一个 Etcd 集群
 3. `SECRET_KEY` 和 `BCRYPT_SALT` 全局一致（JWT 互认）
-4. 各节点 MinIO 通过 Site Replication 互联
+4. 所有节点设置相同的 `SYNC_AUTHORITY_REGION`；首次上线需保证该区域 Mongo 拓扑布局正确
+5. MinIO 统一使用 Bucket Replication；不要同时启用 Site Replication
 
 故障处理、备份恢复与限流说明见 [docs/RUNBOOK.md](docs/RUNBOOK.md)。
 

@@ -1,5 +1,6 @@
 import aetcd
 import asyncio
+import time
 from copy import deepcopy
 from typing import Callable
 from loguru import logger
@@ -40,7 +41,11 @@ async def _handle_etcd_put(key: str, value: str):
     logger.warning(f"Etcd 事件值解析失败: key={key}")
     return
 
-  if short_key == sync_module.ETCD_KEY_REGION:
+  if short_key == sync_module.ETCD_KEY_ROLES:
+    await sync_module.sync_roles_to_mongo(data)
+  elif short_key == sync_module.ETCD_KEY_USERS:
+    await sync_module.sync_users_to_mongo(data)
+  elif short_key == sync_module.ETCD_KEY_REGION:
     await sync_module.sync_region_to_mongo(data)
   elif short_key == sync_module.ETCD_KEY_SERVERS:
     await sync_module.sync_servers_to_mongo(data)
@@ -56,6 +61,8 @@ async def _handle_etcd_put(key: str, value: str):
     await sync_module.sync_revoked_tokens_to_mongo(data)
   elif short_key == sync_module.ETCD_KEY_AI_CONFIG:
     await sync_module.sync_ai_config_to_mongo(data)
+  elif short_key == sync_module.ETCD_KEY_TOPOLOGY_LAYOUT:
+    await sync_module.sync_topology_layout_to_mongo(data)
 
 
 async def _handle_etcd_delete(key: str):
@@ -68,7 +75,13 @@ async def _handle_etcd_delete(key: str):
     await sync_module.sync_region_to_mongo({})
   elif short_key == sync_module.ETCD_KEY_SERVERS:
     await sync_module.sync_servers_to_mongo({})
-  elif short_key in (sync_module.ETCD_KEY_APPLICATIONS, sync_module.ETCD_KEY_API_KEYS):
+  elif short_key in (
+    sync_module.ETCD_KEY_ROLES,
+    sync_module.ETCD_KEY_USERS,
+    sync_module.ETCD_KEY_APPLICATIONS,
+    sync_module.ETCD_KEY_API_KEYS,
+    sync_module.ETCD_KEY_TOPOLOGY_LAYOUT,
+  ):
     logger.warning(f"跳过对 {short_key} 的批量清空，等待显式 PUT 收敛")
   else:
     logger.info(f"未处理的 Etcd DELETE: {short_key}")
@@ -82,7 +95,10 @@ async def watch_etcd_task(client: aetcd.Client):
   while True:
     try:
       encoded_prefix = ETCD_PREFIX.encode()
-      logger.info("Etcd watch 已启动（region / servers / applications / api_keys / ai_config）")
+      logger.info(
+        "Etcd watch 已启动（roles / users / region / servers / applications / "
+        "api_keys / ai_config / topology_layout）"
+      )
       async for event in await client.watch_prefix(encoded_prefix):
         backoff = 1.0
         key = event.kv.key.decode("utf-8")
@@ -113,6 +129,37 @@ async def watch_etcd_task(client: aetcd.Client):
         client = await get_etcd_client()
       except Exception as ce:
         logger.warning(f"Etcd 客户端重建失败: {ce}")
+
+
+async def reconcile_etcd_task():
+  """Periodically heal Mongo state if a Watch event was missed or failed."""
+  interval = max(float(settings.SYNC_RECONCILE_INTERVAL_SECONDS), 5.0)
+  while True:
+    client = None
+    try:
+      client = await get_etcd_client()
+      await sync_module.publish_roles(client=client)
+      await sync_module.publish_local_users(client=client)
+      await sync_module.bootstrap_topology_layout(client=client)
+      await sync_module.pull_all_and_sync(client=client)
+      from src.core import metrics as metrics_mod
+      metrics_mod.incr("sync_reconcile_runs_total")
+      metrics_mod.set_gauge("sync_last_success_timestamp_seconds", time.time())
+    except asyncio.CancelledError:
+      logger.info("Etcd 周期全量校准已停止")
+      raise
+    except Exception as e:
+      from src.core import metrics as metrics_mod
+      metrics_mod.incr("sync_reconcile_failures_total")
+      metrics_mod.set_gauge("sync_last_failure_timestamp_seconds", time.time())
+      logger.warning(f"Etcd 周期全量校准失败: {e}")
+    finally:
+      if client is not None:
+        try:
+          await client.close()
+        except Exception:
+          pass
+    await asyncio.sleep(interval)
 
 
 async def get_etcd(request: Request) -> aetcd.Client:

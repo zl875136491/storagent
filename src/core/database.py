@@ -93,6 +93,11 @@ async def init_db():
     database=database,
     document_models=document_models
   )
+  edge_collection = database[BucketEdgePosition.Settings.name]
+  for index_name, spec in (await edge_collection.index_information()).items():
+    if spec.get("key") == [("from_server", 1), ("to_server", 1)]:
+      await edge_collection.drop_index(index_name)
+      logger.info("已移除 BucketEdgePosition 遗留跨桶唯一索引。")
   logger.info(f"MongoDB '{settings.MONGO_DB_NAME}' 连接和 Beanie 初始化完成。")
 
 async def close_db():

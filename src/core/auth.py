@@ -132,6 +132,7 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
     User: 如果验证成功返回用户对象，否则返回 None
   """
   user = await user_crud.read_user_by_username(username)
+  user_changed = False
   if not user or getattr(user, "is_sync", False):
     user_info = await import_user_from_springboard(username)
     if user_info is None:
@@ -153,6 +154,7 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
       user.is_sync = False
       user.updated_at = utc_now()
       await user.save()
+      user_changed = True
     else:
       user = await user_crud.create_user(
         username=username,
@@ -160,8 +162,18 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
         hashed_password=hashed_password,
         roles=roles
       )
+      user_changed = True
   if not verify_password(password, user.hashed_password):
     raise CustomException(ErrorDesc.LOGIN_ERR, "密码错误")
+  if user_changed:
+    try:
+      from src.core import sync as sync_module
+      await sync_module.publish_user(user)
+    except Exception as e:
+      from src.core import metrics as metrics_mod
+      from src.utils.logger import logger
+      metrics_mod.incr("sync_failures_total")
+      logger.warning(f"User {username} 同步到 Etcd 失败，将由周期校准重试: {e}")
   return user
 
 def preset_admin_user(username):
