@@ -430,12 +430,14 @@ async def upsert_api_key_from_etcd(key: str, data: dict):
   if not app_name or not key:
     return None
 
-  app_obj, _ = await upsert_application_from_etcd(app_name, {
-    "shown_name": app_name,
-    "description": "",
-    "enabled": True,
-    "author_username": data.get("author_username", SYNC_USER_PLACEHOLDER),
-  })
+  app_obj = await public_crud.read_application_by_name(app_name)
+  if not app_obj:
+    app_obj, _ = await upsert_application_from_etcd(app_name, {
+      "shown_name": app_name,
+      "description": "",
+      "enabled": True,
+      "author_username": data.get("author_username", SYNC_USER_PLACEHOLDER),
+    })
   if not app_obj.enabled:
     app_obj.enabled = True
     app_obj.enabled_at = utc_now()

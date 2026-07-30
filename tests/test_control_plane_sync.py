@@ -8,6 +8,7 @@ import pytest
 from src.core import etcd_op
 from src.core import sync as sync_module
 from src.modules.graph import service as graph_service
+from src.modules.public import crud as public_crud
 
 
 def _user_entry(updated_at: str, origin: str) -> dict:
@@ -190,3 +191,49 @@ async def test_graph_write_publishes_before_local_save(monkeypatch):
   )
   assert result == "saved"
   assert [item[0] for item in calls] == ["publish", "save"]
+
+
+@pytest.mark.asyncio
+async def test_api_key_sync_preserves_existing_application_metadata(monkeypatch):
+  app = SimpleNamespace(
+    name="system-test",
+    shown_name="测试系统调用",
+    description="Storagent 测试使用的数据",
+    enabled=True,
+  )
+  existing_key = SimpleNamespace(deleted=False)
+
+  async def read_application(name):
+    assert name == "system-test"
+    return app
+
+  async def read_api_key(key):
+    assert key == "sk_test"
+    return existing_key
+
+  async def must_not_overwrite(*_args, **_kwargs):
+    pytest.fail("API Key sync must not overwrite an existing application")
+
+  monkeypatch.setattr(public_crud, "read_application_by_name", read_application)
+  monkeypatch.setattr(
+    public_crud,
+    "read_api_key_by_key_including_deleted",
+    read_api_key,
+  )
+  monkeypatch.setattr(
+    sync_module,
+    "upsert_application_from_etcd",
+    must_not_overwrite,
+  )
+
+  result = await sync_module.upsert_api_key_from_etcd(
+    "sk_test",
+    {
+      "app_name": "system-test",
+      "expired_at": "2026-08-01T00:00:00+00:00",
+    },
+  )
+
+  assert result is existing_key
+  assert app.shown_name == "测试系统调用"
+  assert app.description == "Storagent 测试使用的数据"
