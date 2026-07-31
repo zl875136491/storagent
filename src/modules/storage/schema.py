@@ -61,11 +61,14 @@ class BucketsResponse(BaseModel):
   data: List[BucketListItem] = Field(..., description="存储桶列表")
   
 class BucketReplicateResponse(BaseModel):
-  servers: List[str] = Field(..., description="服务器列表")
+  servers: List[str] | dict = Field(..., description="服务器列表或拓扑坐标")
+  server_ids: List[str] = Field(default_factory=list, description="全部服务器 ID")
   replicates: List[dict] = Field(..., description="复制信息")
+  policy: dict = Field(default_factory=dict, description="全连接复制策略摘要")
 
 class BucketReplicateRuleStatus(BaseModel):
   status: str = Field(default="pending", max_length=32, description="复制规则状态")
+  rule_status: str = Field(default="Enabled", max_length=32, description="MinIO 规则启停状态")
   priority: int = Field(default=0, ge=0, le=2_147_483_647, description="规则优先级")
   delete_marker_replication: Literal["Enabled", "Disabled"] = "Enabled"
   existing_object_replication: Literal["Enabled", "Disabled"] = "Enabled"

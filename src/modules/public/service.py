@@ -189,7 +189,7 @@ async def enable_application(
   application_id: ObjectId,
   current_user: User) -> AsyncGenerator[bytes, None]:
   """
-  启用应用（SSE 流式进度：按 MinIO 服务器逐步处理桶，最终成功或失败并结束连接）
+  启用应用：只有全连接复制策略严格验收通过后才开放应用。
   """
 
   async def _emit(payload: dict) -> AsyncGenerator[bytes, None]:
@@ -202,14 +202,32 @@ async def enable_application(
     )
     yield _sse_line(payload)
 
+  async def _save_state(
+    application: Application,
+    status: str,
+    *,
+    error: str = "",
+    enabled: bool | None = None,
+  ) -> None:
+    now = utc_now()
+    application.provisioning_status = status
+    application.provisioning_error = error
+    application.provisioning_updated_at = now
+    application.updated_at = now
+    if enabled is not None:
+      application.enabled = enabled
+      if not enabled:
+        application.enabled_at = None
+    await application.save()
+    await sync_module.publish_application(application)
+
   application_obj = await public_crud.read_application_by_id(application_id)
   if not application_obj:
-    msg = "应用不存在，无法授权"
     async for chunk in _emit({
       "step": "validate",
       "server_name": None,
       "status": "failed",
-      "message": msg,
+      "message": "应用不存在，无法授权",
     }):
       yield chunk
     async for chunk in _emit({
@@ -221,12 +239,11 @@ async def enable_application(
       yield chunk
     return
   if application_obj.enabled:
-    msg = "应用已启用，无需重复授权"
     async for chunk in _emit({
       "step": "validate",
       "server_name": None,
       "status": "failed",
-      "message": msg,
+      "message": "应用已启用，无需重复授权",
     }):
       yield chunk
     async for chunk in _emit({
@@ -242,194 +259,187 @@ async def enable_application(
     "step": "start",
     "server_name": None,
     "status": "running",
-    "message": "开始授权流程",
+    "message": "开始授权并初始化全连接复制策略",
   }):
     yield chunk
 
-  application_obj.enabled = True
-  application_obj.enabled_at = utc_now()
-  application_obj.approver = current_user
+  failure_step = "validate"
+  try:
+    async with sync_module.application_replication_lock(application_obj.name):
+      application_obj = await public_crud.read_application_by_id(application_id)
+      if not application_obj:
+        raise RuntimeError("应用在授权期间被删除")
+      if application_obj.enabled:
+        async for chunk in _emit({
+          "step": "done",
+          "server_name": None,
+          "status": "success",
+          "message": "应用已由其他节点完成授权",
+        }):
+          yield chunk
+        return
 
-  server_names = await storage_crud.read_minio_server_names()
-  async for chunk in _emit({
-    "step": "bucket_phase",
-    "server_name": None,
-    "status": "running",
-    "message": f"共 {len(server_names)} 台 MinIO 服务器待处理桶: {application_obj.name}",
-  }):
-    yield chunk
+      application_obj.approver = current_user
+      failure_step = "persist"
+      await _save_state(
+        application_obj,
+        "provisioning",
+        enabled=False,
+      )
 
-  # 逐个创建桶
-  errors: dict[str, str] = {}
-  for server_name in server_names:
-    async for chunk in _emit({
-      "step": "bucket_check",
-      "server_name": server_name,
-      "status": "running",
-      "message": f"检查服务器 {server_name} 上桶是否存在",
-    }):
-      yield chunk
-    existed = await minio_op.check_server_bucket_existed(server_name, application_obj.name)
-    if existed:
+      server_names = sorted(set(await storage_crud.read_minio_server_names()))
+      if len(server_names) < 2:
+        raise RuntimeError("至少需要两个 MinIO 站点才能初始化全连接复制策略")
       async for chunk in _emit({
-        "step": "bucket_check",
-        "server_name": server_name,
-        "status": "skipped",
-        "message": f"服务器 {server_name} 上桶已存在，跳过创建",
+        "step": "bucket_phase",
+        "server_name": None,
+        "status": "running",
+        "message": f"检查 {len(server_names)} 个站点的存储桶 {application_obj.name}",
       }):
         yield chunk
-      continue
-    async for chunk in _emit({
-      "step": "bucket_create",
-      "server_name": server_name,
-      "status": "running",
-      "message": f"在服务器 {server_name} 上创建桶",
-    }):
-      yield chunk
-    success, err = await minio_op.create_bucket(server_name, application_obj.name)
-    if not success:
-      errors[server_name] = err
+
+      failure_step = "bucket_create"
+      create_errors: dict[str, str] = {}
+      for server_name in server_names:
+        async for chunk in _emit({
+          "step": "bucket_check",
+          "server_name": server_name,
+          "status": "running",
+          "message": f"检查站点 {server_name} 的存储桶",
+        }):
+          yield chunk
+        existed = await minio_op.check_server_bucket_existed(
+          server_name,
+          application_obj.name,
+        )
+        if existed:
+          async for chunk in _emit({
+            "step": "bucket_check",
+            "server_name": server_name,
+            "status": "skipped",
+            "message": f"站点 {server_name} 的存储桶已存在",
+          }):
+            yield chunk
+          continue
+        success, err = await minio_op.create_bucket(server_name, application_obj.name)
+        if not success:
+          create_errors[server_name] = str(err)
+          async for chunk in _emit({
+            "step": "bucket_create",
+            "server_name": server_name,
+            "status": "failed",
+            "message": f"站点 {server_name} 创建存储桶失败: {err}",
+          }):
+            yield chunk
+        else:
+          async for chunk in _emit({
+            "step": "bucket_create",
+            "server_name": server_name,
+            "status": "ok",
+            "message": f"站点 {server_name} 创建存储桶成功",
+          }):
+            yield chunk
+      if create_errors:
+        raise RuntimeError(f"部分站点创建存储桶失败: {create_errors}")
+
+      failure_step = "bucket_versioning"
+      for server_name in server_names:
+        async for chunk in _emit({
+          "step": "bucket_versioning",
+          "server_name": server_name,
+          "status": "running",
+          "message": f"启用站点 {server_name} 的存储桶版本控制",
+        }):
+          yield chunk
+        success, err = await minio_op.enable_bucket_versioning(
+          server_name,
+          application_obj.name,
+        )
+        if not success:
+          raise RuntimeError(f"站点 {server_name} 开启版本控制失败: {err}")
+        async for chunk in _emit({
+          "step": "bucket_versioning",
+          "server_name": server_name,
+          "status": "ok",
+          "message": f"站点 {server_name} 已启用版本控制",
+        }):
+          yield chunk
+
+      failure_step = "replicate"
       async for chunk in _emit({
-        "step": "bucket_create",
-        "server_name": server_name,
-        "status": "failed",
-        "message": f"服务器 {server_name} 创建桶失败: {err}",
+        "step": "replicate",
+        "server_name": None,
+        "status": "running",
+        "message": f"补齐并验收 {len(server_names) * (len(server_names) - 1)} 条有向复制规则",
       }):
         yield chunk
-    else:
+      policy = await sync_module.setup_bucket_replication(
+        application_obj.name,
+        server_names,
+      )
       async for chunk in _emit({
-        "step": "bucket_create",
-        "server_name": server_name,
+        "step": "replicate",
+        "server_name": None,
         "status": "ok",
-        "message": f"服务器 {server_name} 创建桶成功",
+        "message": "全连接复制策略验收通过",
+        "detail": policy,
       }):
         yield chunk
 
-  # 如果部分服务器创建桶失败，则终止授权
-  if errors:
+      failure_step = "persist"
+      await storage_crud.bulk_create_minio_bucket(application_obj)
+      application_obj.enabled_at = utc_now()
+      await _save_state(application_obj, "ready", enabled=True)
+      async for chunk in _emit({
+        "step": "persist",
+        "server_name": None,
+        "status": "ok",
+        "message": "应用已启用并同步到所有节点",
+      }):
+        yield chunk
+
+  except sync_module.ReplicationLockBusyError as e:
     async for chunk in _emit({
-      "step": "bucket_create",
+      "step": "validate",
       "server_name": None,
       "status": "failed",
-      "message": "部分服务器创建桶失败，终止授权",
-      "detail": errors,
+      "message": str(e),
     }):
       yield chunk
     async for chunk in _emit({
       "step": "done",
       "server_name": None,
       "status": "failed",
-      "message": "授权失败",
+      "message": "授权任务已在其他节点执行",
     }):
       yield chunk
     return
-
-  # 逐个开启桶版本控制
-  for server_name in server_names:
+  except Exception as e:
+    logger.warning(f"应用授权失败 {application_obj.name}: {e}")
+    try:
+      await _save_state(
+        application_obj,
+        "failed",
+        error=str(e),
+        enabled=False,
+      )
+    except Exception as state_error:
+      logger.warning(f"应用授权失败状态同步异常 {application_obj.name}: {state_error}")
     async for chunk in _emit({
-      "step": "bucket_versioning",
-      "server_name": server_name,
-      "status": "running",
-      "message": f"在服务器 {server_name} 上开启桶版本控制",
+      "step": failure_step,
+      "server_name": None,
+      "status": "failed",
+      "message": str(e),
     }):
       yield chunk
-    success, err = await minio_op.enable_bucket_versioning(server_name, application_obj.name)
-    if not success:
-      async for chunk in _emit({
-        "step": "bucket_versioning",
-        "server_name": server_name,
-        "status": "failed",
-        "message": f"服务器 {server_name} 开启版本控制失败: {err}",
-      }):
-        yield chunk
-      async for chunk in _emit({
-        "step": "done",
-        "server_name": None,
-        "status": "failed",
-        "message": "授权失败",
-      }):
-        yield chunk
-      return
     async for chunk in _emit({
-      "step": "bucket_versioning",
-      "server_name": server_name,
-      "status": "ok",
-      "message": f"服务器 {server_name} 开启版本控制成功",
+      "step": "done",
+      "server_name": None,
+      "status": "failed",
+      "message": "授权失败，可修复后直接重试",
     }):
       yield chunk
-      
-  # 更改应用启用状态
-  async for chunk in _emit({
-    "step": "persist",
-    "server_name": None,
-    "status": "running",
-    "message": "保存应用启用状态",
-  }):
-    yield chunk
-  await application_obj.save()
-  async for chunk in _emit({
-    "step": "persist",
-    "server_name": None,
-    "status": "ok",
-    "message": "应用状态已保存",
-  }):
-    yield chunk
-
-  # 跨节点同步：发布 Application 到 Etcd
-  async for chunk in _emit({
-    "step": "sync",
-    "server_name": None,
-    "status": "running",
-    "message": "同步应用信息到其他节点",
-  }):
-    yield chunk
-  try:
-    await sync_module.publish_application(application_obj)
-    sync_msg = "应用信息已同步到其他节点"
-    sync_status = "ok"
-  except Exception as e:
-    sync_msg = f"应用信息同步失败: {e}"
-    sync_status = "failed"
-    logger.warning(sync_msg)
-    from src.core import metrics as metrics_mod
-    metrics_mod.incr("sync_failures_total")
-  async for chunk in _emit({
-    "step": "sync",
-    "server_name": None,
-    "status": sync_status,
-    "message": sync_msg,
-  }):
-    yield chunk
-
-  # 配置 bucket 级复制规则
-  async for chunk in _emit({
-    "step": "replicate",
-    "server_name": None,
-    "status": "running",
-    "message": "配置存储桶跨节点复制规则",
-  }):
-    yield chunk
-  try:
-    await sync_module.setup_bucket_replication(application_obj.name, server_names)
-    rep_msg = "存储桶复制规则配置完成"
-    rep_status = "ok"
-  except Exception as e:
-    rep_msg = f"存储桶复制规则配置失败: {e}"
-    rep_status = "failed"
-    logger.warning(rep_msg)
-  async for chunk in _emit({
-    "step": "replicate",
-    "server_name": None,
-    "status": rep_status,
-    "message": rep_msg,
-  }):
-    yield chunk
-
-  # 持久化桶记录
-  try:
-    await storage_crud.bulk_create_minio_bucket(application_obj)
-  except Exception as e:
-    logger.warning(f"MinioBucket 记录写入失败: {e}")
+    return
 
   async for chunk in _emit({
     "step": "done",
@@ -457,8 +467,11 @@ async def create_api_key(
   application_obj = await public_crud.read_application_by_id(application_id)
   if not application_obj:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
-  if not application_obj.enabled:
-    raise CustomException(ErrorDesc.STATUS_ERR, "应用未启用")
+  if (
+    not application_obj.enabled
+    or application_obj.provisioning_status != "ready"
+  ):
+    raise CustomException(ErrorDesc.STATUS_ERR, "应用复制策略尚未就绪")
   if application_obj.author != current_user:
     raise CustomException(ErrorDesc.RES_NOT_BELONG_TO_USER, "应用不属于当前用户")
   if expired_at:

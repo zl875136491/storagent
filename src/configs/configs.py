@@ -82,6 +82,9 @@ class Settings(BaseSettings):
   # initialization, every region may update the shared layout through Etcd CAS.
   SYNC_AUTHORITY_REGION: str = "beijing"
   SYNC_RECONCILE_INTERVAL_SECONDS: float = 30.0
+  REPLICATION_RECONCILE_INTERVAL_SECONDS: float = 300.0
+  REPLICATION_LOCK_TTL_SECONDS: int = 120
+  REPLICATION_LOCK_TIMEOUT_SECONDS: int = 10
 
   LOG_PATH: str = "logs/"
   LOG_STD_LEVEL: str = "INFO"

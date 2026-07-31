@@ -8,7 +8,9 @@
 - applications（应用元数据）
 - api_keys（API 密钥；字典键为哈希，值为加密后的 Key）
 """
+import asyncio
 import secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -279,6 +281,12 @@ def application_to_etcd_entry(app) -> dict:
     "shown_name": app.shown_name,
     "description": app.description,
     "enabled": app.enabled,
+    "provisioning_status": app.provisioning_status,
+    "provisioning_error": app.provisioning_error,
+    "provisioning_updated_at": (
+      app.provisioning_updated_at.isoformat()
+      if app.provisioning_updated_at else None
+    ),
     "author_username": author.username if author else "",
     "author_name": author.name if author else "",
     "approver_username": approver.username if approver else "",
@@ -371,8 +379,15 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
   if data.get("approver_username"):
     approver = await get_or_create_sync_user(data["approver_username"])
 
+  enabled = bool(data.get("enabled", False))
+  provisioning_status = data.get("provisioning_status") or (
+    "ready" if enabled else "pending"
+  )
+  provisioning_updated_at = _parse_sync_datetime(
+    data.get("provisioning_updated_at")
+  )
+
   if not app_obj:
-    enabled = data.get("enabled", False)
     app_obj = Application(
       name=app_name,
       shown_name=data.get("shown_name", app_name),
@@ -381,14 +396,12 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
       author=author,
       approver=approver,
       enabled_at=enabled_at if enabled else None,
+      provisioning_status=provisioning_status,
+      provisioning_error=data.get("provisioning_error", ""),
+      provisioning_updated_at=provisioning_updated_at,
     )
     await app_obj.save()
     logger.info(f"Etcd sync: 创建 Application {app_name}")
-    if enabled:
-      await ensure_local_buckets_for_app(app_name)
-      from src.modules.storage import crud as storage_crud
-      server_names = await storage_crud.read_minio_server_names()
-      await setup_bucket_replication(app_name, server_names)
     return app_obj, True
 
   changed = False
@@ -398,28 +411,32 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
   if app_obj.description != data.get("description", app_obj.description):
     app_obj.description = data.get("description", app_obj.description)
     changed = True
-  if data.get("enabled") and not app_obj.enabled:
+  if enabled and not app_obj.enabled:
     app_obj.enabled = True
     app_obj.enabled_at = enabled_at or utc_now()
     if approver:
       app_obj.approver = approver
     changed = True
-    newly_enabled = True
-  elif data.get("enabled") is False and app_obj.enabled:
+  elif not enabled and app_obj.enabled:
     app_obj.enabled = False
     changed = True
-    newly_enabled = False
-  else:
-    newly_enabled = False
+  if app_obj.provisioning_status != provisioning_status:
+    app_obj.provisioning_status = provisioning_status
+    changed = True
+  incoming_error = data.get("provisioning_error", "")
+  if app_obj.provisioning_error != incoming_error:
+    app_obj.provisioning_error = incoming_error
+    changed = True
+  if not _same_sync_datetime(
+    app_obj.provisioning_updated_at,
+    provisioning_updated_at,
+  ):
+    app_obj.provisioning_updated_at = provisioning_updated_at
+    changed = True
   if changed:
     app_obj.updated_at = utc_now()
     await app_obj.save()
     logger.info(f"Etcd sync: 更新 Application {app_name}")
-    if newly_enabled:
-      await ensure_local_buckets_for_app(app_name)
-      from src.modules.storage import crud as storage_crud
-      server_names = await storage_crud.read_minio_server_names()
-      await setup_bucket_replication(app_name, server_names)
   return app_obj, changed
 
 
@@ -436,11 +453,15 @@ async def upsert_api_key_from_etcd(key: str, data: dict):
       "shown_name": app_name,
       "description": "",
       "enabled": True,
+      "provisioning_status": "ready",
       "author_username": data.get("author_username", SYNC_USER_PLACEHOLDER),
     })
   if not app_obj.enabled:
     app_obj.enabled = True
     app_obj.enabled_at = utc_now()
+    app_obj.provisioning_status = "ready"
+    app_obj.provisioning_error = ""
+    app_obj.provisioning_updated_at = utc_now()
     await app_obj.save()
 
   expired_at = datetime.fromisoformat(data["expired_at"]) if data.get("expired_at") else utc_now()
@@ -897,24 +918,212 @@ async def setup_mc_aliases(servers_data: dict):
       logger.warning(f"mc alias 设置失败 {server_region_name}: {res}")
 
 
-async def setup_bucket_replication(bucket_name: str, server_names: list[str] | None = None):
+class ReplicationPolicyError(RuntimeError):
+  def __init__(self, message: str, policy: dict | None = None):
+    super().__init__(message)
+    self.policy = policy or {}
+
+
+class ReplicationLockBusyError(RuntimeError):
+  pass
+
+
+@asynccontextmanager
+async def application_replication_lock(
+  application_name: str,
+  *,
+  client=None,
+  timeout: int | None = None,
+):
+  """Serialize full-mesh provisioning across all Storagent regions."""
+  from src.core import etcd_op
+
+  own_client = client is None
+  if own_client:
+    client = await etcd_op.get_etcd_client()
+  ttl = max(int(settings.REPLICATION_LOCK_TTL_SECONDS), 30)
+  wait_timeout = (
+    int(settings.REPLICATION_LOCK_TIMEOUT_SECONDS)
+    if timeout is None else timeout
+  )
+  lock = client.lock(
+    f"/storagent/locks/application-replication/{application_name}".encode(),
+    ttl=ttl,
+  )
+  acquired = False
+  refresh_job = None
+
+  async def refresh_lock():
+    while True:
+      await asyncio.sleep(max(ttl / 3, 5))
+      await lock.refresh()
+
+  try:
+    acquired = await lock.acquire(timeout=wait_timeout)
+    if not acquired:
+      raise ReplicationLockBusyError(
+        f"应用 {application_name} 的复制策略正在由其他节点配置"
+      )
+    refresh_job = asyncio.create_task(refresh_lock())
+    yield
+  finally:
+    if refresh_job is not None:
+      refresh_job.cancel()
+      try:
+        await refresh_job
+      except asyncio.CancelledError:
+        pass
+      except Exception as e:
+        logger.warning(f"复制策略锁续租任务异常: {e}")
+    if acquired:
+      try:
+        await lock.release()
+      except Exception as e:
+        logger.warning(f"复制策略锁释放失败 {application_name}: {e}")
+    if own_client:
+      await client.close()
+
+
+def replication_priority(
+  server_names: list[str],
+  from_server: str,
+  to_server: str,
+) -> int:
+  targets = [name for name in sorted(set(server_names)) if name != from_server]
+  return targets.index(to_server) + 1
+
+
+async def setup_bucket_replication(
+  bucket_name: str,
+  server_names: list[str] | None = None,
+  *,
+  readback_attempts: int = 5,
+  readback_delay: float = 0.5,
+) -> dict:
+  """Idempotently create and strictly verify an N x (N-1) full mesh."""
   from src.core import minio_op
   from src.modules.storage import crud as storage_crud
+  from src.modules.storage import service as storage_service
 
   if server_names is None:
     server_names = await storage_crud.read_minio_server_names()
-  if len(server_names) < 2:
-    return
+  server_names = sorted(set(server_names))
+  initial = await storage_service.get_bucket_replicate_infos(bucket_name)
+  initial_policy = initial["policy"]
+  if (
+    initial_policy.get("read_errors")
+    or initial_policy.get("unmapped_rule_count", 0)
+  ):
+    raise ReplicationPolicyError(
+      f"无法安全识别存储桶 {bucket_name} 的现有复制规则",
+      initial_policy,
+    )
 
-  for from_server in server_names:
+  existing_pairs = {
+    (rule.get("from"), rule.get("to"))
+    for rule in initial.get("replicates", [])
+  }
+  failures: dict[str, str] = {}
+
+  async def create_missing_for_source(from_server: str):
     for to_server in server_names:
-      if from_server == to_server:
+      if from_server == to_server or (from_server, to_server) in existing_pairs:
         continue
-      success, err = await minio_op.create_bucket_replicate(from_server, to_server, bucket_name)
+      success, err = await minio_op.create_bucket_replicate(
+        from_server,
+        to_server,
+        bucket_name,
+        priority=replication_priority(server_names, from_server, to_server),
+        enabled=True,
+        replicate_options=[
+          "delete",
+          "delete-marker",
+          "existing-objects",
+          "metadata-sync",
+        ],
+      )
+      pair = f"{from_server}->{to_server}"
       if success:
         logger.info(f"Bucket Replication: {from_server}/{bucket_name} -> {to_server}")
       else:
-        logger.warning(f"Bucket Replication 失败 {from_server}->{to_server}/{bucket_name}: {err}")
+        failures[pair] = str(err)
+        logger.warning(f"Bucket Replication 失败 {pair}/{bucket_name}: {err}")
+
+  await asyncio.gather(*(
+    create_missing_for_source(from_server)
+    for from_server in server_names
+  ))
+  if failures:
+    detail = "; ".join(f"{pair}: {error}" for pair, error in sorted(failures.items()))
+    raise ReplicationPolicyError(f"全连接复制规则创建失败: {detail}", initial_policy)
+
+  latest = initial
+  attempts = max(readback_attempts, 1)
+  for attempt in range(attempts):
+    latest = await storage_service.get_bucket_replicate_infos(bucket_name)
+    if latest["policy"].get("complete"):
+      return latest["policy"]
+    if attempt + 1 < attempts and readback_delay > 0:
+      await asyncio.sleep(readback_delay)
+
+  policy = latest["policy"]
+  raise ReplicationPolicyError(
+    (
+      f"全连接复制策略验收失败: "
+      f"规则 {policy.get('actual_rule_count', 0)}/"
+      f"{policy.get('expected_rule_count', 0)}, "
+      f"健康 {policy.get('healthy_rule_count', 0)}"
+    ),
+    policy,
+  )
+
+
+async def reconcile_replication_policies_task():
+  """Authority-region loop that repairs missing rules for enabled apps."""
+  if settings.REGION != settings.SYNC_AUTHORITY_REGION:
+    logger.info("非权威区域不执行复制策略校准")
+    return
+
+  from src.modules.public import crud as public_crud
+  from src.modules.storage import crud as storage_crud
+
+  interval = max(float(settings.REPLICATION_RECONCILE_INTERVAL_SECONDS), 30.0)
+  while True:
+    try:
+      applications = await public_crud.read_application_list()
+      server_names = await storage_crud.read_minio_server_names()
+      for app in applications:
+        if not app.enabled:
+          continue
+        try:
+          async with application_replication_lock(app.name, timeout=0):
+            await setup_bucket_replication(app.name, server_names)
+          if app.provisioning_status != "ready" or app.provisioning_error:
+            app.provisioning_status = "ready"
+            app.provisioning_error = ""
+            app.provisioning_updated_at = utc_now()
+            app.updated_at = utc_now()
+            await app.save()
+            await publish_application(app)
+        except ReplicationLockBusyError:
+          continue
+        except Exception as e:
+          app.provisioning_status = "degraded"
+          app.provisioning_error = str(e)
+          app.provisioning_updated_at = utc_now()
+          app.updated_at = utc_now()
+          await app.save()
+          try:
+            await publish_application(app)
+          except Exception as publish_error:
+            logger.warning(f"复制策略异常状态同步失败 {app.name}: {publish_error}")
+          logger.warning(f"复制策略校准失败 {app.name}: {e}")
+    except asyncio.CancelledError:
+      logger.info("复制策略周期校准已停止")
+      raise
+    except Exception as e:
+      logger.warning(f"复制策略周期校准失败: {e}")
+    await asyncio.sleep(interval)
 
 
 async def ensure_local_buckets_for_app(app_name: str):

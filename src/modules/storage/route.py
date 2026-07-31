@@ -88,6 +88,7 @@ async def get_buckets(
 
 @router.get(
   path="/buckets/{bucket_name}/replicates",
+  response_model=storage_schema.BucketReplicateResponse,
   summary="获取存储桶复制信息")
 async def get_bucket_replicate_infos(
   bucket_name: str,

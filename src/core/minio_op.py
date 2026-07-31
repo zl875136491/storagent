@@ -1,4 +1,5 @@
 import json
+import asyncio
 import shlex
 import subprocess
 from minio import Minio
@@ -22,15 +23,19 @@ async def _run_cmd(cmd):
     str: 执行结果
   """
   try:
-    result = subprocess.run(
-      cmd, shell=True, check=True, 
-      capture_output=True, text=True
+    result = await asyncio.to_thread(
+      subprocess.run,
+      cmd,
+      shell=True,
+      check=True,
+      capture_output=True,
+      text=True,
     )
     await create_shell_command_log(cmd, result.stdout, result.stderr)
     return True, result.stdout
   except subprocess.CalledProcessError as e:
-    await create_shell_command_log(cmd, "", e.stderr)
-    return False, e.stderr
+    await create_shell_command_log(cmd, e.stdout or "", e.stderr or "")
+    return False, e.stderr or e.stdout or str(e)
 
 def get_minio_client(host: str, port: int, access_key: str, secret_key: str) -> Minio:
   """
@@ -339,7 +344,10 @@ async def delete_bucket_replicate(
     return False, f"删除复制失败:{str(err)}"
   return True, "删除复制成功"
 
-async def get_bucket_replicate_status(server_name: str, bucket_name: str):
+async def get_bucket_replicate_status_result(
+  server_name: str,
+  bucket_name: str,
+) -> tuple[bool, dict, str]:
   """
   获取存储桶复制状态
   
@@ -350,6 +358,8 @@ async def get_bucket_replicate_status(server_name: str, bucket_name: str):
   cmd = f"mc replicate ls {server_name}/{bucket_name} --json"
   success, output = await _run_cmd(cmd)
   data = {}
+  if not success and _replication_config_not_set(output):
+    return True, data, ""
   if success:
     lines = [line.strip() for line in output.split('\n') if line.strip()]
     for line in lines:
@@ -358,24 +368,54 @@ async def get_bucket_replicate_status(server_name: str, bucket_name: str):
         data[status_item["rule"]["ID"]] = status_item
       except (json.JSONDecodeError, KeyError, TypeError):
         continue
+  return success, data, "" if success else str(output)
+
+
+async def get_bucket_replicate_status(server_name: str, bucket_name: str):
+  _, data, _ = await get_bucket_replicate_status_result(server_name, bucket_name)
   return data
 
-async def get_bucket_replicate_info(server: str, bucket: str):
+async def get_bucket_replicate_entries_result(
+  server: str,
+  bucket: str,
+) -> tuple[bool, list[dict[str, str]], str]:
+  """Return every remote rule without collapsing duplicate destinations."""
   success, output = await _run_cmd(f"mc replicate ls {server}/{bucket}")
-  endpoints = []
-  rule_ids = []
-  if success:
-    for line in output.splitlines():
-      if "Remote Bucket:" in line:
-        remote = line.split("Remote Bucket:")[-1].strip().removesuffix(f"/{bucket}")
-        bucket_endpoint = remote.split("://", 1)[-1].rsplit("@", 1)[-1].rstrip("/")
-        endpoints.append(bucket_endpoint)
-      if "Rule ID:" in line:
-        rule_id = line.split("Rule ID:")[-1].strip()
-        rule_ids.append(rule_id)
-  data = {}
+  if not success and _replication_config_not_set(output):
+    return True, [], ""
+  if not success:
+    return False, [], str(output)
+
+  endpoints: list[str] = []
+  rule_ids: list[str] = []
+  for line in output.splitlines():
+    if "Remote Bucket:" in line:
+      remote = line.split("Remote Bucket:")[-1].strip().removesuffix(f"/{bucket}")
+      endpoint = remote.split("://", 1)[-1].rsplit("@", 1)[-1].rstrip("/")
+      endpoints.append(endpoint)
+    if "Rule ID:" in line:
+      rule_ids.append(line.split("Rule ID:")[-1].strip())
   if len(endpoints) != len(rule_ids):
-    return None
-  for i in range(len(endpoints)):
-    data[endpoints[i]] = rule_ids[i]
-  return data
+    return False, [], "mc replicate ls 返回的 Rule ID 与 Remote Bucket 数量不一致"
+  entries = [
+    {"endpoint": endpoint, "rule_id": rule_id}
+    for endpoint, rule_id in zip(endpoints, rule_ids)
+  ]
+  return True, entries, ""
+
+
+def _replication_config_not_set(output: object) -> bool:
+  message = str(output or "").lower()
+  return (
+    "replication configuration" in message
+    and ("not set" in message or "not found" in message)
+  )
+
+
+async def get_bucket_replicate_entries(server: str, bucket: str) -> list[dict[str, str]]:
+  _, entries, _ = await get_bucket_replicate_entries_result(server, bucket)
+  return entries
+
+async def get_bucket_replicate_info(server: str, bucket: str):
+  entries = await get_bucket_replicate_entries(server, bucket)
+  return {entry["endpoint"]: entry["rule_id"] for entry in entries}

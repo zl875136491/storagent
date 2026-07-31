@@ -141,10 +141,25 @@ async def create_minio_bucket(
 async def bulk_create_minio_bucket(
   app: Application) -> List[MinioBucket]:
   """
-  批量创建 Minio 存储桶
+  补齐应用在各站点的 MinioBucket 记录。
+
+  授权流程允许失败后重试，因此这里必须能接续一次只写入了部分站点的操作。
   """
   minio_server_objs = await read_minio_server_list()
+  existing_buckets = await MinioBucket.find(
+    MinioBucket.name == app.name,
+    fetch_links=True,
+  ).to_list()
+  buckets_by_region = {
+    str(bucket.region.id): bucket
+    for bucket in existing_buckets
+  }
+  buckets = []
   for minio_server_obj in minio_server_objs:
+    region_key = str(minio_server_obj.region.id)
+    if region_key in buckets_by_region:
+      buckets.append(buckets_by_region[region_key])
+      continue
     minio_bucket = MinioBucket(
       region=minio_server_obj.region,
       app=app,
@@ -153,6 +168,7 @@ async def bulk_create_minio_bucket(
     )
     try:
       await minio_bucket.save()
+      buckets.append(minio_bucket)
     except Exception as e:
       raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, str(e))
-  
+  return buckets

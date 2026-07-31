@@ -18,8 +18,8 @@ from src.core.minio_op import (
   check_server_bucket_existed,
   get_minio_client,
   get_server_buckets,
-  get_bucket_replicate_status,
-  get_bucket_replicate_info,
+  get_bucket_replicate_status_result,
+  get_bucket_replicate_entries_result,
   get_site_alias,
   create_bucket_replicate as create_minio_bucket_replicate,
   delete_bucket_replicate as delete_minio_bucket_replicate,
@@ -219,7 +219,7 @@ async def get_server_details(minio_server: ObjectId) -> List[str]:
   buckets = await get_buckets_info(minio_client)
   return dict[str, list](data=buckets)
 
-async def format_replicate_status(status: dict) -> str:
+async def format_replicate_status(status: dict) -> dict:
   """
   格式化复制状态
   """
@@ -229,6 +229,8 @@ async def format_replicate_status(status: dict) -> str:
   if "rule" in status:
     if "Priority" in status["rule"]:
       data["priority"] = status["rule"]["Priority"]
+    if "Status" in status["rule"]:
+      data["rule_status"] = status["rule"]["Status"]
     if "DeleteMarkerReplication" in status["rule"]:
       data["delete_marker_replication"] = status["rule"]["DeleteMarkerReplication"]["Status"]
     if "ExistingObjectReplication" in status["rule"]:
@@ -238,7 +240,95 @@ async def format_replicate_status(status: dict) -> str:
         data["source_selection_criteria"] = status["rule"]["SourceSelectionCriteria"]["ReplicaModifications"]["Status"]
   return data
 
-async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
+
+def _replication_setting_enabled(value: object) -> bool:
+  return str(value or "").strip().lower() == "enabled"
+
+
+def is_replication_rule_healthy(rule: dict) -> bool:
+  status = rule.get("status") or {}
+  return (
+    str(status.get("status") or "").lower() == "success"
+    and _replication_setting_enabled(status.get("rule_status"))
+    and _replication_setting_enabled(status.get("delete_marker_replication"))
+    and _replication_setting_enabled(status.get("existing_object_replication"))
+    and _replication_setting_enabled(status.get("source_selection_criteria"))
+  )
+
+
+def build_full_mesh_policy(
+  server_names: list[str],
+  replicates: list[dict],
+  *,
+  read_errors: dict[str, str] | None = None,
+  unmapped_rule_count: int = 0,
+) -> dict:
+  sites = sorted(set(server_names))
+  expected_pairs = {
+    (from_server, to_server)
+    for from_server in sites
+    for to_server in sites
+    if from_server != to_server
+  }
+  rules_by_pair: dict[tuple[str, str], list[dict]] = {}
+  for rule in replicates:
+    pair = (str(rule.get("from") or ""), str(rule.get("to") or ""))
+    rules_by_pair.setdefault(pair, []).append(rule)
+
+  missing = sorted(expected_pairs - set(rules_by_pair))
+  duplicates = sorted(
+    pair for pair, rules in rules_by_pair.items()
+    if pair in expected_pairs and len(rules) > 1
+  )
+  unexpected = sorted(set(rules_by_pair) - expected_pairs)
+  unhealthy = sorted(
+    pair for pair in expected_pairs
+    if len(rules_by_pair.get(pair, [])) == 1
+    and not is_replication_rule_healthy(rules_by_pair[pair][0])
+  )
+  read_errors = read_errors or {}
+  actual_count = len(replicates) + unmapped_rule_count
+  healthy_count = sum(is_replication_rule_healthy(rule) for rule in replicates)
+  expected_count = len(expected_pairs)
+  complete = (
+    len(sites) >= 2
+    and actual_count == expected_count
+    and not missing
+    and not duplicates
+    and not unexpected
+    and not unhealthy
+    and not read_errors
+    and unmapped_rule_count == 0
+  )
+  return {
+    "type": "full_mesh",
+    "site_count": len(sites),
+    "expected_rule_count": expected_count,
+    "actual_rule_count": actual_count,
+    "healthy_rule_count": healthy_count,
+    "complete": complete,
+    "status": "ready" if complete else "degraded",
+    "missing_rules": [
+      {"from": from_server, "to": to_server}
+      for from_server, to_server in missing
+    ],
+    "duplicate_rules": [
+      {"from": from_server, "to": to_server, "count": len(rules_by_pair[(from_server, to_server)])}
+      for from_server, to_server in duplicates
+    ],
+    "unhealthy_rules": [
+      {"from": from_server, "to": to_server}
+      for from_server, to_server in unhealthy
+    ],
+    "unexpected_rules": [
+      {"from": from_server, "to": to_server}
+      for from_server, to_server in unexpected
+    ],
+    "unmapped_rule_count": unmapped_rule_count,
+    "read_errors": read_errors,
+  }
+
+async def get_bucket_replicate_infos(bucket_name) -> dict:
   """
   获取存储桶复制信息
   """
@@ -256,6 +346,8 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
   # 获取拓扑图的边和节点的位置信息
   nodes = {}
   edges = {}
+  read_errors: dict[str, str] = {}
+  unmapped_rule_count = 0
   node_objs = await graph_crud.read_many_bucket_node_positions(bucket_name)
   edge_objs = await graph_crud.read_many_bucket_edge_positions(bucket_name)
   for node_item in node_objs:
@@ -276,15 +368,24 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
       "to_position": to_position
     } 
   for server_name in server_names:
-    to_server_endpoints = await get_bucket_replicate_info(server_name, bucket_name)
-    status_infos = await get_bucket_replicate_status(server_name, bucket_name)
-    if not to_server_endpoints:
+    entries_ok, to_server_entries, entries_error = await get_bucket_replicate_entries_result(
+      server_name,
+      bucket_name,
+    )
+    status_ok, status_infos, status_error = await get_bucket_replicate_status_result(
+      server_name,
+      bucket_name,
+    )
+    if not entries_ok or not status_ok:
+      read_errors[server_name] = entries_error or status_error or "读取复制规则失败"
       continue
-    for endpoint in to_server_endpoints.keys():
+    for entry in to_server_entries:
+      endpoint = entry["endpoint"]
       to_server_name = mappings.get(endpoint)
       if not to_server_name:
+        unmapped_rule_count += 1
         continue
-      rule_id = to_server_endpoints[endpoint]
+      rule_id = entry["rule_id"]
       status_info = await format_replicate_status(status_infos.get(rule_id, {}))
       temp_id = f"{server_name}-{to_server_name}"
       if temp_id in edges:
@@ -315,7 +416,18 @@ async def get_bucket_replicate_infos(bucket_name) -> List[dict]:
       except Exception:
         pass
     nodes = migrated
-  return dict(servers=nodes, replicates=replicates, server_ids=server_names)
+  policy = build_full_mesh_policy(
+    server_names,
+    replicates,
+    read_errors=read_errors,
+    unmapped_rule_count=unmapped_rule_count,
+  )
+  return dict(
+    servers=nodes,
+    replicates=replicates,
+    server_ids=server_names,
+    policy=policy,
+  )
 
 
 _BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")

@@ -8,6 +8,7 @@ from src.configs.configs import settings
 from src.utils.logger import setup_logging
 from src.core.initialization import init_project, init_service
 from src.core.etcd_op import get_etcd_client, reconcile_etcd_task, watch_etcd_task
+from src.core.sync import reconcile_replication_policies_task
 from src.core.exception import register_exception
 from src.core.middleware import RequestContextMiddleware
 from src.modules.auth.crud import cleanup_expired_tokens_task
@@ -53,11 +54,17 @@ async def lifespan(app: FastAPI):
   # 7. 过期 token 清理后台任务
   cleanup_job = asyncio.create_task(cleanup_expired_tokens_task())
 
+  # 8. 权威区域周期验收并补齐启用应用的全连接复制策略
+  replication_reconcile_job = asyncio.create_task(
+    reconcile_replication_policies_task()
+  )
+
   yield
   
   watch_job.cancel()
   reconcile_job.cancel()
   cleanup_job.cancel()
+  replication_reconcile_job.cancel()
   try:
     await etcd_client.close()
   except Exception:

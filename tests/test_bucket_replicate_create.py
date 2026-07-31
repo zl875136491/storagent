@@ -371,11 +371,11 @@ async def test_get_replicate_infos_migrates_legacy_percent_positions(monkeypatch
   async def edge_positions(_bucket):
     return []
 
-  async def replicate_info(_server, _bucket):
-    return None
+  async def replicate_entries(_server, _bucket):
+    return True, [], ""
 
   async def replicate_status(_server, _bucket):
-    return {}
+    return True, {}, ""
 
   async def update_pos(bucket, server, x, y):
     persisted[server] = {"bucket": bucket, "x": x, "y": y}
@@ -388,8 +388,16 @@ async def test_get_replicate_infos_migrates_legacy_percent_positions(monkeypatch
   monkeypatch.setattr(
     storage_service.graph_crud, "read_many_bucket_edge_positions", edge_positions
   )
-  monkeypatch.setattr(storage_service, "get_bucket_replicate_info", replicate_info)
-  monkeypatch.setattr(storage_service, "get_bucket_replicate_status", replicate_status)
+  monkeypatch.setattr(
+    storage_service,
+    "get_bucket_replicate_entries_result",
+    replicate_entries,
+  )
+  monkeypatch.setattr(
+    storage_service,
+    "get_bucket_replicate_status_result",
+    replicate_status,
+  )
   monkeypatch.setattr(storage_service.graph_service, "set_bucket_node_position", update_pos)
 
   result = await storage_service.get_bucket_replicate_infos("system-test")
@@ -419,11 +427,11 @@ async def test_get_replicate_infos_omits_default_zero_positions(monkeypatch):
   async def edge_positions(_bucket):
     return []
 
-  async def replicate_info(_server, _bucket):
-    return None
+  async def replicate_entries(_server, _bucket):
+    return True, [], ""
 
   async def replicate_status(_server, _bucket):
-    return {}
+    return True, {}, ""
 
   monkeypatch.setattr(storage_service, "get_site_alias", aliases)
   monkeypatch.setattr(storage_service.storage_crud, "read_minio_server_names", server_names)
@@ -433,8 +441,16 @@ async def test_get_replicate_infos_omits_default_zero_positions(monkeypatch):
   monkeypatch.setattr(
     storage_service.graph_crud, "read_many_bucket_edge_positions", edge_positions
   )
-  monkeypatch.setattr(storage_service, "get_bucket_replicate_info", replicate_info)
-  monkeypatch.setattr(storage_service, "get_bucket_replicate_status", replicate_status)
+  monkeypatch.setattr(
+    storage_service,
+    "get_bucket_replicate_entries_result",
+    replicate_entries,
+  )
+  monkeypatch.setattr(
+    storage_service,
+    "get_bucket_replicate_status_result",
+    replicate_status,
+  )
 
   result = await storage_service.get_bucket_replicate_infos("system-test")
   assert result["servers"] == {"hangzhou": {"position_x": 220, "position_y": 340}}

@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Any, List
+from typing import Any, List, Literal
 from bson import ObjectId
 from pydantic_core import CoreSchema, core_schema
 from pydantic import GetCoreSchemaHandler, BaseModel, Field
@@ -83,6 +83,9 @@ class ApplicationResponse(BaseModel):
   description: str
   enabled: bool
   enabled_at: datetime | None
+  provisioning_status: Literal["pending", "provisioning", "ready", "failed", "degraded"]
+  provisioning_error: str
+  provisioning_updated_at: datetime | None
   author: SimpleUserResponse
 
 class ApplicationListResponse(BaseModel):

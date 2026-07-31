@@ -2,10 +2,10 @@ from beanie import Document
 from beanie.odm.fields import Link
 from datetime import datetime
 from pymongo import IndexModel
-from pydantic import Field
+from pydantic import Field, model_validator
 from src.utils.helpers import utc_now
 from src.modules.auth.model import User
-from typing import List
+from typing import List, Literal
 from pydantic import BaseModel
 
 class Region(Document):
@@ -27,9 +27,20 @@ class Application(Document):
   created_at: datetime = Field(default_factory=utc_now)
   updated_at: datetime = Field(default_factory=utc_now)
   enabled_at: datetime | None = Field(default=None)
+  provisioning_status: Literal["pending", "provisioning", "ready", "failed", "degraded"] | None = Field(default=None)
+  provisioning_error: str = Field(default="")
+  provisioning_updated_at: datetime | None = Field(default=None)
   # regions: List[Link[Region]] = Field(default=[])
   author: Link[User]
   approver: Link[User] | None = Field(default=None)
+
+  @model_validator(mode="after")
+  def normalize_legacy_provisioning_status(self):
+    # Existing enabled applications predate provisioning state and already
+    # passed the legacy authorization flow.
+    if self.provisioning_status is None:
+      self.provisioning_status = "ready" if self.enabled else "pending"
+    return self
   
   class Settings:
     name = "application"

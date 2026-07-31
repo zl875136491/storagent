@@ -17,7 +17,7 @@ def test_watch_handlers_exist():
 
 def test_upsert_application_source_supports_disable():
   src = inspect.getsource(upsert_application_from_etcd)
-  assert 'data.get("enabled") is False' in src
+  assert "elif not enabled and app_obj.enabled" in src
 
 
 def test_unpublish_helpers_exist():
