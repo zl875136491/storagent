@@ -2,7 +2,12 @@ from fastapi import APIRouter, Depends, Request
 from src.modules.auth import service as auth_service
 from src.modules.auth import schema as auth_schema
 from src.core.auth import get_current_user, oauth2_scheme, require_admin
-from src.core.rate_limit import rate_limit_login, rate_limit_refresh
+from src.core.rate_limit import (
+  rate_limit_login,
+  rate_limit_oa_request,
+  rate_limit_oa_verify,
+  rate_limit_refresh,
+)
 from src.modules.auth.model import User
 
 router = APIRouter()
@@ -19,9 +24,61 @@ async def login(
   用户登录
   """
   rate_limit_login(request)
-  username = payload.username.strip()
-  password = payload.password.strip()
+  username = payload.username
+  password = payload.password
   return await auth_service.login_user(username, password)
+
+
+@router.post(
+  path="/register/request",
+  response_model=auth_schema.AuthRequestResponse,
+  summary="通过 OA 发起新用户注册",
+)
+async def request_registration(
+  payload: auth_schema.PasswordPairRequest,
+  request: Request,
+) -> auth_schema.AuthRequestResponse:
+  rate_limit_oa_request(request, payload.username)
+  return await auth_service.request_registration(payload.username, payload.password)
+
+
+@router.post(
+  path="/password-reset/request",
+  response_model=auth_schema.AuthRequestResponse,
+  summary="通过 OA 发起密码重置",
+)
+async def request_password_reset(
+  payload: auth_schema.PasswordPairRequest,
+  request: Request,
+) -> auth_schema.AuthRequestResponse:
+  rate_limit_oa_request(request, payload.username)
+  return await auth_service.request_password_reset(payload.username, payload.password)
+
+
+@router.post(
+  path="/login-link/request",
+  response_model=auth_schema.AuthRequestResponse,
+  summary="发送 OA 快捷登录链接",
+)
+async def request_login_link(
+  payload: auth_schema.AuthLinkRequest,
+  request: Request,
+) -> auth_schema.AuthRequestResponse:
+  rate_limit_oa_request(request, payload.username)
+  return await auth_service.request_login_link(payload.username)
+
+
+@router.post(
+  path="/login-by-code",
+  response_model=auth_schema.TokenResponse,
+  summary="使用 OA 一次性链接完成认证",
+)
+async def login_by_code(
+  payload: auth_schema.CodeLoginRequest,
+  request: Request,
+) -> auth_schema.TokenResponse:
+  rate_limit_oa_verify(request, payload.username)
+  return await auth_service.login_by_code(payload.username, payload.code)
 
 @router.post(
   path="/refresh",

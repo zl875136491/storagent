@@ -1,5 +1,11 @@
 import asyncio
-from src.modules.auth.model import User, Role, DestoryedToken
+import hashlib
+import secrets
+from datetime import timedelta
+
+from beanie import UpdateResponse
+
+from src.modules.auth.model import User, Role, TempCode, DestoryedToken
 from typing import List
 from src.utils.helpers import utc_now, get_full_permissions
 from src.core.exception import CustomException, ErrorDesc
@@ -40,6 +46,76 @@ async def create_user(
   except Exception as e:
     raise CustomException(ErrorDesc.CREATE_USER_FAILED, "创建用户失败")
   return user
+
+
+def auth_code_hash(code: str) -> str:
+  return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+async def create_auth_challenge(
+  *,
+  username: str,
+  purpose: str,
+  password_hash: str = "",
+  display_name: str = "",
+) -> tuple[TempCode, str]:
+  """Create a node-local challenge and return the plaintext code once."""
+  from src.configs.configs import settings
+
+  code = secrets.token_urlsafe(32)
+  now = utc_now()
+  challenge = TempCode(
+    username=username,
+    code_hash=auth_code_hash(code),
+    purpose=purpose,
+    password_hash=password_hash,
+    display_name=display_name,
+    delivery_status="pending",
+    created_at=now,
+    expired_at=now + timedelta(minutes=max(settings.OA_AUTH_CODE_EXPIRE_MINUTES, 1)),
+  )
+  await challenge.save()
+  return challenge, code
+
+
+async def set_auth_challenge_delivery(challenge: TempCode, status: str) -> None:
+  challenge.delivery_status = status
+  await challenge.save()
+
+
+async def delete_auth_challenge(challenge: TempCode) -> None:
+  await challenge.delete()
+
+
+async def consume_auth_challenge(username: str, code: str) -> TempCode | None:
+  """Atomically consume a matching unexpired code so links cannot be replayed."""
+  consumed_at = utc_now()
+  return await TempCode.find_one(
+    {
+      "username": username,
+      "code_hash": auth_code_hash(code),
+      "consumed_at": None,
+      "expired_at": {"$gt": utc_now()},
+    },
+  ).update(
+    {"$set": {"consumed_at": consumed_at}},
+    response_type=UpdateResponse.NEW_DOCUMENT,
+  )
+
+
+async def restore_auth_challenge(challenge: TempCode) -> None:
+  """Restore a consumed code only when its local account mutation failed."""
+  await TempCode.get_motor_collection().update_one(
+    {"_id": challenge.id, "consumed_at": challenge.consumed_at},
+    {"$set": {"consumed_at": None}},
+  )
+
+
+async def cleanup_expired_auth_challenges() -> int:
+  result = await TempCode.get_motor_collection().delete_many(
+    {"expired_at": {"$lt": utc_now()}},
+  )
+  return int(result.deleted_count)
 
 async def check_token_valid(token: str) -> bool:
   """
@@ -189,6 +265,9 @@ async def cleanup_expired_tokens_task():
       count = await cleanup_expired_tokens()
       if count:
         logger.info(f"清理了 {count} 条过期 token")
+      challenge_count = await cleanup_expired_auth_challenges()
+      if challenge_count:
+        logger.info(f"清理了 {challenge_count} 条过期 OA 认证挑战")
     except asyncio.CancelledError:
       break
     except Exception as e:

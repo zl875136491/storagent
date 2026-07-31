@@ -77,6 +77,8 @@ class ErrorDesc(Enum):
   AI_NOT_CONFIGURED = ("AI 助手未配置", 400042)
   AI_UPSTREAM_FAILED = ("AI 上游服务不可用", 502043)
   AI_CONFIG_INVALID = ("AI 配置不合法", 400044)
+  AUTH_CODE_INVALID = ("认证链接无效或已过期", 401045)
+  USER_ALREADY_REGISTERED = ("用户已完成注册", 400046)
   
 
   

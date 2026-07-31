@@ -25,6 +25,8 @@ class User(Document):
   permissions: List[str] = Field(default=[])
   """跨节点同步创建的占位用户，禁止登录"""
   is_sync: bool = Field(default=False)
+  """密码重置时递增；JWT 中版本不匹配的旧会话立即失效"""
+  auth_version: int = Field(default=0, ge=0)
   created_at: datetime = Field(default_factory=utc_now)
   updated_at: datetime = Field(default_factory=utc_now)
   
@@ -35,14 +37,24 @@ class User(Document):
     ]
   
 class TempCode(Document):
+  """仅保存在发起节点的 OA 一次性认证挑战，不参与 Etcd 同步。"""
   username: str
-  code: str
+  code: str = Field(default="")  # 兼容旧数据；新流程只写 code_hash
+  code_hash: str = Field(default="")
+  purpose: str = Field(default="login")
+  password_hash: str = Field(default="")
+  display_name: str = Field(default="")
+  delivery_status: str = Field(default="pending")
+  created_at: datetime = Field(default_factory=utc_now)
   expired_at: datetime
+  consumed_at: datetime | None = Field(default=None)
   
   class Settings:
     name = "temp_code"
     indexes = [
       IndexModel(["expired_at"]),
+      IndexModel(["code_hash"]),
+      IndexModel(["username", "purpose", "created_at"]),
     ]
   
 class DestoryedToken(Document):

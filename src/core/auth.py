@@ -7,7 +7,7 @@ from fastapi.security import OAuth2PasswordBearer
 
 from src.configs.configs import settings
 from src.modules.auth.model import User
-from src.utils.helpers import utc_now, import_user_from_springboard
+from src.utils.helpers import utc_now
 from src.modules.auth import crud as user_crud
 from src.core.exception import CustomException, ErrorDesc
 from src.configs.consts import preset_permissions
@@ -94,7 +94,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
   encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
   return encoded_jwt
 
-async def create_token(username: str) -> dict:
+async def create_token(username: str, auth_version: int = 0) -> dict:
   """
   创建 JWT token（access / refresh 带 typ，防止互相冒用）
   
@@ -107,11 +107,11 @@ async def create_token(username: str) -> dict:
   access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
   refresh_token_expires = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
   access_token = create_access_token(
-    data={"sub": username, "typ": TOKEN_TYP_ACCESS},
+    data={"sub": username, "typ": TOKEN_TYP_ACCESS, "ver": int(auth_version)},
     expires_delta=access_token_expires
   )
   refresh_token = create_access_token(
-    data={"sub": username, "typ": TOKEN_TYP_REFRESH},
+    data={"sub": username, "typ": TOKEN_TYP_REFRESH, "ver": int(auth_version)},
     expires_delta=refresh_token_expires
   )
   return {
@@ -132,48 +132,13 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
     User: 如果验证成功返回用户对象，否则返回 None
   """
   user = await user_crud.read_user_by_username(username)
-  user_changed = False
   if not user or getattr(user, "is_sync", False):
-    user_info = await import_user_from_springboard(username)
-    if user_info is None:
-      raise CustomException(ErrorDesc.LOGIN_ERR, "用户不存在")
-    if not password_check(password):
-      raise CustomException(ErrorDesc.PASSWORD_UNSET, "密码不符合要求(至少8位，包含数字和字母)")
-    hashed_password = get_password_hash(password)
-    if preset_admin_user(username):
-      admin_role = await user_crud.get_admin_role()
-      roles = [admin_role]
-    else:
-      basic_role = await user_crud.get_basic_role()
-      roles = [basic_role]
-    if user:
-      user.name = user_info["user_info"]["l"]
-      user.hashed_password = hashed_password
-      user.roles = roles
-      user.permissions = await user_crud.get_all_permissions(roles)
-      user.is_sync = False
-      user.updated_at = utc_now()
-      await user.save()
-      user_changed = True
-    else:
-      user = await user_crud.create_user(
-        username=username,
-        name=user_info["user_info"]["l"],
-        hashed_password=hashed_password,
-        roles=roles
-      )
-      user_changed = True
+    raise CustomException(
+      ErrorDesc.PASSWORD_UNSET,
+      "请先通过 OA 身份验证完成注册",
+    )
   if not verify_password(password, user.hashed_password):
     raise CustomException(ErrorDesc.LOGIN_ERR, "密码错误")
-  if user_changed:
-    try:
-      from src.core import sync as sync_module
-      await sync_module.publish_user(user)
-    except Exception as e:
-      from src.core import metrics as metrics_mod
-      from src.utils.logger import logger
-      metrics_mod.incr("sync_failures_total")
-      logger.warning(f"User {username} 同步到 Etcd 失败，将由周期校准重试: {e}")
   return user
 
 def preset_admin_user(username):
@@ -228,6 +193,12 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
   
   user = await user_crud.read_user_by_username(username)
   if user is None:
+    raise credentials_exception
+  try:
+    token_version = int(payload.get("ver", 0))
+  except (TypeError, ValueError):
+    raise credentials_exception
+  if token_version != int(getattr(user, "auth_version", 0)):
     raise credentials_exception
   
   return user

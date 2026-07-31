@@ -115,6 +115,7 @@ def user_to_etcd_entry(user) -> dict:
   return {
     "name": user.name,
     "hashed_password_enc": encrypt_secret(user.hashed_password),
+    "auth_version": int(getattr(user, "auth_version", 0)),
     "role_names": role_names,
     "created_at": user.created_at.isoformat() if user.created_at else None,
     "updated_at": user.updated_at.isoformat() if user.updated_at else None,
@@ -177,6 +178,7 @@ async def sync_users_to_mongo(users_data: dict) -> None:
     permissions = await user_crud.get_all_permissions(roles)
     created_at = _parse_sync_datetime(data.get("created_at")) or utc_now()
     updated_at = _parse_sync_datetime(data.get("updated_at")) or created_at
+    auth_version = max(int(data.get("auth_version") or 0), 0)
 
     user = await user_crud.read_user_by_username(username)
     if not user:
@@ -189,6 +191,7 @@ async def sync_users_to_mongo(users_data: dict) -> None:
       )
       user.created_at = created_at
       user.updated_at = updated_at
+      user.auth_version = auth_version
       await user.save()
       logger.info(f"Etcd sync: 创建可登录 User {username}")
       continue
@@ -205,6 +208,7 @@ async def sync_users_to_mongo(users_data: dict) -> None:
       current_role_names != desired_role_names,
       sorted(user.permissions or []) != sorted(permissions),
       bool(getattr(user, "is_sync", False)),
+      int(getattr(user, "auth_version", 0)) != auth_version,
       not _same_sync_datetime(user.created_at, created_at),
       not _same_sync_datetime(user.updated_at, updated_at),
     ))
@@ -215,6 +219,7 @@ async def sync_users_to_mongo(users_data: dict) -> None:
     user.roles = roles
     user.permissions = permissions
     user.is_sync = False
+    user.auth_version = auth_version
     user.created_at = created_at
     user.updated_at = updated_at
     await user.save()

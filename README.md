@@ -6,7 +6,7 @@ Storagent（Storage + Agent）是一个多区域 MinIO 对象存储管理后端 
 
 | 模块 | 能力 |
 |------|------|
-| 认证 | JWT 登录/登出/刷新、企业 SSO 集成、RBAC 权限 |
+| 认证 | JWT 登录/登出/刷新、OA 一次性链接、注册/密码重置、RBAC 权限 |
 | 公共 | Region 管理、Application 创建与 SSE 授权、API Key 管理 |
 | 存储 | MinIO 服务器管理、Bucket 列表、复制拓扑查询 |
 | 文件 | S3 Multipart 分片上传/下载/断点续传（API Key 鉴权） |
@@ -86,6 +86,10 @@ docker run -d --env-file .env -p 9000:9000 storagent
 | `DEBUG` | 调试模式 | `false` |
 | `RELOAD` | 热重载（开发用） | `true` |
 | `IGNORE_AUTH` | 跳过企业 SSO（测试用） | `false` |
+| `SPRINGBOARD_URL` | OA 消息网关地址 | `http://tl.cooacloud.com/springboard_v3/` |
+| `SPRINGBOARD_APP` | OA 消息应用标识 | `storagent` |
+| `FRONT_URL` | OA 认证链接的前端地址 | `http://stor.1oa.com.cn` |
+| `OA_AUTH_CODE_EXPIRE_MINUTES` | OA 一次性链接有效期（分钟） | `15` |
 | `MONGO_DB_*` | MongoDB 连接参数 | 见 `.env.example` |
 | `MINIO_*` | 本地 MinIO 连接参数 | 见 `.env.example` |
 | `ETCD_*` | Etcd 连接参数 | 见 `.env.example` |
@@ -101,6 +105,10 @@ docker run -d --env-file .env -p 9000:9000 storagent
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/login` | 用户登录 |
+| POST | `/register/request` | 设置密码并向 OA 发送注册确认链接 |
+| POST | `/password-reset/request` | 设置新密码并向 OA 发送重置确认链接 |
+| POST | `/login-link/request` | 向 OA 发送快捷登录链接 |
+| POST | `/login-by-code` | 消费一次性链接并签发 Token |
 | POST | `/refresh` | 刷新 Token |
 | GET | `/profile` | 获取用户信息 |
 | GET | `/logout` | 登出 |
@@ -198,7 +206,7 @@ storagent/
 | Etcd Key | 同步内容 | 触发时机 |
 |----------|---------|---------|
 | `roles` | 角色定义（按角色名关联） | 启动合并 / 周期校准 / Watch |
-| `users` | 可登录用户、加密密码哈希和角色（按用户名关联） | 首次登录 / 角色变更 / 周期校准 / Watch |
+| `users` | 可登录用户、加密密码哈希、认证版本和角色（按用户名关联） | OA 注册/密码重置 / 角色变更 / 周期校准 / Watch |
 | `region` | 区域名称映射 | 启动 init / 创建 Region / Watch |
 | `servers` | MinIO 节点配置 | 启动 init / 创建或更新 Server / Watch |
 | `topology_layout` | Bucket 拓扑节点坐标和连线端点 | 北京首次引导 / 拓扑编辑 / Watch |
@@ -209,7 +217,7 @@ storagent/
 
 ### 同步链路
 
-1. **身份同步**：角色按名称、用户按用户名合并；密码哈希加密后写入 Etcd，远端使用本地 ObjectId 重建关联
+1. **身份同步**：角色按名称、用户按用户名合并；密码哈希和认证版本写入 Etcd，密码哈希加密存储，远端使用本地 ObjectId 重建关联。OA 一次性挑战只保存在发起节点，不参与同步
 2. **节点清单**：各节点启动时将 Region/Server 注册到 Etcd，Watch 同步到其他节点 MongoDB，并更新 mc alias
 3. **布局同步**：`topology_layout` 首次仅由 `SYNC_AUTHORITY_REGION`（默认北京）写入完整快照；之后任一区域的布局编辑均通过 Etcd CAS 合并
 4. **数据面隔离**：MinIO Bucket Replication 规则始终从 MinIO 实时读取；Mongo/Etcd 只同步图形布局，不会因布局同步创建或删除复制规则

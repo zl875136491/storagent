@@ -102,6 +102,13 @@ class Settings(BaseSettings):
   IGNORE_AUTH: bool = False
   USER_INFO_URL: str = "http://1.1.1.1:3000/api/v1/"
 
+  # OA IM 身份验证
+  SPRINGBOARD_URL: str = "http://tl.cooacloud.com/springboard_v3/"
+  SPRINGBOARD_APP: str = "storagent"
+  FRONT_URL: str = "http://stor.1oa.com.cn"
+  OA_AUTH_CODE_EXPIRE_MINUTES: int = 15
+  OA_AUTH_SEND_RETRIES: int = 3
+
   @property
   def mongo_db_url(self) -> str:
     """

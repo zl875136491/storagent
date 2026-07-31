@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from starlette.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
 
 from src.api import register_api
 from src.core.database import init_db, close_db
@@ -95,9 +96,15 @@ def create_app() -> FastAPI:
   app.add_middleware(RequestContextMiddleware)
 
   if settings.BACKEND_CORS_ORIGINS:
+    cors_origins = [str(origin).rstrip("/") for origin in settings.BACKEND_CORS_ORIGINS]
+    front = settings.FRONT_URL.rstrip("/")
+    parsed_front = urlparse(front)
+    if parsed_front.scheme in ("http", "https") and parsed_front.netloc:
+      if front not in cors_origins:
+        cors_origins.append(front)
     app.add_middleware(
       CORSMiddleware,
-      allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
+      allow_origins=cors_origins,
       allow_credentials=True,
       allow_methods=["*"],
       allow_headers=["*"],

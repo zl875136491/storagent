@@ -1,3 +1,4 @@
+import asyncio
 import secrets
 from typing import Type
 from loguru import logger
@@ -49,11 +50,19 @@ async def import_user_from_springboard(username: str) -> dict | None:
       }
     }
   api_url = settings.USER_INFO_URL + "?itcode=" + username
-  response = requests_get(api_url, timeout=3)
+  try:
+    response = await asyncio.to_thread(requests_get, api_url, timeout=3)
+  except Exception as exc:
+    logger.error(f"Import User from Springboard Error: {exc}")
+    return None
   if response.status_code != 200:
     logger.error(f"Import User from Springboard Error: {response.text}")
     return None
-  return response.json()
+  try:
+    return response.json()
+  except ValueError:
+    logger.error("Import User from Springboard Error: invalid JSON response")
+    return None
 
 def convert_utc_to_local_str(dt: datetime) -> str:
   """

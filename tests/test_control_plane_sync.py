@@ -41,6 +41,7 @@ def test_user_entry_encrypts_password_hash_and_uses_role_names(monkeypatch):
   user = SimpleNamespace(
     name="Alice",
     hashed_password="$2b$04$hash",
+    auth_version=3,
     roles=[SimpleNamespace(name="user"), SimpleNamespace(name="admin")],
     created_at=now,
     updated_at=now,
@@ -50,6 +51,7 @@ def test_user_entry_encrypts_password_hash_and_uses_role_names(monkeypatch):
   assert entry["hashed_password_enc"].startswith("enc:v1:")
   assert "$2b$04$hash" not in entry["hashed_password_enc"]
   assert entry["role_names"] == ["admin", "user"]
+  assert entry["auth_version"] == 3
   assert entry["origin_region"] == "shenzhen"
 
 

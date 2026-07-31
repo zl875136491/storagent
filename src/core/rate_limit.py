@@ -62,3 +62,13 @@ def rate_limit_locate(request: Request) -> None:
 def rate_limit_ai(request: Request, username: str) -> None:
   ip = _client_ip(request)
   check_rate_limit(f"ai:{username}:{ip}", limit=30, window_seconds=60.0)
+
+
+def rate_limit_oa_request(request: Request, username: str) -> None:
+  ip = _client_ip(request)
+  check_rate_limit(f"oa-request:{username}:{ip}", limit=5, window_seconds=600.0)
+
+
+def rate_limit_oa_verify(request: Request, username: str) -> None:
+  ip = _client_ip(request)
+  check_rate_limit(f"oa-verify:{username}:{ip}", limit=30, window_seconds=60.0)
