@@ -1,7 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, Form, Request
-from src.core.auth import get_current_app
+from src.core.auth import get_current_app_context
 from src.core.rate_limit import rate_limit_locate
 from src.modules.auth.model import User
 from src.modules.files import schema as files_schema
@@ -15,10 +15,10 @@ router = APIRouter()
   summary="初始化分片上传")
 async def multipart_init(
   payload: files_schema.MultipartInitRequest,
-  app_name: str = Depends(get_current_app),
+  app_context: dict = Depends(get_current_app_context),
 ) -> files_schema.MultipartInitResponse:
   content_type = payload.content_type
-  return await files_service.multipart_init(app_name, content_type)
+  return await files_service.multipart_init(app_context, content_type)
 
 
 @router.post(
@@ -31,10 +31,10 @@ async def multipart_upload_part(
   object_key: str = Form(...),
   part_number: int = Form(...),
   file: UploadFile = File(...),
-  app_name: str = Depends(get_current_app),
+  app_context: dict = Depends(get_current_app_context),
 ) -> files_schema.MultipartPartResponse:
   return await files_service.multipart_upload_part(
-    app_name=app_name,
+    app_context=app_context,
     upload_id=upload_id,
     object_key=object_key,
     part_number=part_number,
@@ -48,13 +48,13 @@ async def multipart_upload_part(
 )
 async def multipart_complete(
   payload: files_schema.MultipartCompleteRequest,
-  app_name: str = Depends(get_current_app),
+  app_context: dict = Depends(get_current_app_context),
 ) -> files_schema.MultipartCompleteResponse:
   upload_id = payload.upload_id
   object_key = payload.object_key
   parts = payload.parts
   return await files_service.multipart_complete(
-    app_name=app_name,
+    app_context=app_context,
     upload_id=upload_id,
     object_key=object_key,
     parts=parts,
@@ -67,9 +67,9 @@ async def multipart_complete(
 )
 async def multipart_abort(
   body: files_schema.MultipartAbortRequest,
-  app_name: str = Depends(get_current_app),
+  app_context: dict = Depends(get_current_app_context),
 ) -> dict:
-  return await files_service.multipart_abort(body, app_name)
+  return await files_service.multipart_abort(body, app_context)
 
 
 @router.get(
@@ -81,9 +81,9 @@ async def multipart_list_parts(
   upload_id: str = Query(...),
   object_key: str = Query(...),
   part_number_marker: Optional[str] = Query(None),
-  app_name: str = Depends(get_current_app)) -> files_schema.MultipartListPartsResponse:
+  app_context: dict = Depends(get_current_app_context)) -> files_schema.MultipartListPartsResponse:
   return await files_service.multipart_list_parts(
-    app_name, object_key, upload_id, part_number_marker,
+    app_context, object_key, upload_id, part_number_marker,
   )
 
 
@@ -97,13 +97,13 @@ async def object_locate(
   object_key: str = Query(..., description="对象键"),
   offset: int = Query(0, ge=0, description="下载起始字节（用于生成 download_url）"),
   length: int = Query(0, ge=0, description="下载长度（用于生成 download_url）"),
-  app_name: str = Depends(get_current_app),
+  app_context: dict = Depends(get_current_app_context),
 ) -> files_schema.ObjectLocateResponse:
   """
   扫描所有 MinIO 服务点，返回对象存在的位置及对应 stat/download 指引 URL。
   """
   rate_limit_locate(request)
-  return await files_service.locate_object(app_name, object_key, offset, length)
+  return await files_service.locate_object(app_context["app_name"], object_key, offset, length)
 
 
 @router.post(
@@ -113,9 +113,9 @@ async def object_locate(
 )
 async def object_stat(
   payload: files_schema.ObjectStatRequest,
-  app_name: str = Depends(get_current_app),
+  app_context: dict = Depends(get_current_app_context),
 ) -> files_schema.ObjectStatResponse:
-  return await files_service.stat_object(app_name, payload.object_key)
+  return await files_service.stat_object(app_context["app_name"], payload.object_key)
 
 
 @router.get(
@@ -131,6 +131,6 @@ async def download_chunk(
     ge=0,
     description="读取长度；0 表示从 offset 读到末尾（流式）",
   ),
-  app_name: str = Depends(get_current_app),
+  app_context: dict = Depends(get_current_app_context),
 ):
-  return await files_service.download_chunk(app_name, object_key, offset, length)
+  return await files_service.download_chunk(app_context, object_key, offset, length)

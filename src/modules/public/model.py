@@ -83,6 +83,27 @@ class APIKeyUsage(Document):
   data: List[APIKeyUsageData] = Field(default=[]) # 最大3000条数据
   full_at: datetime | None = Field(default=None) # 满3000条数据的时间
 
+
+class APIUsageEvent(Document):
+  """一次成功上传或下载请求产生的持久化用量事件。"""
+  api_key_id: str
+  api_key_hint: str = Field(default="")
+  app_name: str
+  app_shown_name: str = Field(default="")
+  operation: Literal["upload", "download"]
+  bytes_transferred: int = Field(default=0, ge=0)
+  region: str
+  occurred_at: datetime = Field(default_factory=utc_now)
+
+  class Settings:
+    name = "api_usage_event"
+    indexes = [
+      IndexModel([("occurred_at", -1)]),
+      IndexModel([("api_key_id", 1), ("occurred_at", -1)]),
+      IndexModel([("app_name", 1), ("occurred_at", -1)]),
+      IndexModel([("region", 1), ("occurred_at", -1)]),
+    ]
+
 class SystemConfig(Document):
   key: str
   value: str

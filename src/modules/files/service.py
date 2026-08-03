@@ -12,6 +12,7 @@ from src.core.minio_op import get_minio_client
 from src.modules.storage import crud as storage_crud
 from src.modules.files import schema as files_schema
 from src.modules.files import locate as files_locate
+from src.modules.usage.service import record_transfer
 
 _READ_CHUNK = 1024 * 1024
 
@@ -38,8 +39,9 @@ async def _get_minio_client():
 
 
 async def multipart_init(
-  app_name: str,
+  app_context: dict,
   content_type: str) -> files_schema.MultipartInitResponse:
+  app_name = app_context["app_name"]
   object_key = gen_object_key()
   client = await _get_minio_client()
   headers = {"Content-Type": content_type}
@@ -60,12 +62,13 @@ async def multipart_init(
 
 
 async def multipart_upload_part(
-  app_name: str,
+  app_context: dict,
   object_key: str,
   upload_id: str,
   part_number: int,
   file: UploadFile,
 ) -> files_schema.MultipartPartResponse:
+  app_name = app_context["app_name"]
   if part_number < 1 or part_number > 10000:
     raise CustomException(ErrorDesc.INVALID_PARAMS, "part_number 必须在 1-10000 之间")
   key = object_key.strip()
@@ -80,6 +83,7 @@ async def multipart_upload_part(
   except Exception as e:
     raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
 
+  await record_transfer(app_context, "upload", len(data))
   return files_schema.MultipartPartResponse(
     part_number=part_number,
     etag=_normalize_etag(etag),
@@ -87,13 +91,14 @@ async def multipart_upload_part(
 
 
 async def multipart_complete(
-  app_name: str,
+  app_context: dict,
   upload_id: str,
   object_key: str,
   parts: List[files_schema.MultipartPartItem]) -> files_schema.MultipartCompleteResponse:
   """
   完成分片上传
   """
+  app_name = app_context["app_name"]
   parts_sorted = sorted(parts, key=lambda p: p.part_number)
   parts = [
     Part(part_number=p.part_number, etag=_normalize_etag(p.etag))
@@ -118,7 +123,8 @@ async def multipart_complete(
 
 
 async def multipart_abort(body: files_schema.MultipartAbortRequest,
-  app_name: str) -> dict:
+  app_context: dict) -> dict:
+  app_name = app_context["app_name"]
   b = app_name
   object_key = body.object_key.strip()
   client = await _get_minio_client()
@@ -135,11 +141,12 @@ async def multipart_abort(body: files_schema.MultipartAbortRequest,
 
 
 async def multipart_list_parts(
-  app_name: str,
+  app_context: dict,
   object_key: str,
   upload_id: str,
   part_number_marker: Optional[str],
 ) -> files_schema.MultipartListPartsResponse:
+  app_name = app_context["app_name"]
   b = app_name
   key = object_key.strip()
   client = await _get_minio_client()
@@ -207,7 +214,7 @@ async def stat_object(
 
 
 async def download_chunk(
-  app_name: str,
+  app_context: dict,
   object_key: str,
   offset: int,
   length: int) -> Response | StreamingResponse:
@@ -216,6 +223,7 @@ async def download_chunk(
   offset=0 且 length=0 表示整对象流式下载。
   本节点不存在时返回其他服务点的下载指引（见 OBJECT_NOT_FOUND_LOCAL）。
   """
+  app_name = app_context["app_name"]
   b = app_name
   key = object_key.strip()
 
@@ -250,6 +258,7 @@ async def download_chunk(
       out_headers["Content-Length"] = resp_headers["content-length"]
     media = resp_headers.get("content-type", "application/octet-stream")
     code = 206 if status == 206 else 200
+    await record_transfer(app_context, "download", len(data))
     return Response(
       content=data,
       media_type=media,
@@ -259,20 +268,32 @@ async def download_chunk(
 
   content_type = stat.content_type or "application/octet-stream"
 
-  def _sync_gen():
-    resp = client.get_object(b, key, offset=offset, length=0)
+  async def _stream_with_usage():
+    resp = await asyncio.to_thread(
+      client.get_object,
+      b,
+      key,
+      offset=offset,
+      length=0,
+    )
+    transferred = 0
+    completed = False
     try:
       while True:
-        chunk = resp.read(_READ_CHUNK)
+        chunk = await asyncio.to_thread(resp.read, _READ_CHUNK)
         if not chunk:
           break
+        transferred += len(chunk)
         yield chunk
+      completed = True
     finally:
       resp.close()
       resp.release_conn()
+      if transferred or completed:
+        await record_transfer(app_context, "download", transferred)
 
   return StreamingResponse(
-    _sync_gen(),
+    _stream_with_usage(),
     media_type=content_type,
   )
 

@@ -232,7 +232,9 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:
 from fastapi.security import APIKeyHeader
 from src.modules.public import crud as public_crud
 from src.utils.helpers import before_compare
-async def get_current_app(api_key: str = Depends(APIKeyHeader(name="x-api-key"))) -> str:
+async def get_current_app_context(
+  api_key: str = Depends(APIKeyHeader(name="x-api-key")),
+) -> dict:
   """
   从请求头中提取 API-KEY 字段作为输入源
   """
@@ -248,7 +250,23 @@ async def get_current_app(api_key: str = Depends(APIKeyHeader(name="x-api-key"))
     application_obj = await public_crud.read_application_by_id(application_obj.ref.id)
   if not isinstance(application_obj, Application):
     raise CustomException(ErrorDesc.API_KEY_INVALID, "API-KEY 关联的应用不存在")
-  if application_obj.enabled:
-    return application_obj.name
-  else:
+  if not application_obj.enabled:
     raise CustomException(ErrorDesc.APP_NOT_ENABLED, "应用未启用")
+  return {
+    "app_name": application_obj.name,
+    "app_shown_name": application_obj.shown_name or application_obj.name,
+    # APIKey Mongo ObjectId 在各区不同；哈希 Key 在 Etcd 同步后保持一致。
+    "api_key_id": str(
+      getattr(api_key_obj, "key", "")
+      or getattr(api_key_obj, "id", "")
+    ),
+    "api_key_hint": getattr(api_key_obj, "key_hint", "") or "",
+  }
+
+
+async def get_current_app(
+  api_key: str = Depends(APIKeyHeader(name="x-api-key")),
+) -> str:
+  """兼容现有文件服务：仅返回 APIKey 绑定的 APP 名称。"""
+  context = await get_current_app_context(api_key)
+  return str(context["app_name"])
