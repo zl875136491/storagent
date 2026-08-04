@@ -314,6 +314,47 @@ def _rate_by_arn(replication_stats: dict[str, Any]) -> dict[str, float]:
   return result
 
 
+def parse_replication_resync_status(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+  """Normalize mc resync status entries and index them by remote ARN."""
+  resync_info = payload.get("resyncInfo")
+  if not isinstance(resync_info, dict):
+    return {}
+  targets = resync_info.get("target")
+  if not isinstance(targets, list):
+    return {}
+
+  status_map = {
+    "ongoing": "running",
+    "running": "running",
+    "pending": "running",
+    "started": "running",
+    "starting": "running",
+    "completed": "completed",
+    "complete": "completed",
+    "failed": "failed",
+    "cancelled": "failed",
+    "canceled": "failed",
+  }
+  result: dict[str, dict[str, Any]] = {}
+  for item in targets:
+    if not isinstance(item, dict):
+      continue
+    arn = str(item.get("arn") or "")
+    if not arn:
+      continue
+    raw_status = str(item.get("resyncStatus") or "").strip().lower()
+    result[arn] = {
+      "resync_status": status_map.get(raw_status, "unknown"),
+      "resync_reset_id": str(item.get("resetid") or item.get("resetID") or ""),
+      "resync_started_at": _safe_datetime(item.get("startTime")),
+      "resync_updated_at": _safe_datetime(item.get("endTime")),
+      "resync_completed_bytes": _as_int(item.get("completedReplicationSize")),
+      "resync_object_count": _as_int(item.get("replicationCount")),
+      "resync_current_object": str(item.get("object") or ""),
+    }
+  return result
+
+
 def parse_replication_source(
   source: str,
   payload: dict[str, Any],
@@ -321,6 +362,8 @@ def parse_replication_source(
   server_names: list[str],
   endpoints: dict[str, str],
   elapsed_ms: float,
+  resync_by_arn: dict[str, dict[str, Any]] | None = None,
+  resync_status_known: bool = True,
 ) -> dict[str, Any]:
   replication_stats = payload.get("replicationstats")
   if not isinstance(replication_stats, dict):
@@ -334,6 +377,7 @@ def parse_replication_source(
   failed_totals = failed.get("totals") if isinstance(failed.get("totals"), dict) else {}
   stats_by_arn = current.get("Stats") if isinstance(current.get("Stats"), dict) else {}
   rates = _rate_by_arn(replication_stats)
+  resync_by_arn = resync_by_arn or {}
 
   mrf_failed = 0
   retries_total = 0
@@ -368,6 +412,9 @@ def parse_replication_source(
       "degraded" if failed_count else ("syncing" if rates.get(arn, 0) > 0 else "healthy")
     )
     latency = target.get("latency") if isinstance(target.get("latency"), dict) else {}
+    resync = resync_by_arn.get(arn) or {
+      "resync_status": "idle" if resync_status_known else "unknown",
+    }
     targets.append({
       "source": source,
       "target": target_name,
@@ -385,6 +432,7 @@ def parse_replication_source(
       "failed_count": failed_count,
       "failed_bytes": _as_int(target_failed_totals.get("bytes")),
       "current_rate_bps": rates.get(arn, 0.0),
+      **resync,
     })
 
   expected_targets = [name for name in server_names if name != source]
@@ -461,11 +509,19 @@ async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
 
   async def inspect(bucket_name: str, source: str) -> dict[str, Any]:
     async with semaphore:
-      success, payload, error, elapsed_ms = await minio_op.get_bucket_replication_metrics(
-        source,
-        bucket_name,
-        timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+      metrics_result, resync_result = await asyncio.gather(
+        minio_op.get_bucket_replication_metrics(
+          source,
+          bucket_name,
+          timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+        ),
+        minio_op.get_bucket_replication_resync_status(
+          source,
+          bucket_name,
+          timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+        ),
       )
+    success, payload, error, elapsed_ms = metrics_result
     if not success:
       return {
         "server": source,
@@ -477,12 +533,19 @@ async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
         "actual_target_count": 0,
         "targets": [],
       }
+    resync_success, resync_payload, _, _ = resync_result
     return parse_replication_source(
       source,
       payload,
       server_names=server_names,
       endpoints=endpoints,
       elapsed_ms=elapsed_ms,
+      resync_by_arn=(
+        parse_replication_resync_status(resync_payload)
+        if resync_success
+        else {}
+      ),
+      resync_status_known=resync_success,
     )
 
   tasks = {
@@ -556,6 +619,40 @@ async def reconcile_bucket_replication(bucket: str, actor: str) -> dict[str, Any
   }
 
 
+async def _read_running_resync(
+  source: str,
+  bucket: str,
+  remote_arn: str,
+) -> dict[str, Any] | None:
+  success, payload, _, _ = await minio_op.get_bucket_replication_resync_status(
+    source,
+    bucket,
+    remote_arn,
+    timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+  )
+  if not success:
+    return None
+  detail = parse_replication_resync_status(payload).get(remote_arn)
+  if not detail or detail.get("resync_status") != "running":
+    return None
+  return detail
+
+
+def _running_resync_response(
+  bucket: str,
+  source: str,
+  target: str,
+  detail: dict[str, Any],
+) -> dict[str, Any]:
+  return {
+    "message": "对象补传任务正在运行",
+    "bucket": bucket,
+    "source_server": source,
+    "target_server": target,
+    "detail": {**detail, "already_running": True},
+  }
+
+
 async def start_replication_resync(
   bucket: str,
   source_server: str,
@@ -595,13 +692,36 @@ async def start_replication_resync(
   if not remote or not remote.get("arn"):
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "该复制链路不存在，无法启动补传")
 
+  remote_arn = str(remote["arn"])
+  running = await _read_running_resync(source, bucket_name, remote_arn)
+  if running:
+    audit.audit(
+      "replication.resync",
+      actor=actor,
+      resource=f"{bucket_name}:{source}->{target}",
+      detail={**running, "already_running": True},
+    )
+    return _running_resync_response(bucket_name, source, target, running)
+
   success, detail, error, _ = await minio_op.start_bucket_replication_resync(
     source,
     bucket_name,
-    str(remote["arn"]),
+    remote_arn,
     older_than=older_than,
     timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
   )
+  if not success:
+    # MinIO rejects a second start while the first request is racing to become
+    # visible. Re-read authoritative status and treat that case as idempotent.
+    running = await _read_running_resync(source, bucket_name, remote_arn)
+    if running:
+      audit.audit(
+        "replication.resync",
+        actor=actor,
+        resource=f"{bucket_name}:{source}->{target}",
+        detail={**running, "already_running": True},
+      )
+      return _running_resync_response(bucket_name, source, target, running)
   audit.audit(
     "replication.resync",
     actor=actor,

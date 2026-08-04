@@ -100,6 +100,7 @@ class BucketReplicateDeleteRequest(BaseModel):
 
 
 OperationStatus = Literal["healthy", "syncing", "degraded", "critical", "unreachable"]
+ReplicationResyncStatus = Literal["idle", "running", "completed", "failed", "unknown"]
 
 
 class ReplicationTargetMetric(BaseModel):
@@ -119,6 +120,13 @@ class ReplicationTargetMetric(BaseModel):
   failed_count: int = 0
   failed_bytes: int = 0
   current_rate_bps: float = 0
+  resync_status: ReplicationResyncStatus = "idle"
+  resync_reset_id: str = ""
+  resync_started_at: datetime | None = None
+  resync_updated_at: datetime | None = None
+  resync_completed_bytes: int = 0
+  resync_object_count: int = 0
+  resync_current_object: str = ""
 
 
 class ReplicationSourceMetric(BaseModel):
