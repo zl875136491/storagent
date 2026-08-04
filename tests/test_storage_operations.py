@@ -112,6 +112,18 @@ def test_parse_replication_source_exposes_queue_failures_and_latency():
     server_names=["beijing", "hangzhou"],
     endpoints={"10.31.133.207:9000": "hangzhou"},
     elapsed_ms=8,
+    resync_by_arn=operations.parse_replication_resync_status({
+      "resyncInfo": {"target": [{
+        "arn": arn,
+        "resetid": "reset-1",
+        "startTime": "2026-08-04T03:40:26Z",
+        "endTime": "2026-08-04T03:41:26Z",
+        "resyncStatus": "Ongoing",
+        "completedReplicationSize": 4096,
+        "replicationCount": 7,
+        "object": "object-key",
+      }]},
+    }),
   )
 
   assert result["status"] == "degraded"
@@ -123,6 +135,10 @@ def test_parse_replication_source_exposes_queue_failures_and_latency():
   assert target["latency_current_ms"] == 5
   assert target["total_downtime_seconds"] == 2
   assert target["current_rate_bps"] == 1024.5
+  assert target["resync_status"] == "running"
+  assert target["resync_reset_id"] == "reset-1"
+  assert target["resync_completed_bytes"] == 4096
+  assert target["resync_object_count"] == 7
   schema.ReplicationSourceMetric.model_validate(result)
 
 
@@ -237,3 +253,100 @@ async def test_resync_command_uses_argv_and_remote_arn(monkeypatch):
     "--remote-bucket", "arn:minio:replication::abc:system-test",
     "--older-than", "7d12h",
   ]
+
+
+@pytest.mark.asyncio
+async def test_start_resync_returns_existing_running_task(monkeypatch):
+  arn = "arn:minio:replication::shenzhen:one-v2"
+  servers = [
+    SimpleNamespace(name="beijing", host="10.32.129.241", minio_port=9000),
+    SimpleNamespace(name="shenzhen", host="10.41.102.223", minio_port=9000),
+  ]
+
+  async def read_servers():
+    return servers
+
+  async def read_metrics(_source, _bucket, *, timeout):
+    assert timeout > 0
+    return True, {
+      "remoteTargets": [{"arn": arn, "endpoint": "10.41.102.223:9000"}],
+    }, "", 1.0
+
+  async def read_status(_source, _bucket, _arn=None, *, timeout):
+    assert _arn == arn
+    assert timeout > 0
+    return True, {
+      "resyncInfo": {"target": [{
+        "arn": arn,
+        "resyncStatus": "Ongoing",
+        "replicationCount": 807,
+        "completedReplicationSize": 34_643_839_580,
+      }]},
+    }, "", 1.0
+
+  async def should_not_start(*_args, **_kwargs):
+    pytest.fail("an existing resync must not be started again")
+
+  monkeypatch.setattr(operations.storage_crud, "read_minio_server_list", read_servers)
+  monkeypatch.setattr(operations.minio_op, "get_bucket_replication_metrics", read_metrics)
+  monkeypatch.setattr(operations.minio_op, "get_bucket_replication_resync_status", read_status)
+  monkeypatch.setattr(operations.minio_op, "start_bucket_replication_resync", should_not_start)
+  monkeypatch.setattr(operations.audit, "audit", lambda *_args, **_kwargs: None)
+
+  result = await operations.start_replication_resync(
+    "one-v2",
+    "beijing",
+    "shenzhen",
+    None,
+    "admin",
+  )
+
+  assert result["message"] == "对象补传任务正在运行"
+  assert result["detail"]["already_running"] is True
+  assert result["detail"]["resync_status"] == "running"
+  assert result["detail"]["resync_object_count"] == 807
+
+
+@pytest.mark.asyncio
+async def test_start_resync_handles_concurrent_start_as_idempotent(monkeypatch):
+  arn = "arn:minio:replication::shenzhen:one-v2"
+  servers = [
+    SimpleNamespace(name="beijing", host="10.32.129.241", minio_port=9000),
+    SimpleNamespace(name="shenzhen", host="10.41.102.223", minio_port=9000),
+  ]
+  status_calls = 0
+
+  async def read_servers():
+    return servers
+
+  async def read_metrics(*_args, **_kwargs):
+    return True, {
+      "remoteTargets": [{"arn": arn, "endpoint": "10.41.102.223:9000"}],
+    }, "", 1.0
+
+  async def read_status(*_args, **_kwargs):
+    nonlocal status_calls
+    status_calls += 1
+    targets = [] if status_calls == 1 else [{"arn": arn, "resyncStatus": "Ongoing"}]
+    return True, {"resyncInfo": {"target": targets}}, "", 1.0
+
+  async def start(*_args, **_kwargs):
+    return False, {}, "Resync is already in progress", 1.0
+
+  monkeypatch.setattr(operations.storage_crud, "read_minio_server_list", read_servers)
+  monkeypatch.setattr(operations.minio_op, "get_bucket_replication_metrics", read_metrics)
+  monkeypatch.setattr(operations.minio_op, "get_bucket_replication_resync_status", read_status)
+  monkeypatch.setattr(operations.minio_op, "start_bucket_replication_resync", start)
+  monkeypatch.setattr(operations.audit, "audit", lambda *_args, **_kwargs: None)
+
+  result = await operations.start_replication_resync(
+    "one-v2",
+    "beijing",
+    "shenzhen",
+    None,
+    "admin",
+  )
+
+  assert status_calls == 2
+  assert result["message"] == "对象补传任务正在运行"
+  assert result["detail"]["already_running"] is True
