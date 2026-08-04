@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 from src.modules.public.schema import PydanticObjectId
 from datetime import datetime
 class MinioServerCreateRequest(BaseModel):
@@ -47,6 +47,10 @@ class BucketInfo(BaseModel):
 
 class ServerDetailsResponse(BaseModel):
   data: List[BucketInfo] = Field(..., description="文件详情")
+  cache_hit: bool = Field(False, description="是否命中 Mongo 缓存")
+  cached_at: datetime = Field(..., description="缓存生成时间")
+  expires_at: datetime = Field(..., description="缓存过期时间")
+  ttl_seconds: int = Field(600, ge=1, description="缓存有效期")
 
 class SimpleAppInfo(BaseModel):
   shown_name: Optional[str] = Field(None, description="应用显示名称")
@@ -93,3 +97,177 @@ class BucketReplicateDeleteRequest(BaseModel):
   from_server: str = Field(alias="from", min_length=1, max_length=128, description="源站点别名")
   to_server: str = Field(alias="to", min_length=1, max_length=128, description="目标站点别名")
   rule_id: str | None = Field(None, max_length=128, description="复制规则 ID；缺省时按 from/to 查找")
+
+
+OperationStatus = Literal["healthy", "syncing", "degraded", "critical", "unreachable"]
+
+
+class ReplicationTargetMetric(BaseModel):
+  source: str
+  target: str
+  arn: str
+  endpoint: str
+  status: OperationStatus
+  online: bool
+  latency_current_ms: float = 0
+  latency_average_ms: float = 0
+  latency_maximum_ms: float = 0
+  total_downtime_seconds: float = 0
+  last_online: datetime | None = None
+  replication_count: int = 0
+  completed_bytes: int = 0
+  failed_count: int = 0
+  failed_bytes: int = 0
+  current_rate_bps: float = 0
+
+
+class ReplicationSourceMetric(BaseModel):
+  server: str
+  status: OperationStatus
+  reachable: bool
+  command_latency_ms: float = 0
+  error: str = ""
+  queued_count: int = 0
+  queued_bytes: int = 0
+  failed_count: int = 0
+  failed_bytes: int = 0
+  mrf_failed_last_5m: int = 0
+  retries_total: int = 0
+  current_rate_bps: float = 0
+  expected_target_count: int = 0
+  actual_target_count: int = 0
+  targets: list[ReplicationTargetMetric] = Field(default_factory=list)
+
+
+class ReplicationBucketMetric(BaseModel):
+  bucket: str
+  shown_name: str = ""
+  status: OperationStatus
+  sources: list[ReplicationSourceMetric]
+
+
+class ReplicationOperationsSummary(BaseModel):
+  status: OperationStatus
+  bucket_count: int = 0
+  source_count: int = 0
+  reachable_source_count: int = 0
+  expected_link_count: int = 0
+  actual_link_count: int = 0
+  online_link_count: int = 0
+  queued_count: int = 0
+  queued_bytes: int = 0
+  failed_count: int = 0
+  failed_bytes: int = 0
+  mrf_failed_last_5m: int = 0
+  current_rate_bps: float = 0
+
+
+class ReplicationOperationsResponse(BaseModel):
+  generated_at: datetime
+  servers: list[str]
+  summary: ReplicationOperationsSummary
+  buckets: list[ReplicationBucketMetric]
+
+
+class ReplicationResyncRequest(BaseModel):
+  source_server: str = Field(..., min_length=1, max_length=128)
+  target_server: str = Field(..., min_length=1, max_length=128)
+  older_than: str | None = Field(None, max_length=64, description="可选 mc 时长，如 7d12h")
+
+
+class ReplicationOperationResponse(BaseModel):
+  message: str
+  bucket: str
+  source_server: str | None = None
+  target_server: str | None = None
+  detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class ClusterDriveHealth(BaseModel):
+  endpoint: str
+  path: str = ""
+  state: str
+  total_bytes: int = 0
+  used_bytes: int = 0
+  available_bytes: int = 0
+  waiting_operations: int = 0
+
+
+class ClusterHealthItem(BaseModel):
+  id: str
+  server: str
+  region: str
+  shown_name: str
+  endpoint: str
+  status: Literal["online", "degraded", "offline"]
+  reachable: bool
+  error: str = ""
+  checked_at: datetime
+  command_latency_ms: float = 0
+  version: str = ""
+  uptime_seconds: int = 0
+  bucket_count: int = 0
+  object_count: int = 0
+  version_count: int = 0
+  delete_marker_count: int = 0
+  logical_usage_bytes: int = 0
+  raw_capacity_bytes: int = 0
+  raw_used_bytes: int = 0
+  online_disks: int = 0
+  offline_disks: int = 0
+  healing_disks: int = 0
+  drives: list[ClusterDriveHealth] = Field(default_factory=list)
+
+
+class ClusterHealthSummary(BaseModel):
+  status: Literal["online", "degraded", "offline"]
+  cluster_count: int = 0
+  online_clusters: int = 0
+  degraded_clusters: int = 0
+  offline_clusters: int = 0
+  online_disks: int = 0
+  offline_disks: int = 0
+  healing_disks: int = 0
+  raw_capacity_bytes: int = 0
+  raw_used_bytes: int = 0
+  logical_usage_bytes: int = 0
+  object_count: int = 0
+
+
+class ClusterHealthResponse(BaseModel):
+  generated_at: datetime
+  auto_heal_enabled: bool
+  auto_heal_authority_region: str
+  summary: ClusterHealthSummary
+  clusters: list[ClusterHealthItem]
+
+
+class StorageOperationItem(BaseModel):
+  id: str
+  kind: Literal["cluster_heal"]
+  status: Literal["queued", "running", "succeeded", "failed"]
+  server: str
+  bucket: str = ""
+  actor: str
+  message: str
+  result: dict[str, Any] = Field(default_factory=dict)
+  created_at: datetime
+  started_at: datetime | None = None
+  finished_at: datetime | None = None
+
+
+class StorageOperationListResponse(BaseModel):
+  data: list[StorageOperationItem]
+
+
+class ClusterHealStatusResponse(BaseModel):
+  server: str
+  reachable: bool
+  status: str
+  scanned_items: int = 0
+  offline_nodes: list[str] = Field(default_factory=list)
+  heal_disks: list[dict[str, Any]] = Field(default_factory=list)
+  sets: list[dict[str, Any]] = Field(default_factory=list)
+  error: str = ""
+  checked_at: datetime
+  latest_operation: StorageOperationItem | None = None

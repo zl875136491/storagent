@@ -13,6 +13,10 @@ from src.core.sync import reconcile_replication_policies_task
 from src.core.exception import register_exception
 from src.core.middleware import RequestContextMiddleware
 from src.modules.auth.crud import cleanup_expired_tokens_task
+from src.modules.storage.operations import (
+  monitor_cluster_health_task,
+  shutdown_background_operations,
+)
 import asyncio
 
 app_description = """
@@ -60,12 +64,17 @@ async def lifespan(app: FastAPI):
     reconcile_replication_policies_task()
   )
 
+  # 9. 权威区域监控 MinIO 磁盘健康，并记录原生自愈状态
+  cluster_health_job = asyncio.create_task(monitor_cluster_health_task())
+
   yield
   
   watch_job.cancel()
   reconcile_job.cancel()
   cleanup_job.cancel()
   replication_reconcile_job.cancel()
+  cluster_health_job.cancel()
+  await shutdown_background_operations()
   try:
     await etcd_client.close()
   except Exception:

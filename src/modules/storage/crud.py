@@ -1,6 +1,11 @@
 from typing import List
 from bson import ObjectId
-from src.modules.storage.model import MinioServer
+from beanie.operators import In
+from src.modules.storage.model import (
+  MinioServer,
+  ServerFileDetailsCache,
+  StorageOperation,
+)
 from src.modules.public.model import Region
 from src.modules.public.model import Application
 from src.modules.storage.model import MinioBucket
@@ -9,6 +14,40 @@ from src.core.crypto import encrypt_secret, minio_server_plain_credentials
 from loguru import logger
 from src.utils.helpers import try_to_obj_id
 from src.configs.configs import settings
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+import json
+import zlib
+from uuid import uuid4
+
+
+_CACHE_CHUNK_BYTES = 8 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ServerFileDetailsSnapshot:
+  data: list[dict[str, Any]]
+  fetched_at: datetime
+  expires_at: datetime
+  generation: str
+
+
+def _encode_server_file_details(data: list[dict[str, Any]]) -> bytes:
+  serialized = json.dumps(
+    data,
+    ensure_ascii=False,
+    separators=(",", ":"),
+    default=str,
+  ).encode("utf-8")
+  return zlib.compress(serialized)
+
+
+def _decode_server_file_details(payload: bytes) -> list[dict[str, Any]]:
+  decoded = json.loads(zlib.decompress(payload).decode("utf-8"))
+  if not isinstance(decoded, list) or any(not isinstance(item, dict) for item in decoded):
+    raise ValueError("服务器文件详情缓存格式不合法")
+  return decoded
 
 async def create_minio_server(
   region: Region,
@@ -120,6 +159,136 @@ async def read_minio_server_names() -> List[str]:
     server_name = server_obj.name
     server_names.append(server_name)
   return server_names
+
+
+async def delete_expired_server_file_details(now: datetime) -> int:
+  result = await ServerFileDetailsCache.get_motor_collection().delete_many({
+    "expires_at": {"$lte": now},
+  })
+  return int(result.deleted_count)
+
+
+async def read_server_file_details_cache(
+  server_id: str,
+) -> ServerFileDetailsSnapshot | None:
+  latest = await ServerFileDetailsCache.find(
+    ServerFileDetailsCache.server_id == server_id
+  ).sort("-fetched_at").limit(1).to_list()
+  if not latest:
+    return None
+  head = latest[0]
+  chunks = await ServerFileDetailsCache.find(
+    ServerFileDetailsCache.server_id == server_id,
+    ServerFileDetailsCache.generation == head.generation,
+  ).sort("chunk_index").to_list()
+  if not chunks or any(item.chunk_index != index for index, item in enumerate(chunks)):
+    await ServerFileDetailsCache.get_motor_collection().delete_many({
+      "server_id": server_id,
+      "generation": head.generation,
+    })
+    return None
+  try:
+    data = _decode_server_file_details(b"".join(item.payload for item in chunks))
+  except (ValueError, TypeError, zlib.error, json.JSONDecodeError, UnicodeDecodeError):
+    await ServerFileDetailsCache.get_motor_collection().delete_many({
+      "server_id": server_id,
+      "generation": head.generation,
+    })
+    return None
+  return ServerFileDetailsSnapshot(
+    data=data,
+    fetched_at=head.fetched_at,
+    expires_at=head.expires_at,
+    generation=head.generation,
+  )
+
+
+async def write_server_file_details_cache(
+  server_id: str,
+  data: list[dict[str, Any]],
+  fetched_at: datetime,
+  expires_at: datetime,
+) -> ServerFileDetailsSnapshot:
+  generation = uuid4().hex
+  payload = _encode_server_file_details(data)
+  parts = [
+    payload[offset:offset + _CACHE_CHUNK_BYTES]
+    for offset in range(0, len(payload), _CACHE_CHUNK_BYTES)
+  ] or [b""]
+  chunks = [
+    ServerFileDetailsCache(
+      server_id=server_id,
+      generation=generation,
+      chunk_index=index,
+      payload=part,
+      fetched_at=fetched_at,
+      expires_at=expires_at,
+    )
+    for index, part in enumerate(parts)
+  ]
+  await ServerFileDetailsCache.insert_many(chunks)
+  # Keep a concurrently written newer generation; remove this server's older snapshots.
+  await ServerFileDetailsCache.get_motor_collection().delete_many({
+    "server_id": server_id,
+    "generation": {"$ne": generation},
+    "fetched_at": {"$lte": fetched_at},
+  })
+  return ServerFileDetailsSnapshot(
+    data=data,
+    fetched_at=fetched_at,
+    expires_at=expires_at,
+    generation=generation,
+  )
+
+
+async def delete_server_file_details_cache(server_id: str) -> int:
+  result = await ServerFileDetailsCache.get_motor_collection().delete_many({
+    "server_id": server_id,
+  })
+  return int(result.deleted_count)
+
+
+async def create_storage_operation(
+  *,
+  kind: str,
+  server: str,
+  actor: str,
+  bucket: str = "",
+) -> StorageOperation:
+  operation = StorageOperation(
+    kind=kind,
+    server=server,
+    bucket=bucket,
+    actor=actor,
+  )
+  await operation.insert()
+  return operation
+
+
+async def read_active_storage_operation(
+  kind: str,
+  server: str,
+) -> StorageOperation | None:
+  return await StorageOperation.find_one(
+    StorageOperation.kind == kind,
+    StorageOperation.server == server,
+    In(StorageOperation.status, ["queued", "running"]),
+  )
+
+
+async def read_latest_storage_operation(
+  kind: str,
+  server: str,
+) -> StorageOperation | None:
+  items = await StorageOperation.find(
+    StorageOperation.kind == kind,
+    StorageOperation.server == server,
+  ).sort("-created_at").limit(1).to_list()
+  return items[0] if items else None
+
+
+async def list_storage_operations(limit: int = 20) -> list[StorageOperation]:
+  return await StorageOperation.find_all().sort("-created_at").limit(limit).to_list()
 
 async def create_minio_bucket(
   region: Region,

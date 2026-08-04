@@ -3,7 +3,9 @@ from beanie.odm.fields import Link
 from pydantic import Field
 from pymongo import IndexModel
 from src.modules.public.model import Region, Application
-from datetime import datetime
+from src.utils.helpers import utc_now
+from datetime import datetime, timedelta
+from typing import Any, Literal
 
 class MinioServer(Document):
   """
@@ -65,6 +67,49 @@ class MinioEvent(Document):
       IndexModel(["bucket"]),
       IndexModel(["last_modified"]),
     ]
-    
-  
+
+
+class ServerFileDetailsCache(Document):
+  """One compressed chunk of a cached recursive MinIO inventory."""
+  server_id: str
+  generation: str
+  chunk_index: int = Field(ge=0)
+  payload: bytes
+  fetched_at: datetime = Field(default_factory=utc_now)
+  expires_at: datetime
+
+  class Settings:
+    # A new collection avoids inheriting the old one-document-per-server index.
+    name = "server_file_details_cache_v2"
+    indexes = [
+      IndexModel(
+        [("server_id", 1), ("generation", 1), ("chunk_index", 1)],
+        unique=True,
+      ),
+      IndexModel([("server_id", 1), ("fetched_at", -1)]),
+      IndexModel(["expires_at"], expireAfterSeconds=0),
+    ]
+
+
+class StorageOperation(Document):
+  """Persistent state for long-running MinIO maintenance operations."""
+  kind: Literal["cluster_heal"]
+  status: Literal["queued", "running", "succeeded", "failed"] = "queued"
+  server: str
+  bucket: str = ""
+  actor: str = "-"
+  message: str = ""
+  result: dict[str, Any] = Field(default_factory=dict)
+  created_at: datetime = Field(default_factory=utc_now)
+  started_at: datetime | None = None
+  finished_at: datetime | None = None
+  expires_at: datetime = Field(default_factory=lambda: utc_now() + timedelta(days=30))
+
+  class Settings:
+    name = "storage_operation"
+    indexes = [
+      IndexModel([("created_at", -1)]),
+      IndexModel([("kind", 1), ("server", 1), ("status", 1)]),
+      IndexModel(["expires_at"], expireAfterSeconds=0),
+    ]
   
