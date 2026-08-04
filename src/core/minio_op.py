@@ -2,6 +2,7 @@ import json
 import asyncio
 import shlex
 import subprocess
+from time import perf_counter
 from minio import Minio
 from typing import Any, List
 
@@ -36,6 +37,165 @@ async def _run_cmd(cmd):
   except subprocess.CalledProcessError as e:
     await create_shell_command_log(cmd, e.stdout or "", e.stderr or "")
     return False, e.stderr or e.stdout or str(e)
+
+
+def _mc_error_message(items: list[dict[str, Any]], fallback: str) -> str:
+  for item in reversed(items):
+    if item.get("status") != "error":
+      continue
+    error = item.get("error")
+    if isinstance(error, dict):
+      message = error.get("message")
+      cause = error.get("cause")
+      if isinstance(cause, dict) and cause.get("message"):
+        return f"{message}: {cause['message']}" if message else str(cause["message"])
+      if message:
+        return str(message)
+    if error:
+      return str(error)
+  return fallback.strip() or "MinIO 命令执行失败"
+
+
+async def run_mc_json(
+  args: list[str],
+  *,
+  timeout: float = 20.0,
+  record: bool = True,
+) -> tuple[bool, list[dict[str, Any]], str, float]:
+  """Run an mc command without a shell and parse its JSON-lines output."""
+  cmd = ["mc", *args]
+  if "--json" not in cmd:
+    cmd.append("--json")
+  command_text = shlex.join(cmd)
+  started = perf_counter()
+  try:
+    result = await asyncio.to_thread(
+      subprocess.run,
+      cmd,
+      shell=False,
+      check=False,
+      capture_output=True,
+      text=True,
+      timeout=max(float(timeout), 1.0),
+    )
+  except subprocess.TimeoutExpired as e:
+    elapsed_ms = (perf_counter() - started) * 1000
+    stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+    stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+    await create_shell_command_log(command_text, stdout, stderr or "command timed out")
+    return False, [], f"MinIO 命令超时（{timeout:g} 秒）", elapsed_ms
+  except Exception as e:
+    elapsed_ms = (perf_counter() - started) * 1000
+    await create_shell_command_log(command_text, "", str(e))
+    return False, [], str(e), elapsed_ms
+
+  elapsed_ms = (perf_counter() - started) * 1000
+  items: list[dict[str, Any]] = []
+  for line in result.stdout.splitlines():
+    line = line.strip()
+    if not line:
+      continue
+    try:
+      item = json.loads(line)
+    except json.JSONDecodeError:
+      continue
+    if isinstance(item, dict):
+      items.append(item)
+  has_error = any(item.get("status") == "error" for item in items)
+  if record or result.returncode != 0 or has_error:
+    await create_shell_command_log(command_text, result.stdout, result.stderr)
+  if result.returncode != 0 or has_error:
+    return False, items, _mc_error_message(items, result.stderr or result.stdout), elapsed_ms
+  if not items:
+    return False, [], "MinIO 命令未返回 JSON 数据", elapsed_ms
+  return True, items, "", elapsed_ms
+
+
+async def get_cluster_admin_info(
+  server_name: str,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, dict[str, Any], str, float]:
+  success, items, error, elapsed_ms = await run_mc_json(
+    ["admin", "info", server_name],
+    timeout=timeout,
+    record=False,
+  )
+  return success, (items[-1] if items else {}), error, elapsed_ms
+
+
+async def get_cluster_heal_info(
+  server_name: str,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, dict[str, Any], str, float]:
+  success, items, error, elapsed_ms = await run_mc_json(
+    ["admin", "heal", f"{server_name}/"],
+    timeout=timeout,
+    record=False,
+  )
+  return success, (items[-1] if items else {}), error, elapsed_ms
+
+
+async def run_cluster_heal(
+  server_name: str,
+  *,
+  timeout: float = 3600.0,
+) -> tuple[bool, list[dict[str, Any]], str, float]:
+  return await run_mc_json(
+    ["admin", "heal", "--force", f"{server_name}/"],
+    timeout=timeout,
+  )
+
+
+async def get_bucket_replication_metrics(
+  server_name: str,
+  bucket_name: str,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, dict[str, Any], str, float]:
+  success, items, error, elapsed_ms = await run_mc_json(
+    ["replicate", "status", f"{server_name}/{bucket_name}"],
+    timeout=timeout,
+    record=False,
+  )
+  return success, (items[-1] if items else {}), error, elapsed_ms
+
+
+async def start_bucket_replication_resync(
+  server_name: str,
+  bucket_name: str,
+  remote_arn: str,
+  *,
+  older_than: str | None = None,
+  timeout: float = 20.0,
+) -> tuple[bool, dict[str, Any], str, float]:
+  args = [
+    "replicate", "resync", "start", f"{server_name}/{bucket_name}",
+    "--remote-bucket", remote_arn,
+  ]
+  if older_than:
+    args.extend(["--older-than", older_than])
+  success, items, error, elapsed_ms = await run_mc_json(args, timeout=timeout)
+  return success, (items[-1] if items else {}), error, elapsed_ms
+
+
+async def get_bucket_replication_resync_status(
+  server_name: str,
+  bucket_name: str,
+  remote_arn: str | None = None,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, dict[str, Any], str, float]:
+  args = ["replicate", "resync", "status", f"{server_name}/{bucket_name}"]
+  if remote_arn:
+    args.extend(["--remote-bucket", remote_arn])
+  success, items, error, elapsed_ms = await run_mc_json(
+    args,
+    timeout=timeout,
+    record=False,
+  )
+  return success, (items[-1] if items else {}), error, elapsed_ms
 
 def get_minio_client(host: str, port: int, access_key: str, secret_key: str) -> Minio:
   """
@@ -115,7 +275,7 @@ async def create_bucket(server_name: str, bucket_name: str):
   if not success:
     raise CustomException(ErrorDesc.MINIO_CREATE_BUCKET_FAILED, str(err))
 
-async def get_buckets_info(client: Minio):
+def _get_buckets_info_sync(client: Minio) -> list[dict[str, Any]]:
   """
   获取存储桶文件列表
   
@@ -148,6 +308,11 @@ async def get_buckets_info(client: Minio):
       "files": file_tree
     })
   return results
+
+
+async def get_buckets_info(client: Minio) -> list[dict[str, Any]]:
+  """Collect a recursive inventory without blocking the FastAPI event loop."""
+  return await asyncio.to_thread(_get_buckets_info_sync, client)
 
 async def get_site_alias():
   """

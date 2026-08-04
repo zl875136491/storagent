@@ -1,6 +1,11 @@
 from typing import List
 from bson import ObjectId
-from src.modules.storage.model import MinioServer
+from beanie.operators import In
+from src.modules.storage.model import (
+  MinioServer,
+  ServerFileDetailsCache,
+  StorageOperation,
+)
 from src.modules.public.model import Region
 from src.modules.public.model import Application
 from src.modules.storage.model import MinioBucket
@@ -9,6 +14,8 @@ from src.core.crypto import encrypt_secret, minio_server_plain_credentials
 from loguru import logger
 from src.utils.helpers import try_to_obj_id
 from src.configs.configs import settings
+from datetime import datetime
+from typing import Any
 
 async def create_minio_server(
   region: Region,
@@ -120,6 +127,105 @@ async def read_minio_server_names() -> List[str]:
     server_name = server_obj.name
     server_names.append(server_name)
   return server_names
+
+
+async def delete_expired_server_file_details(now: datetime) -> int:
+  result = await ServerFileDetailsCache.get_motor_collection().delete_many({
+    "expires_at": {"$lte": now},
+  })
+  return int(result.deleted_count)
+
+
+async def read_server_file_details_cache(
+  server_id: str,
+) -> ServerFileDetailsCache | None:
+  return await ServerFileDetailsCache.find_one(
+    ServerFileDetailsCache.server_id == server_id
+  )
+
+
+async def write_server_file_details_cache(
+  server_id: str,
+  data: list[dict[str, Any]],
+  fetched_at: datetime,
+  expires_at: datetime,
+) -> ServerFileDetailsCache:
+  cache = await read_server_file_details_cache(server_id)
+  if cache:
+    cache.data = data
+    cache.fetched_at = fetched_at
+    cache.expires_at = expires_at
+    await cache.save()
+    return cache
+  cache = ServerFileDetailsCache(
+    server_id=server_id,
+    data=data,
+    fetched_at=fetched_at,
+    expires_at=expires_at,
+  )
+  try:
+    await cache.insert()
+    return cache
+  except Exception:
+    # A second worker may have populated the unique server cache meanwhile.
+    cache = await read_server_file_details_cache(server_id)
+    if not cache:
+      raise
+    cache.data = data
+    cache.fetched_at = fetched_at
+    cache.expires_at = expires_at
+    await cache.save()
+    return cache
+
+
+async def delete_server_file_details_cache(server_id: str) -> int:
+  result = await ServerFileDetailsCache.get_motor_collection().delete_many({
+    "server_id": server_id,
+  })
+  return int(result.deleted_count)
+
+
+async def create_storage_operation(
+  *,
+  kind: str,
+  server: str,
+  actor: str,
+  bucket: str = "",
+) -> StorageOperation:
+  operation = StorageOperation(
+    kind=kind,
+    server=server,
+    bucket=bucket,
+    actor=actor,
+  )
+  await operation.insert()
+  return operation
+
+
+async def read_active_storage_operation(
+  kind: str,
+  server: str,
+) -> StorageOperation | None:
+  return await StorageOperation.find_one(
+    StorageOperation.kind == kind,
+    StorageOperation.server == server,
+    In(StorageOperation.status, ["queued", "running"]),
+  )
+
+
+async def read_latest_storage_operation(
+  kind: str,
+  server: str,
+) -> StorageOperation | None:
+  items = await StorageOperation.find(
+    StorageOperation.kind == kind,
+    StorageOperation.server == server,
+  ).sort("-created_at").limit(1).to_list()
+  return items[0] if items else None
+
+
+async def list_storage_operations(limit: int = 20) -> list[StorageOperation]:
+  return await StorageOperation.find_all().sort("-created_at").limit(limit).to_list()
 
 async def create_minio_bucket(
   region: Region,

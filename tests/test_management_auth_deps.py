@@ -17,6 +17,9 @@ def test_storage_write_routes_require_user():
     storage_route.update_minio_server,
     storage_route.create_bucket_replicate,
     storage_route.delete_bucket_replicate,
+    storage_route.reconcile_bucket_replication,
+    storage_route.start_bucket_replication_resync,
+    storage_route.start_cluster_heal,
   ):
     assert "current_user" in _endpoint_params(fn)
 
@@ -27,6 +30,10 @@ def test_storage_read_routes_require_user():
     storage_route.get_server_details,
     storage_route.get_buckets,
     storage_route.get_bucket_replicate_infos,
+    storage_route.get_replication_operations,
+    storage_route.get_cluster_health_operations,
+    storage_route.get_cluster_heal_status,
+    storage_route.get_storage_operations,
   ):
     assert "current_user" in _endpoint_params(fn)
 

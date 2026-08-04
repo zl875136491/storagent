@@ -3,7 +3,9 @@ from beanie.odm.fields import Link
 from pydantic import Field
 from pymongo import IndexModel
 from src.modules.public.model import Region, Application
-from datetime import datetime
+from src.utils.helpers import utc_now
+from datetime import datetime, timedelta
+from typing import Any, Literal
 
 class MinioServer(Document):
   """
@@ -65,6 +67,42 @@ class MinioEvent(Document):
       IndexModel(["bucket"]),
       IndexModel(["last_modified"]),
     ]
-    
-  
+
+
+class ServerFileDetailsCache(Document):
+  """Cached recursive bucket inventory for one configured MinIO server."""
+  server_id: str
+  data: list[dict[str, Any]] = Field(default_factory=list)
+  fetched_at: datetime = Field(default_factory=utc_now)
+  expires_at: datetime
+
+  class Settings:
+    name = "server_file_details_cache"
+    indexes = [
+      IndexModel(["server_id"], unique=True),
+      IndexModel(["expires_at"], expireAfterSeconds=0),
+    ]
+
+
+class StorageOperation(Document):
+  """Persistent state for long-running MinIO maintenance operations."""
+  kind: Literal["cluster_heal"]
+  status: Literal["queued", "running", "succeeded", "failed"] = "queued"
+  server: str
+  bucket: str = ""
+  actor: str = "-"
+  message: str = ""
+  result: dict[str, Any] = Field(default_factory=dict)
+  created_at: datetime = Field(default_factory=utc_now)
+  started_at: datetime | None = None
+  finished_at: datetime | None = None
+  expires_at: datetime = Field(default_factory=lambda: utc_now() + timedelta(days=30))
+
+  class Settings:
+    name = "storage_operation"
+    indexes = [
+      IndexModel([("created_at", -1)]),
+      IndexModel([("kind", 1), ("server", 1), ("status", 1)]),
+      IndexModel(["expires_at"], expireAfterSeconds=0),
+    ]
   
