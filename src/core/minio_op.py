@@ -68,30 +68,41 @@ async def run_mc_json(
     cmd.append("--json")
   command_text = shlex.join(cmd)
   started = perf_counter()
+  process = None
   try:
-    result = await asyncio.to_thread(
-      subprocess.run,
-      cmd,
-      shell=False,
-      check=False,
-      capture_output=True,
-      text=True,
-      timeout=max(float(timeout), 1.0),
+    process = await asyncio.create_subprocess_exec(
+      *cmd,
+      stdout=asyncio.subprocess.PIPE,
+      stderr=asyncio.subprocess.PIPE,
     )
-  except subprocess.TimeoutExpired as e:
-    elapsed_ms = (perf_counter() - started) * 1000
-    stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-    stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
-    await create_shell_command_log(command_text, stdout, stderr or "command timed out")
-    return False, [], f"MinIO 命令超时（{timeout:g} 秒）", elapsed_ms
+    try:
+      stdout_bytes, stderr_bytes = await asyncio.wait_for(
+        process.communicate(),
+        timeout=max(float(timeout), 1.0),
+      )
+    except TimeoutError:
+      process.kill()
+      stdout_bytes, stderr_bytes = await process.communicate()
+      stdout = stdout_bytes.decode("utf-8", errors="replace")
+      stderr = stderr_bytes.decode("utf-8", errors="replace")
+      elapsed_ms = (perf_counter() - started) * 1000
+      await create_shell_command_log(command_text, stdout, stderr or "command timed out")
+      return False, [], f"MinIO 命令超时（{timeout:g} 秒）", elapsed_ms
+  except asyncio.CancelledError:
+    if process is not None and process.returncode is None:
+      process.kill()
+      await process.communicate()
+    raise
   except Exception as e:
     elapsed_ms = (perf_counter() - started) * 1000
     await create_shell_command_log(command_text, "", str(e))
     return False, [], str(e), elapsed_ms
 
+  stdout = stdout_bytes.decode("utf-8", errors="replace")
+  stderr = stderr_bytes.decode("utf-8", errors="replace")
   elapsed_ms = (perf_counter() - started) * 1000
   items: list[dict[str, Any]] = []
-  for line in result.stdout.splitlines():
+  for line in stdout.splitlines():
     line = line.strip()
     if not line:
       continue
@@ -102,10 +113,10 @@ async def run_mc_json(
     if isinstance(item, dict):
       items.append(item)
   has_error = any(item.get("status") == "error" for item in items)
-  if record or result.returncode != 0 or has_error:
-    await create_shell_command_log(command_text, result.stdout, result.stderr)
-  if result.returncode != 0 or has_error:
-    return False, items, _mc_error_message(items, result.stderr or result.stdout), elapsed_ms
+  if record or process.returncode != 0 or has_error:
+    await create_shell_command_log(command_text, stdout, stderr)
+  if process.returncode != 0 or has_error:
+    return False, items, _mc_error_message(items, stderr or stdout), elapsed_ms
   if not items:
     return False, [], "MinIO 命令未返回 JSON 数据", elapsed_ms
   return True, items, "", elapsed_ms
@@ -137,7 +148,7 @@ async def get_cluster_heal_info(
   return success, (items[-1] if items else {}), error, elapsed_ms
 
 
-async def run_cluster_heal(
+async def inspect_cluster_heal(
   server_name: str,
   *,
   timeout: float = 3600.0,
@@ -145,6 +156,7 @@ async def run_cluster_heal(
   return await run_mc_json(
     ["admin", "heal", "--force", f"{server_name}/"],
     timeout=timeout,
+    record=False,
   )
 
 

@@ -5,8 +5,22 @@ import pytest
 from bson import ObjectId
 
 from src.core import minio_op
-from src.modules.storage import operations, schema, service
+from src.modules.storage import crud, operations, schema, service
 from src.utils.helpers import utc_now
+
+
+def test_server_details_cache_codec_round_trip_unicode_tree():
+  data = [{
+    "name": "Bucket: system-test",
+    "total_size": 3,
+    "created_at": "2026-08-04T10:00:00+08:00",
+    "files": [{"name": "目录/文件.txt", "size": 3, "last_modified": "now"}],
+  }]
+
+  encoded = crud._encode_server_file_details(data)
+
+  assert isinstance(encoded, bytes)
+  assert crud._decode_server_file_details(encoded) == data
 
 
 def test_parse_cluster_admin_info_reports_capacity_and_degraded_disk():

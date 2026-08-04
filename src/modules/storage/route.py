@@ -214,7 +214,7 @@ async def get_cluster_heal_status(
 @router.post(
   path="/operations/clusters/{server_name}/heal",
   response_model=storage_schema.StorageOperationItem,
-  summary="启动集群深度修复扫描",
+  summary="启动集群原生自愈巡检",
 )
 async def start_cluster_heal(
   server_name: str,

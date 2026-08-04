@@ -70,16 +70,23 @@ class MinioEvent(Document):
 
 
 class ServerFileDetailsCache(Document):
-  """Cached recursive bucket inventory for one configured MinIO server."""
+  """One compressed chunk of a cached recursive MinIO inventory."""
   server_id: str
-  data: list[dict[str, Any]] = Field(default_factory=list)
+  generation: str
+  chunk_index: int = Field(ge=0)
+  payload: bytes
   fetched_at: datetime = Field(default_factory=utc_now)
   expires_at: datetime
 
   class Settings:
-    name = "server_file_details_cache"
+    # A new collection avoids inheriting the old one-document-per-server index.
+    name = "server_file_details_cache_v2"
     indexes = [
-      IndexModel(["server_id"], unique=True),
+      IndexModel(
+        [("server_id", 1), ("generation", 1), ("chunk_index", 1)],
+        unique=True,
+      ),
+      IndexModel([("server_id", 1), ("fetched_at", -1)]),
       IndexModel(["expires_at"], expireAfterSeconds=0),
     ]
 

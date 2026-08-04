@@ -64,7 +64,7 @@ async def lifespan(app: FastAPI):
     reconcile_replication_policies_task()
   )
 
-  # 9. 权威区域监控 MinIO 磁盘健康，并按冷却策略触发深度修复扫描
+  # 9. 权威区域监控 MinIO 磁盘健康，并记录原生自愈状态
   cluster_health_job = asyncio.create_task(monitor_cluster_health_task())
 
   yield

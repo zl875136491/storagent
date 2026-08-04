@@ -14,8 +14,40 @@ from src.core.crypto import encrypt_secret, minio_server_plain_credentials
 from loguru import logger
 from src.utils.helpers import try_to_obj_id
 from src.configs.configs import settings
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+import json
+import zlib
+from uuid import uuid4
+
+
+_CACHE_CHUNK_BYTES = 8 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ServerFileDetailsSnapshot:
+  data: list[dict[str, Any]]
+  fetched_at: datetime
+  expires_at: datetime
+  generation: str
+
+
+def _encode_server_file_details(data: list[dict[str, Any]]) -> bytes:
+  serialized = json.dumps(
+    data,
+    ensure_ascii=False,
+    separators=(",", ":"),
+    default=str,
+  ).encode("utf-8")
+  return zlib.compress(serialized)
+
+
+def _decode_server_file_details(payload: bytes) -> list[dict[str, Any]]:
+  decoded = json.loads(zlib.decompress(payload).decode("utf-8"))
+  if not isinstance(decoded, list) or any(not isinstance(item, dict) for item in decoded):
+    raise ValueError("服务器文件详情缓存格式不合法")
+  return decoded
 
 async def create_minio_server(
   region: Region,
@@ -138,9 +170,36 @@ async def delete_expired_server_file_details(now: datetime) -> int:
 
 async def read_server_file_details_cache(
   server_id: str,
-) -> ServerFileDetailsCache | None:
-  return await ServerFileDetailsCache.find_one(
+) -> ServerFileDetailsSnapshot | None:
+  latest = await ServerFileDetailsCache.find(
     ServerFileDetailsCache.server_id == server_id
+  ).sort("-fetched_at").limit(1).to_list()
+  if not latest:
+    return None
+  head = latest[0]
+  chunks = await ServerFileDetailsCache.find(
+    ServerFileDetailsCache.server_id == server_id,
+    ServerFileDetailsCache.generation == head.generation,
+  ).sort("chunk_index").to_list()
+  if not chunks or any(item.chunk_index != index for index, item in enumerate(chunks)):
+    await ServerFileDetailsCache.get_motor_collection().delete_many({
+      "server_id": server_id,
+      "generation": head.generation,
+    })
+    return None
+  try:
+    data = _decode_server_file_details(b"".join(item.payload for item in chunks))
+  except (ValueError, TypeError, zlib.error, json.JSONDecodeError, UnicodeDecodeError):
+    await ServerFileDetailsCache.get_motor_collection().delete_many({
+      "server_id": server_id,
+      "generation": head.generation,
+    })
+    return None
+  return ServerFileDetailsSnapshot(
+    data=data,
+    fetched_at=head.fetched_at,
+    expires_at=head.expires_at,
+    generation=head.generation,
   )
 
 
@@ -149,33 +208,37 @@ async def write_server_file_details_cache(
   data: list[dict[str, Any]],
   fetched_at: datetime,
   expires_at: datetime,
-) -> ServerFileDetailsCache:
-  cache = await read_server_file_details_cache(server_id)
-  if cache:
-    cache.data = data
-    cache.fetched_at = fetched_at
-    cache.expires_at = expires_at
-    await cache.save()
-    return cache
-  cache = ServerFileDetailsCache(
-    server_id=server_id,
+) -> ServerFileDetailsSnapshot:
+  generation = uuid4().hex
+  payload = _encode_server_file_details(data)
+  parts = [
+    payload[offset:offset + _CACHE_CHUNK_BYTES]
+    for offset in range(0, len(payload), _CACHE_CHUNK_BYTES)
+  ] or [b""]
+  chunks = [
+    ServerFileDetailsCache(
+      server_id=server_id,
+      generation=generation,
+      chunk_index=index,
+      payload=part,
+      fetched_at=fetched_at,
+      expires_at=expires_at,
+    )
+    for index, part in enumerate(parts)
+  ]
+  await ServerFileDetailsCache.insert_many(chunks)
+  # Keep a concurrently written newer generation; remove this server's older snapshots.
+  await ServerFileDetailsCache.get_motor_collection().delete_many({
+    "server_id": server_id,
+    "generation": {"$ne": generation},
+    "fetched_at": {"$lte": fetched_at},
+  })
+  return ServerFileDetailsSnapshot(
     data=data,
     fetched_at=fetched_at,
     expires_at=expires_at,
+    generation=generation,
   )
-  try:
-    await cache.insert()
-    return cache
-  except Exception:
-    # A second worker may have populated the unique server cache meanwhile.
-    cache = await read_server_file_details_cache(server_id)
-    if not cache:
-      raise
-    cache.data = data
-    cache.fetched_at = fetched_at
-    cache.expires_at = expires_at
-    await cache.save()
-    return cache
 
 
 async def delete_server_file_details_cache(server_id: str) -> int:

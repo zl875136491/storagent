@@ -689,9 +689,9 @@ async def _run_heal_operation(operation: StorageOperation) -> None:
     async with _distributed_operation_lock(f"cluster-heal/{operation.server}"):
       operation.status = "running"
       operation.started_at = utc_now()
-      operation.message = "正在执行深度修复扫描"
+      operation.message = "正在采集 MinIO 原生自愈状态"
       await operation.save()
-      success, items, error, elapsed_ms = await minio_op.run_cluster_heal(
+      success, items, error, elapsed_ms = await minio_op.inspect_cluster_heal(
         operation.server,
         timeout=settings.MINIO_HEAL_TIMEOUT_SECONDS,
       )
@@ -704,7 +704,7 @@ async def _run_heal_operation(operation: StorageOperation) -> None:
   except asyncio.CancelledError:
     operation.status = "failed"
     operation.finished_at = utc_now()
-    operation.message = "后端停止，修复任务状态已回收"
+    operation.message = "后端停止，自愈巡检状态已回收"
     await operation.save()
     raise
   except Exception as e:
@@ -725,7 +725,7 @@ async def _run_heal_operation(operation: StorageOperation) -> None:
   operation.result = {**_heal_result(items), "elapsed_ms": elapsed_ms}
   if success:
     operation.status = "succeeded"
-    operation.message = "深度修复扫描完成"
+    operation.message = "自愈巡检完成"
   else:
     operation.status = "failed"
     operation.message = error
@@ -764,7 +764,7 @@ async def start_cluster_heal(server_name: str, actor: str) -> dict[str, Any]:
     server=server,
     actor=actor,
   )
-  operation.message = "深度修复任务已进入队列"
+  operation.message = "自愈巡检任务已进入队列"
   await operation.save()
   _spawn(_run_heal_operation(operation))
   return _operation_dict(operation) or {}
@@ -776,7 +776,7 @@ async def list_storage_operations(limit: int = 20) -> dict[str, Any]:
 
 
 async def monitor_cluster_health_task() -> None:
-  """Authority-only loop that starts heal scans for online healing drives."""
+  """Authority-only loop that records native MinIO healing when drives need it."""
   if settings.REGION != settings.SYNC_AUTHORITY_REGION:
     logger.info("非权威区域不执行 MinIO 自动自愈监控")
     return
