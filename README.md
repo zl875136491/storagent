@@ -82,6 +82,7 @@ docker run -d --env-file .env -p 9000:9000 storagent
 | `REGION_NAME` | 区域显示名称 | `未定义` |
 | `SERVER_HOST` | 对外暴露的主机地址 | `localhost` |
 | `SERVER_PORT` | API 服务端口 | `9000` |
+| `ONE_TIME_DOWNLOAD_TTL_SECONDS` | 管理员一次性应急下载链接有效期（30-900 秒） | `300` |
 | `INIT_SERVICE` | 启动时自动注册 Region/MinIO 到 Etcd | `true` |
 | `DEBUG` | 调试模式 | `false` |
 | `RELOAD` | 热重载（开发用） | `true` |

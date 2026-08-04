@@ -1,11 +1,54 @@
-from fastapi import APIRouter, Depends, Query
+import secrets
+from urllib.parse import parse_qs
+
+from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.responses import HTMLResponse
 
 from src.core.auth import get_current_user, check_permissions, require_admin
+from src.core.rate_limit import rate_limit_one_time_download
 from src.modules.auth.model import User
 from src.modules.storage import service as storage_service
 from src.modules.storage import operations as storage_operations
+from src.modules.storage import download as storage_download
 from src.modules.storage import schema as storage_schema
 from src.modules.public import schema as public_schema
+
+
+_ONE_TIME_DOWNLOAD_BODY_LIMIT = 256
+
+
+async def _read_one_time_download_token(request: Request) -> str:
+  content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+  if content_type != "application/x-www-form-urlencoded":
+    raise storage_download.invalid_link_error()
+
+  raw_length = request.headers.get("content-length")
+  if raw_length:
+    try:
+      if int(raw_length) > _ONE_TIME_DOWNLOAD_BODY_LIMIT:
+        raise storage_download.invalid_link_error()
+    except ValueError:
+      raise storage_download.invalid_link_error()
+
+  body = bytearray()
+  async for chunk in request.stream():
+    if len(body) + len(chunk) > _ONE_TIME_DOWNLOAD_BODY_LIMIT:
+      raise storage_download.invalid_link_error()
+    body.extend(chunk)
+
+  try:
+    fields = parse_qs(
+      body.decode("ascii"),
+      keep_blank_values=True,
+      strict_parsing=True,
+      max_num_fields=1,
+    )
+  except (UnicodeDecodeError, ValueError):
+    raise storage_download.invalid_link_error()
+  values = fields.get("token")
+  if set(fields) != {"token"} or not values or len(values) != 1:
+    raise storage_download.invalid_link_error()
+  return values[0]
 
 router = APIRouter()
 
@@ -78,6 +121,111 @@ async def get_server_details(
     minio_server_id,
     force_refresh=refresh,
   )
+
+
+@router.post(
+  path="/{minio_server_id}/objects/presigned-download",
+  response_model=storage_schema.OneTimeDownloadCreateResponse,
+  summary="生成管理员一次性对象下载链接",
+)
+async def create_one_time_object_download(
+  minio_server_id: public_schema.PydanticObjectId,
+  payload: storage_schema.OneTimeDownloadCreateRequest,
+  request: Request,
+  response: Response,
+  current_user: User = Depends(require_admin),
+) -> storage_schema.OneTimeDownloadCreateResponse:
+  issued = await storage_download.issue_one_time_download(
+    minio_server_id,
+    payload.bucket,
+    payload.object_key,
+    current_user.username,
+  )
+  token = issued.pop("token")
+  # Return an origin-independent path. The authenticated console resolves it
+  # against the backend it selected, so Host/proxy headers cannot redirect it.
+  bootstrap_url = str(request.app.url_path_for("download_one_time_object_bootstrap"))
+  # URL fragment is never sent in the HTTP request target or access log.
+  download_url = f"{bootstrap_url}#token={token}"
+  response.headers["Cache-Control"] = "no-store"
+  return storage_schema.OneTimeDownloadCreateResponse(
+    download_url=download_url,
+    url=download_url,
+    single_use=True,
+    **issued,
+  )
+
+
+@router.get(
+  path="/objects/one-time-download",
+  name="download_one_time_object_bootstrap",
+  response_model=None,
+  summary="打开一次性对象下载引导页",
+)
+async def download_one_time_object_bootstrap():
+  """Read the capability from the fragment, erase it, then submit it in a POST body."""
+  nonce = secrets.token_urlsafe(18)
+  html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="referrer" content="no-referrer">
+  <title>正在准备下载</title>
+</head>
+<body>
+  <p>正在准备下载...</p>
+  <noscript>此下载链接需要启用 JavaScript。</noscript>
+  <script nonce="{nonce}">
+  (() => {{
+    const rawHash = window.location.hash;
+    window.history.replaceState(null, "", window.location.pathname);
+    const token = new URLSearchParams(rawHash.startsWith("#") ? rawHash.slice(1) : rawHash).get("token");
+    if (!token) {{
+      document.body.textContent = "下载链接无效或已过期";
+      return;
+    }}
+    const form = document.createElement("form");
+    form.method = "post";
+    form.action = window.location.pathname;
+    form.enctype = "application/x-www-form-urlencoded";
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = "token";
+    input.value = token;
+    form.appendChild(input);
+    document.body.appendChild(form);
+    form.submit();
+  }})();
+  </script>
+</body>
+</html>"""
+  return HTMLResponse(
+    content=html,
+    headers={
+      "Cache-Control": "private, no-store, max-age=0",
+      "Pragma": "no-cache",
+      "Content-Security-Policy": (
+        "default-src 'none'; "
+        f"script-src 'nonce-{nonce}'; "
+        "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+      ),
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    },
+  )
+
+
+@router.post(
+  path="/objects/one-time-download",
+  name="download_one_time_object",
+  response_model=None,
+  summary="兑换一次性对象下载链接",
+)
+async def download_one_time_object(request: Request):
+  # Capability 仅出现在受限大小的 POST body；成功兑换后立即从 Etcd 原子删除。
+  rate_limit_one_time_download(request)
+  token = await _read_one_time_download_token(request)
+  return await storage_download.redeem_one_time_download(token)
 
 @router.get(
   path="/buckets",

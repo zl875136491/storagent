@@ -59,6 +59,15 @@ def rate_limit_locate(request: Request) -> None:
   check_rate_limit(f"locate:{ip}", limit=60, window_seconds=60.0)
 
 
+def rate_limit_one_time_download(request: Request) -> None:
+  """Bound anonymous capability lookups by both claimed and direct peer IP."""
+  ip = _client_ip(request)
+  peer = request.client.host if request.client and request.client.host else "unknown"
+  check_rate_limit(f"one-time-download:{ip}", limit=60, window_seconds=60.0)
+  # A direct caller can forge X-Forwarded-For; the peer-wide guard still caps Etcd work.
+  check_rate_limit(f"one-time-download-peer:{peer}", limit=600, window_seconds=60.0)
+
+
 def rate_limit_ai(request: Request, username: str) -> None:
   ip = _client_ip(request)
   check_rate_limit(f"ai:{username}:{ip}", limit=30, window_seconds=60.0)

@@ -88,6 +88,8 @@ class Settings(BaseSettings):
 
   # Storage operations and cluster self-healing
   SERVER_DETAILS_CACHE_TTL_SECONDS: int = 600
+  # 管理员应急下载链接；运行时还会限制在 30-900 秒内。
+  ONE_TIME_DOWNLOAD_TTL_SECONDS: int = 300
   MINIO_OPERATION_TIMEOUT_SECONDS: float = 20.0
   MINIO_HEAL_TIMEOUT_SECONDS: float = 3600.0
   CLUSTER_HEALTH_CHECK_INTERVAL_SECONDS: float = 120.0
