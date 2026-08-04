@@ -20,6 +20,7 @@ def test_storage_write_routes_require_user():
     storage_route.reconcile_bucket_replication,
     storage_route.start_bucket_replication_resync,
     storage_route.start_cluster_heal,
+    storage_route.create_one_time_object_download,
   ):
     assert "current_user" in _endpoint_params(fn)
 

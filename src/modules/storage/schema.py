@@ -52,6 +52,20 @@ class ServerDetailsResponse(BaseModel):
   expires_at: datetime = Field(..., description="缓存过期时间")
   ttl_seconds: int = Field(600, ge=1, description="缓存有效期")
 
+
+class OneTimeDownloadCreateRequest(BaseModel):
+  bucket: str = Field(..., min_length=3, max_length=63, description="存储桶名称")
+  object_key: str = Field(..., min_length=1, max_length=1024, description="完整对象键")
+
+
+class OneTimeDownloadCreateResponse(BaseModel):
+  download_url: str = Field(..., description="无需 API Key 的一次性下载地址")
+  url: str = Field(..., description="download_url 的兼容字段")
+  expires_at: datetime = Field(..., description="链接过期时间")
+  expires_in_seconds: int = Field(..., ge=1, le=900, description="链接有效秒数")
+  single_use: bool = Field(True, description="是否仅允许成功兑换一次")
+  filename: str = Field(..., description="下载时使用的文件名")
+
 class SimpleAppInfo(BaseModel):
   shown_name: Optional[str] = Field(None, description="应用显示名称")
   description: Optional[str] = Field(None, description="应用描述")

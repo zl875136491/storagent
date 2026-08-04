@@ -33,3 +33,34 @@ def test_login_rate_limit_helper_uses_ip():
     rate_limit_login(req)
   with pytest.raises(CustomException):
     rate_limit_login(req)
+
+
+def test_one_time_download_rate_limit_caps_forged_forwarded_ips():
+  from src.core.rate_limit import rate_limit_one_time_download
+
+  _hits.clear()
+  req = MagicMock()
+  req.client.host = "9.9.9.9"
+  for index in range(600):
+    req.headers = {"x-forwarded-for": f"198.51.100.{index}"}
+    rate_limit_one_time_download(req)
+
+  req.headers = {"x-forwarded-for": "203.0.113.1"}
+  with pytest.raises(CustomException) as exc_info:
+    rate_limit_one_time_download(req)
+  assert exc_info.value.code == ErrorDesc.RATE_LIMITED.code
+
+
+def test_one_time_download_rate_limit_caps_single_claimed_ip():
+  from src.core.rate_limit import rate_limit_one_time_download
+
+  _hits.clear()
+  req = MagicMock()
+  req.client.host = "9.9.9.9"
+  req.headers = {"x-forwarded-for": "198.51.100.10"}
+  for _ in range(60):
+    rate_limit_one_time_download(req)
+
+  with pytest.raises(CustomException) as exc_info:
+    rate_limit_one_time_download(req)
+  assert exc_info.value.code == ErrorDesc.RATE_LIMITED.code

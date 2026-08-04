@@ -79,6 +79,8 @@ class ErrorDesc(Enum):
   AI_CONFIG_INVALID = ("AI 配置不合法", 400044)
   AUTH_CODE_INVALID = ("认证链接无效或已过期", 401045)
   USER_ALREADY_REGISTERED = ("用户已完成注册", 400046)
+  ONE_TIME_DOWNLOAD_INVALID = ("下载链接无效、已使用或已过期", 410047)
+  DOWNLOAD_SOURCE_UNAVAILABLE = ("下载源服务不可用", 503048)
   
 
   
