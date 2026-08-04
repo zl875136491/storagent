@@ -82,11 +82,17 @@ def test_parse_replication_source_exposes_queue_failures_and_latency():
           arn: {
             "replicationCount": 9,
             "completedReplicationSize": 8192,
-            "failed": {"totals": {"count": 1, "bytes": 512}},
+            "failed": {
+              "lastHour": {"count": 1, "bytes": 512},
+              "totals": {"count": 1, "bytes": 512},
+            },
           },
         },
         "queued": {"curr": {"count": 2, "bytes": 2048}},
-        "failed": {"totals": {"count": 1, "bytes": 512}},
+        "failed": {
+          "lastHour": {"count": 1, "bytes": 512},
+          "totals": {"count": 1, "bytes": 512},
+        },
       },
       "queueStats": {
         "nodes": [{
@@ -120,6 +126,8 @@ def test_parse_replication_source_exposes_queue_failures_and_latency():
         "endTime": "2026-08-04T03:41:26Z",
         "resyncStatus": "Ongoing",
         "completedReplicationSize": 4096,
+        "failedReplicationCount": 2,
+        "failedReplicationSize": 256,
         "replicationCount": 7,
         "object": "object-key",
       }]},
@@ -135,11 +143,214 @@ def test_parse_replication_source_exposes_queue_failures_and_latency():
   assert target["latency_current_ms"] == 5
   assert target["total_downtime_seconds"] == 2
   assert target["current_rate_bps"] == 1024.5
+  assert target["status"] == "syncing"
   assert target["resync_status"] == "running"
   assert target["resync_reset_id"] == "reset-1"
   assert target["resync_completed_bytes"] == 4096
   assert target["resync_object_count"] == 7
+  assert target["resync_failed_count"] == 2
+  assert target["resync_failed_bytes"] == 256
+  assert target["recent_failed_count"] == 1
   schema.ReplicationSourceMetric.model_validate(result)
+
+
+def test_completed_resync_with_failed_objects_is_partial():
+  arn = "arn:minio:replication::target-1:one-v2"
+
+  result = operations.parse_replication_resync_status({
+    "resyncInfo": {"target": [{
+      "arn": arn,
+      "resyncStatus": "Completed",
+      "startTime": "2026-08-04T03:42:08Z",
+      "endTime": "2026-08-04T04:21:56Z",
+      "completedReplicationSize": 99_796_971_825,
+      "failedReplicationCount": 9,
+      "replicationCount": 2241,
+    }]},
+  })[arn]
+
+  assert result["resync_status"] == "partial"
+  assert result["resync_failed_count"] == 9
+  assert result["resync_completed_bytes"] == 99_796_971_825
+  schema.ReplicationTargetMetric.model_validate({
+    "source": "beijing",
+    "target": "tianjin",
+    "arn": arn,
+    "endpoint": "10.17.158.115:9000",
+    "status": "degraded",
+    "online": True,
+    **result,
+  })
+
+
+def test_resync_parser_accepts_single_target_and_string_counters():
+  arn = "arn:minio:replication::target-1:one-v2"
+
+  result = operations.parse_replication_resync_status({
+    "resyncInfo": {"target": {
+      "arn": arn,
+      "resyncStatus": "Completed",
+      "completedReplicationSize": "99796971825",
+      "failedReplicationCount": "9",
+      "failedReplicationSize": "256",
+      "replicationCount": "2241",
+    }},
+  })[arn]
+
+  assert result["resync_status"] == "partial"
+  assert result["resync_object_count"] == 2241
+  assert result["resync_completed_bytes"] == 99_796_971_825
+  assert result["resync_failed_count"] == 9
+  assert result["resync_failed_bytes"] == 256
+
+
+def test_resync_parser_tolerates_missing_optional_fields():
+  arn = "arn:minio:replication::target-1:one-v2"
+
+  result = operations.parse_replication_resync_status({
+    "resyncInfo": {"target": [{"arn": arn}]},
+  })[arn]
+
+  assert result == {
+    "resync_status": "unknown",
+    "resync_reset_id": "",
+    "resync_started_at": None,
+    "resync_updated_at": None,
+    "resync_completed_bytes": 0,
+    "resync_object_count": 0,
+    "resync_failed_count": 0,
+    "resync_failed_bytes": 0,
+    "resync_current_object": "",
+    "resync_error": "",
+  }
+
+
+def test_string_false_online_and_missing_arn_are_not_healthy():
+  arn = "arn:minio:replication::target-1:one-v2"
+  payload = {
+    "replicationstats": {"currStats": {
+      "Stats": {arn: {
+        "replicationCount": "1",
+        "completedReplicationSize": "1024",
+        "failed": {"totals": {"count": "0", "bytes": "0"}},
+      }},
+    }},
+    "remoteTargets": {
+      "endpoint": "10.17.158.115:9000",
+      "arn": arn,
+      "isOnline": "false",
+    },
+  }
+
+  result = operations.parse_replication_source(
+    "beijing",
+    payload,
+    server_names=["beijing", "tianjin"],
+    endpoints={"10.17.158.115:9000": "tianjin"},
+    elapsed_ms=8,
+  )
+
+  assert result["targets"][0]["online"] is False
+  assert result["targets"][0]["status"] == "critical"
+  assert result["actual_target_count"] == 1
+
+  payload["remoteTargets"]["arn"] = ""
+  missing_arn = operations.parse_replication_source(
+    "beijing",
+    payload,
+    server_names=["beijing", "tianjin"],
+    endpoints={"10.17.158.115:9000": "tianjin"},
+    elapsed_ms=8,
+  )
+  assert missing_arn["targets"][0]["status"] == "critical"
+  assert missing_arn["actual_target_count"] == 0
+
+
+def test_historical_replication_failures_do_not_keep_link_degraded():
+  arn = "arn:minio:replication::target-1:one-v2"
+  payload = {
+    "replicationstats": {"currStats": {
+      "Stats": {arn: {
+        "replicationCount": 2248,
+        "completedReplicationSize": 102_648_528_207,
+        "failed": {
+          "lastHour": {"count": 0, "bytes": 0},
+          "totals": {"count": 383, "bytes": 26_355_568_041},
+        },
+      }},
+      "failed": {
+        "lastHour": {"count": 0, "bytes": 0},
+        "totals": {"count": 383, "bytes": 26_355_568_041},
+      },
+      "queued": {"curr": {"count": 0, "bytes": 0}},
+    }},
+    "remoteTargets": [{
+      "endpoint": "10.17.158.115:9000",
+      "arn": arn,
+      "isOnline": True,
+    }],
+  }
+
+  result = operations.parse_replication_source(
+    "beijing",
+    payload,
+    server_names=["beijing", "tianjin"],
+    endpoints={"10.17.158.115:9000": "tianjin"},
+    elapsed_ms=8,
+    resync_by_arn=operations.parse_replication_resync_status({
+      "resyncInfo": {"target": [{
+        "arn": arn,
+        "resyncStatus": "Completed",
+        "replicationCount": 2241,
+      }]},
+    }),
+  )
+
+  assert result["status"] == "healthy"
+  assert result["failed_count"] == 383
+  assert result["recent_failed_count"] == 0
+  assert result["targets"][0]["status"] == "healthy"
+
+
+def test_historical_failures_without_resync_record_remain_degraded():
+  arn = "arn:minio:replication::kunshan:one-v2"
+  payload = {
+    "replicationstats": {"currStats": {
+      "Stats": {arn: {
+        "replicationCount": 2245,
+        "completedReplicationSize": 102_449_168_471,
+        "failed": {
+          "lastHour": {"count": 0, "bytes": 0},
+          "totals": {"count": 80, "bytes": 11_137_630_473},
+        },
+      }},
+      "failed": {
+        "lastHour": {"count": 0, "bytes": 0},
+        "totals": {"count": 80, "bytes": 11_137_630_473},
+      },
+      "queued": {"curr": {"count": 0, "bytes": 0}},
+    }},
+    "remoteTargets": [{
+      "endpoint": "10.8.136.107:9000",
+      "arn": arn,
+      "isOnline": True,
+    }],
+  }
+
+  result = operations.parse_replication_source(
+    "beijing",
+    payload,
+    server_names=["beijing", "kunshan"],
+    endpoints={"10.8.136.107:9000": "kunshan"},
+    elapsed_ms=8,
+    resync_by_arn={},
+  )
+
+  assert result["targets"][0]["resync_status"] == "idle"
+  assert result["targets"][0]["failed_count"] == 80
+  assert result["targets"][0]["recent_failed_count"] == 0
+  assert result["targets"][0]["status"] == "degraded"
+  assert result["status"] == "degraded"
 
 
 @pytest.mark.asyncio

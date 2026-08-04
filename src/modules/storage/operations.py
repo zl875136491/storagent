@@ -82,6 +82,14 @@ def _as_float(value: Any) -> float:
     return 0.0
 
 
+def _as_bool(value: Any) -> bool:
+  if isinstance(value, bool):
+    return value
+  if isinstance(value, str):
+    return value.strip().lower() in ("1", "true", "yes", "on")
+  return bool(value)
+
+
 def _ns_to_ms(value: Any) -> float:
   return _as_float(value) / 1_000_000
 
@@ -320,6 +328,8 @@ def parse_replication_resync_status(payload: dict[str, Any]) -> dict[str, dict[s
   if not isinstance(resync_info, dict):
     return {}
   targets = resync_info.get("target")
+  if isinstance(targets, dict):
+    targets = [targets]
   if not isinstance(targets, list):
     return {}
 
@@ -343,14 +353,28 @@ def parse_replication_resync_status(payload: dict[str, Any]) -> dict[str, dict[s
     if not arn:
       continue
     raw_status = str(item.get("resyncStatus") or "").strip().lower()
+    failed_count = _as_int(item.get("failedReplicationCount"))
+    failed_bytes = _as_int(
+      item.get("failedReplicationSize") or item.get("failedReplicationBytes")
+    )
+    status = status_map.get(raw_status, "unknown")
+    # MinIO reports Completed even when individual objects could not be
+    # replicated. Keep that outcome distinct from a fully successful run.
+    if status == "completed" and failed_count > 0:
+      status = "partial"
     result[arn] = {
-      "resync_status": status_map.get(raw_status, "unknown"),
+      "resync_status": status,
       "resync_reset_id": str(item.get("resetid") or item.get("resetID") or ""),
       "resync_started_at": _safe_datetime(item.get("startTime")),
       "resync_updated_at": _safe_datetime(item.get("endTime")),
       "resync_completed_bytes": _as_int(item.get("completedReplicationSize")),
       "resync_object_count": _as_int(item.get("replicationCount")),
+      "resync_failed_count": failed_count,
+      "resync_failed_bytes": failed_bytes,
       "resync_current_object": str(item.get("object") or ""),
+      "resync_error": str(
+        item.get("error") or item.get("errorMessage") or item.get("message") or ""
+      ),
     }
   return result
 
@@ -375,6 +399,7 @@ def parse_replication_source(
   queue_current = queue.get("curr") if isinstance(queue.get("curr"), dict) else {}
   failed = current.get("failed") if isinstance(current.get("failed"), dict) else {}
   failed_totals = failed.get("totals") if isinstance(failed.get("totals"), dict) else {}
+  failed_recent = failed.get("lastHour") if isinstance(failed.get("lastHour"), dict) else {}
   stats_by_arn = current.get("Stats") if isinstance(current.get("Stats"), dict) else {}
   rates = _rate_by_arn(replication_stats)
   resync_by_arn = resync_by_arn or {}
@@ -394,7 +419,12 @@ def parse_replication_source(
 
   targets: list[dict[str, Any]] = []
   found_targets: set[str] = set()
-  for target in payload.get("remoteTargets") or []:
+  remote_targets = payload.get("remoteTargets")
+  if isinstance(remote_targets, dict):
+    remote_targets = [remote_targets]
+  if not isinstance(remote_targets, list):
+    remote_targets = []
+  for target in remote_targets:
     if not isinstance(target, dict):
       continue
     arn = str(target.get("arn") or "")
@@ -406,15 +436,33 @@ def parse_replication_source(
     target_failed_totals = (
       target_failed.get("totals") if isinstance(target_failed.get("totals"), dict) else {}
     )
-    online = bool(target.get("isOnline"))
-    failed_count = _as_int(target_failed_totals.get("count"))
-    status = "critical" if not online else (
-      "degraded" if failed_count else ("syncing" if rates.get(arn, 0) > 0 else "healthy")
+    target_failed_recent = (
+      target_failed.get("lastHour")
+      if isinstance(target_failed.get("lastHour"), dict)
+      else {}
     )
+    online = _as_bool(target.get("isOnline"))
+    failed_count = _as_int(target_failed_totals.get("count"))
+    recent_failed_count = _as_int(target_failed_recent.get("count"))
     latency = target.get("latency") if isinstance(target.get("latency"), dict) else {}
     resync = resync_by_arn.get(arn) or {
       "resync_status": "idle" if resync_status_known else "unknown",
     }
+    resync_status = str(resync.get("resync_status") or "unknown")
+    if not arn or not online:
+      status = "critical"
+    elif resync_status == "running":
+      status = "syncing"
+    elif (
+      recent_failed_count
+      or resync_status in ("partial", "failed")
+      or (failed_count > 0 and resync_status != "completed")
+    ):
+      # Historical failure counters only become resolved evidence after a
+      # fully successful resync. MinIO deliberately does not reset totals.
+      status = "degraded"
+    else:
+      status = "syncing" if rates.get(arn, 0) > 0 else "healthy"
     targets.append({
       "source": source,
       "target": target_name,
@@ -431,6 +479,8 @@ def parse_replication_source(
       "completed_bytes": _as_int(target_stats.get("completedReplicationSize")),
       "failed_count": failed_count,
       "failed_bytes": _as_int(target_failed_totals.get("bytes")),
+      "recent_failed_count": recent_failed_count,
+      "recent_failed_bytes": _as_int(target_failed_recent.get("bytes")),
       "current_rate_bps": rates.get(arn, 0.0),
       **resync,
     })
@@ -449,15 +499,27 @@ def parse_replication_source(
       "online": False,
     })
 
-  actual_target_count = len(payload.get("remoteTargets") or [])
+  actual_target_count = sum(
+    bool(str(item.get("arn") or ""))
+    for item in remote_targets
+    if isinstance(item, dict)
+  )
   queued_count = _as_int(queue_current.get("count"))
   failed_count = _as_int(failed_totals.get("count"))
+  recent_failed_count = _as_int(failed_recent.get("count"))
   current_rate = sum(rates.values())
   if any(item["status"] == "critical" for item in targets):
     status = "critical"
-  elif actual_target_count != len(expected_targets) or failed_count or mrf_failed:
+  elif (
+    actual_target_count != len(expected_targets)
+    or recent_failed_count
+    or mrf_failed
+    or any(item.get("status") == "degraded" for item in targets)
+  ):
     status = "degraded"
-  elif queued_count or current_rate > 0:
+  elif queued_count or current_rate > 0 or any(
+    item.get("status") == "syncing" for item in targets
+  ):
     status = "syncing"
   else:
     status = "healthy"
@@ -471,6 +533,8 @@ def parse_replication_source(
     "queued_bytes": _as_int(queue_current.get("bytes")),
     "failed_count": failed_count,
     "failed_bytes": _as_int(failed_totals.get("bytes")),
+    "recent_failed_count": recent_failed_count,
+    "recent_failed_bytes": _as_int(failed_recent.get("bytes")),
     "mrf_failed_last_5m": mrf_failed,
     "retries_total": retries_total,
     "current_rate_bps": current_rate,
@@ -583,6 +647,12 @@ async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
     "queued_bytes": sum(_as_int(item.get("queued_bytes")) for item in all_sources),
     "failed_count": sum(_as_int(item.get("failed_count")) for item in all_sources),
     "failed_bytes": sum(_as_int(item.get("failed_bytes")) for item in all_sources),
+    "recent_failed_count": sum(
+      _as_int(item.get("recent_failed_count")) for item in all_sources
+    ),
+    "recent_failed_bytes": sum(
+      _as_int(item.get("recent_failed_bytes")) for item in all_sources
+    ),
     "mrf_failed_last_5m": sum(_as_int(item.get("mrf_failed_last_5m")) for item in all_sources),
     "current_rate_bps": sum(_as_float(item.get("current_rate_bps")) for item in all_sources),
   }

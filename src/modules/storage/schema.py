@@ -100,7 +100,9 @@ class BucketReplicateDeleteRequest(BaseModel):
 
 
 OperationStatus = Literal["healthy", "syncing", "degraded", "critical", "unreachable"]
-ReplicationResyncStatus = Literal["idle", "running", "completed", "failed", "unknown"]
+ReplicationResyncStatus = Literal[
+  "idle", "running", "completed", "partial", "failed", "unknown"
+]
 
 
 class ReplicationTargetMetric(BaseModel):
@@ -119,6 +121,8 @@ class ReplicationTargetMetric(BaseModel):
   completed_bytes: int = 0
   failed_count: int = 0
   failed_bytes: int = 0
+  recent_failed_count: int = 0
+  recent_failed_bytes: int = 0
   current_rate_bps: float = 0
   resync_status: ReplicationResyncStatus = "idle"
   resync_reset_id: str = ""
@@ -126,7 +130,10 @@ class ReplicationTargetMetric(BaseModel):
   resync_updated_at: datetime | None = None
   resync_completed_bytes: int = 0
   resync_object_count: int = 0
+  resync_failed_count: int = 0
+  resync_failed_bytes: int = 0
   resync_current_object: str = ""
+  resync_error: str = ""
 
 
 class ReplicationSourceMetric(BaseModel):
@@ -139,6 +146,8 @@ class ReplicationSourceMetric(BaseModel):
   queued_bytes: int = 0
   failed_count: int = 0
   failed_bytes: int = 0
+  recent_failed_count: int = 0
+  recent_failed_bytes: int = 0
   mrf_failed_last_5m: int = 0
   retries_total: int = 0
   current_rate_bps: float = 0
@@ -166,6 +175,8 @@ class ReplicationOperationsSummary(BaseModel):
   queued_bytes: int = 0
   failed_count: int = 0
   failed_bytes: int = 0
+  recent_failed_count: int = 0
+  recent_failed_bytes: int = 0
   mrf_failed_last_5m: int = 0
   current_rate_bps: float = 0
 
