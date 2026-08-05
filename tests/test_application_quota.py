@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from types import SimpleNamespace
+from bson import ObjectId
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +13,7 @@ from src.core.exception import CustomException, ErrorDesc
 from src.modules.files import quota as files_quota
 from src.modules.files import schema as files_schema
 from src.modules.files import service as files_service
+from src.modules.public import schema as public_schema
 from src.modules.public import service as public_service
 from src.utils.helpers import utc_now
 
@@ -355,6 +357,25 @@ class _Application:
 
   async def save(self):
     self.saved += 1
+
+
+@pytest.mark.asyncio
+async def test_application_response_resolves_author_link_before_serialization(monkeypatch):
+  app = _Application(enabled=False)
+  app.id = ObjectId()
+
+  class AuthorLink:
+    async def fetch(self):
+      return SimpleNamespace(
+        id=ObjectId(),
+        username="owner",
+        name="Owner",
+      )
+
+  app.author = AuthorLink()
+  result = await public_service._application_response(app)
+  response = public_schema.ApplicationResponse.model_validate(result)
+  assert response.author.username == "owner"
 
 
 @pytest.mark.asyncio

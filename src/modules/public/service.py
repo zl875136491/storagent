@@ -409,6 +409,20 @@ async def _application_response(
   force_usage: bool = False,
   require_all_usage: bool = False,
 ) -> dict:
+  author = application.author
+  # Mongo projections created by the cross-region sync worker can retain a
+  # Beanie Link even when the normal CRUD path requested fetch_links=True.
+  # Resolve it before returning the public response so FastAPI never tries to
+  # validate a Link against SimpleUserResponse.
+  if not hasattr(author, "username") and hasattr(author, "fetch"):
+    resolved_author = await author.fetch()
+    if resolved_author is not author:
+      author = resolved_author
+  if not hasattr(author, "username"):
+    raise CustomException(
+      ErrorDesc.RES_NOT_FOUND,
+      "应用创建者信息暂时不可用，请稍后刷新重试",
+    )
   usage = await refresh_application_quota_usage(
     application,
     force=force_usage,
@@ -431,7 +445,11 @@ async def _application_response(
     "quota_usage_bytes": usage,
     "quota_usage_ratio": usage / quota,
     "quota_usage_updated_at": application.quota_usage_updated_at,
-    "author": application.author,
+    "author": {
+      "id": author.id,
+      "username": author.username,
+      "name": author.name,
+    },
   }
 
 
