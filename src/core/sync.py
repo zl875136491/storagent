@@ -41,6 +41,13 @@ ETCD_KEY_TOPOLOGY_LAYOUT = "topology_layout"
 TOPOLOGY_LAYOUT_SCHEMA_VERSION = 1
 
 SYNC_USER_PLACEHOLDER = "__sync__"
+ROLE_ORDER = (ROLE_USER, "应用管理员", "运维管理员", "用户管理员", ROLE_SUPERADMIN)
+
+
+def _ordered_role_names(names: Any) -> list[str]:
+  unique = {str(name) for name in names if name}
+  rank = {name: index for index, name in enumerate(ROLE_ORDER)}
+  return sorted(unique, key=lambda name: (rank.get(name, len(rank)), name))
 
 
 class LastSuperadminError(RuntimeError):
@@ -340,7 +347,7 @@ async def _sync_user_to_mongo_locked(username: str, data: dict):
   role_names = data.get("role_names") or []
   if not role_names and data.get("role_name"):
     role_names = [data["role_name"]]
-  for role_name in role_names:
+  for role_name in _ordered_role_names(role_names):
     role = await Role.find_one(Role.name == str(role_name))
     if role and role.name not in seen_role_names:
       roles.append(role)
@@ -377,7 +384,7 @@ async def _sync_user_to_mongo_locked(username: str, data: dict):
     for role in (user.roles or [])
     if getattr(role, "name", None)
   })
-  desired_role_names = sorted(role.name for role in roles)
+  desired_role_names = _ordered_role_names(role.name for role in roles)
   changed = any((
     user.name != str(data.get("name") or username),
     apply_auth and user.hashed_password != hashed_password,

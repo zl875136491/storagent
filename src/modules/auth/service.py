@@ -32,11 +32,35 @@ from src.modules.auth import oa as oa_service
 AUTH_PURPOSE_REGISTER = "register"
 AUTH_PURPOSE_PASSWORD_RESET = "password_reset"
 AUTH_PURPOSE_LOGIN = "login"
+ROLE_DISPLAY_ORDER = (
+  ROLE_USER,
+  ROLE_APPLICATION_ADMIN,
+  ROLE_OPERATIONS_ADMIN,
+  ROLE_USER_ADMIN,
+  ROLE_SUPERADMIN,
+)
+
+
+def _ordered_role_names(names) -> list[str]:
+  unique = {str(name) for name in names if name}
+  rank = {name: index for index, name in enumerate(ROLE_DISPLAY_ORDER)}
+  return sorted(unique, key=lambda name: (rank.get(name, len(rank)), name))
+
+
+def _role_sort_key(name: str) -> tuple[int, str]:
+  rank = {role_name: index for index, role_name in enumerate(ROLE_DISPLAY_ORDER)}
+  return rank.get(name, len(rank)), name
 
 
 async def _ensure_user_lock_owned(guard) -> None:
   if guard is not None:
     await guard.ensure_owned()
+
+
+# A short wait absorbs an expired Etcd lease or a just-finished update. A
+# zero-time acquire was surfacing transient lock state as a false claim that
+# another administrator was editing the user.
+USER_IDENTITY_LOCK_ACQUIRE_TIMEOUT_SECONDS = 10
 
 
 def _directory_display_name(user_info: dict | None, username: str) -> str:
@@ -160,7 +184,7 @@ async def _complete_registration(challenge) -> User:
   try:
     async with sync_module.user_role_update_lock(
       challenge.username,
-      timeout=0,
+      timeout=USER_IDENTITY_LOCK_ACQUIRE_TIMEOUT_SECONDS,
     ) as guard:
       user = await sync_module.refresh_user_identity_from_etcd(challenge.username)
       if user and not getattr(user, "is_sync", False):
@@ -229,13 +253,15 @@ async def _complete_registration(challenge) -> User:
           await asyncio.shield(user.save())
         raise
       return user
-  except (
-    sync_module.UserIdentityUpdateLockBusyError,
-    sync_module.UserIdentityUpdateLockLostError,
-  ) as error:
+  except sync_module.UserIdentityUpdateLockBusyError as error:
     raise CustomException(
       ErrorDesc.SYNC_FAILED,
-      "用户身份正在其他区域更新，请稍后重试",
+      "该用户的身份同步正在进行，请稍后重试",
+    ) from error
+  except sync_module.UserIdentityUpdateLockLostError as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "用户身份同步状态暂时无法确认，请刷新后重试",
     ) from error
   except sync_module.UserIdentityVersionConflictError as error:
     raise CustomException(ErrorDesc.SYNC_FAILED, str(error)) from error
@@ -254,7 +280,7 @@ async def _complete_password_reset(challenge) -> User:
   try:
     async with sync_module.user_role_update_lock(
       challenge.username,
-      timeout=0,
+      timeout=USER_IDENTITY_LOCK_ACQUIRE_TIMEOUT_SECONDS,
     ) as guard:
       user = await sync_module.refresh_user_identity_from_etcd(challenge.username)
       if not user or getattr(user, "is_sync", False) or not challenge.password_hash:
@@ -278,13 +304,15 @@ async def _complete_password_reset(challenge) -> User:
         await asyncio.shield(user.save())
         raise
       return user
-  except (
-    sync_module.UserIdentityUpdateLockBusyError,
-    sync_module.UserIdentityUpdateLockLostError,
-  ) as error:
+  except sync_module.UserIdentityUpdateLockBusyError as error:
     raise CustomException(
       ErrorDesc.SYNC_FAILED,
-      "用户身份正在其他区域更新，请稍后重试",
+      "该用户的身份同步正在进行，请稍后重试",
+    ) from error
+  except sync_module.UserIdentityUpdateLockLostError as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "用户身份同步状态暂时无法确认，请刷新后重试",
     ) from error
   except sync_module.UserIdentityVersionConflictError as error:
     raise CustomException(ErrorDesc.SYNC_FAILED, str(error)) from error
@@ -402,7 +430,11 @@ async def get_user_profile(user: User) -> dict:
   user_roles = []
   is_admin = False
   admin_role = await user_crud.get_admin_role()
-  for role in user_obj.roles or []:
+  profile_roles = sorted(
+    (role for role in (user_obj.roles or []) if getattr(role, "name", None)),
+    key=lambda role: _role_sort_key(role.name),
+  )
+  for role in profile_roles:
     if (
       getattr(role, "name", None) == ROLE_SUPERADMIN
       or (admin_role and getattr(role, "id", None) == admin_role.id)
@@ -442,10 +474,12 @@ async def logout_user(token: str) -> dict:
 
 def _user_role_summary(user: User, admin_role) -> dict:
   role_items = []
-  for role in user.roles or []:
-    if not getattr(role, "name", None):
-      continue
-    role_items.append({"id": str(role.id), "name": role.name})
+  role_items = [
+    {"id": str(role.id), "name": role.name}
+    for role in (user.roles or [])
+    if getattr(role, "name", None)
+  ]
+  role_items.sort(key=lambda item: _role_sort_key(item["name"]))
   role_names = [item["name"] for item in role_items]
   is_admin = ROLE_SUPERADMIN in role_names or any(
     admin_role and item["id"] == str(admin_role.id) for item in role_items
@@ -515,7 +549,7 @@ async def update_user_role_for_admin(
   try:
     async with sync_module.user_role_update_lock(
       target.username,
-      timeout=0,
+      timeout=USER_IDENTITY_LOCK_ACQUIRE_TIMEOUT_SECONDS,
     ) as guard:
       await sync_module.refresh_user_identity_from_etcd(target.username)
       return await _update_user_roles_locked(
@@ -526,7 +560,10 @@ async def update_user_role_for_admin(
         guard=guard,
       )
   except sync_module.UserRoleUpdateLockBusyError as error:
-    raise CustomException(ErrorDesc.STATUS_ERR, str(error)) from error
+    raise CustomException(
+      ErrorDesc.STATUS_ERR,
+      "身份同步暂时未完成，请稍后重试",
+    ) from error
   except sync_module.UserIdentityUpdateLockLostError as error:
     raise CustomException(
       ErrorDesc.SYNC_FAILED,

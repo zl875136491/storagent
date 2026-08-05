@@ -54,6 +54,31 @@ def test_system_manage_inherits_new_permissions_and_role_payload_is_compatible()
   ).role_names == ["用户", "应用管理员"]
 
 
+def test_admin_user_role_summary_uses_stable_role_order():
+  now = datetime(2026, 8, 6, tzinfo=timezone.utc)
+  roles = [
+    role("用户管理员", ["user_manage"], "user-admin"),
+    role("用户", [], "basic"),
+    role("管理员", ["system_manage"], "superadmin"),
+    role("应用管理员", ["application_manage"], "app-admin"),
+  ]
+  summary = auth_service._user_role_summary(
+    SimpleNamespace(
+      id="alice",
+      username="alice",
+      name="Alice",
+      roles=roles,
+      permissions=[],
+      created_at=now,
+      updated_at=now,
+    ),
+    roles[2],
+  )
+  assert [item["name"] for item in summary["roles"]] == [
+    "用户", "应用管理员", "用户管理员", "管理员",
+  ]
+
+
 def test_etcd_user_cas_never_removes_the_last_superadmin():
   users = {
     "alice": {
