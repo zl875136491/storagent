@@ -114,9 +114,19 @@ class BucketReplicateDeleteRequest(BaseModel):
 
 
 OperationStatus = Literal["healthy", "syncing", "degraded", "critical", "unreachable"]
+StatusReasonSeverity = Literal[
+  "info", "syncing", "degraded", "critical", "unreachable"
+]
 ReplicationResyncStatus = Literal[
   "idle", "running", "completed", "partial", "failed", "unknown"
 ]
+
+
+class ReplicationStatusReason(BaseModel):
+  code: str
+  message: str
+  value: Any = None
+  severity: StatusReasonSeverity = "info"
 
 
 class ReplicationTargetMetric(BaseModel):
@@ -148,6 +158,7 @@ class ReplicationTargetMetric(BaseModel):
   resync_failed_bytes: int = 0
   resync_current_object: str = ""
   resync_error: str = ""
+  status_reasons: list[ReplicationStatusReason] = Field(default_factory=list)
 
 
 class ReplicationSourceMetric(BaseModel):
@@ -168,6 +179,7 @@ class ReplicationSourceMetric(BaseModel):
   expected_target_count: int = 0
   actual_target_count: int = 0
   targets: list[ReplicationTargetMetric] = Field(default_factory=list)
+  status_reasons: list[ReplicationStatusReason] = Field(default_factory=list)
 
 
 class ReplicationBucketMetric(BaseModel):
@@ -175,6 +187,7 @@ class ReplicationBucketMetric(BaseModel):
   shown_name: str = ""
   status: OperationStatus
   sources: list[ReplicationSourceMetric]
+  status_reasons: list[ReplicationStatusReason] = Field(default_factory=list)
 
 
 class ReplicationOperationsSummary(BaseModel):
@@ -193,6 +206,7 @@ class ReplicationOperationsSummary(BaseModel):
   recent_failed_bytes: int = 0
   mrf_failed_last_5m: int = 0
   current_rate_bps: float = 0
+  status_reasons: list[ReplicationStatusReason] = Field(default_factory=list)
 
 
 class ReplicationOperationsResponse(BaseModel):

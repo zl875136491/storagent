@@ -154,6 +154,177 @@ def test_parse_replication_source_exposes_queue_failures_and_latency():
   schema.ReplicationSourceMetric.model_validate(result)
 
 
+def test_mrf_only_is_a_diagnostic_and_does_not_degrade_source():
+  arn = "arn:minio:replication::tianjin:mesh-e2e-20260731"
+  payload = {
+    "replicationstats": {
+      "currStats": {
+        "Stats": {arn: {
+          "failed": {
+            "lastHour": {"count": 0, "bytes": 0},
+            "totals": {"count": 0, "bytes": 0},
+          },
+        }},
+        "queued": {"curr": {"count": 0, "bytes": 0}},
+        "failed": {
+          "lastHour": {"count": 0, "bytes": 0},
+          "totals": {"count": 0, "bytes": 0},
+        },
+      },
+      "queueStats": {"nodes": [{
+        "mrfStats": {"failedCount_last5min": 1},
+      }]},
+    },
+    "remoteTargets": [{
+      "endpoint": "10.17.158.115:9000",
+      "arn": arn,
+      "isOnline": True,
+    }],
+  }
+
+  result = operations.parse_replication_source(
+    "beijing",
+    payload,
+    server_names=["beijing", "tianjin"],
+    endpoints={"10.17.158.115:9000": "tianjin"},
+    elapsed_ms=8,
+  )
+
+  assert result["status"] == "healthy"
+  assert result["targets"][0]["status"] == "healthy"
+  assert result["mrf_failed_last_5m"] == 1
+  assert result["status_reasons"] == [{
+    "code": "mrf_recent_backlog_observed",
+    "message": "MinIO 报告过 MRF 补偿队列记录；该计数可能粘滞，仅供诊断",
+    "value": 1,
+    "severity": "info",
+  }]
+  schema.ReplicationSourceMetric.model_validate(result)
+
+
+def test_mrf_with_recent_failures_remains_degraded_for_the_real_failure():
+  arn = "arn:minio:replication::tianjin:mesh-e2e-20260731"
+  payload = {
+    "replicationstats": {
+      "currStats": {
+        "Stats": {arn: {
+          "failed": {
+            "lastHour": {"count": 0, "bytes": 0},
+            "totals": {"count": 0, "bytes": 0},
+          },
+        }},
+        "queued": {"curr": {"count": 0, "bytes": 0}},
+        "failed": {
+          "lastHour": {"count": 2, "bytes": 512},
+          "totals": {"count": 2, "bytes": 512},
+        },
+      },
+      "queueStats": {"nodes": [{
+        "mrfStats": {"failedCount_last5min": 1},
+      }]},
+    },
+    "remoteTargets": [{
+      "endpoint": "10.17.158.115:9000",
+      "arn": arn,
+      "isOnline": True,
+    }],
+  }
+
+  result = operations.parse_replication_source(
+    "beijing",
+    payload,
+    server_names=["beijing", "tianjin"],
+    endpoints={"10.17.158.115:9000": "tianjin"},
+    elapsed_ms=8,
+  )
+
+  assert result["status"] == "degraded"
+  assert result["targets"][0]["status"] == "healthy"
+  reasons = {item["code"]: item for item in result["status_reasons"]}
+  assert reasons["recent_replication_failures"]["value"] == 2
+  assert reasons["recent_replication_failures"]["severity"] == "degraded"
+  assert reasons["mrf_recent_backlog_observed"]["severity"] == "info"
+
+
+@pytest.mark.asyncio
+async def test_replication_overview_aggregates_status_reasons(monkeypatch):
+  servers = [
+    SimpleNamespace(name="beijing", host="10.32.129.241", minio_port=9000),
+    SimpleNamespace(name="tianjin", host="10.17.158.115", minio_port=9000),
+  ]
+
+  async def read_servers():
+    return servers
+
+  async def read_applications():
+    return []
+
+  async def read_metrics(source, _bucket, *, timeout):
+    assert timeout > 0
+    target = "tianjin" if source == "beijing" else "beijing"
+    endpoint = (
+      "10.17.158.115:9000" if target == "tianjin" else "10.32.129.241:9000"
+    )
+    arn = f"arn:minio:replication::{target}:mesh-e2e-20260731"
+    recent_failed = 2 if source == "tianjin" else 0
+    mrf_failed = 1 if source == "beijing" else 0
+    return True, {
+      "replicationstats": {
+        "currStats": {
+          "Stats": {arn: {
+            "failed": {
+              "lastHour": {"count": 0, "bytes": 0},
+              "totals": {"count": 0, "bytes": 0},
+            },
+          }},
+          "queued": {"curr": {"count": 0, "bytes": 0}},
+          "failed": {
+            "lastHour": {"count": recent_failed, "bytes": 512},
+            "totals": {"count": recent_failed, "bytes": 512},
+          },
+        },
+        "queueStats": {"nodes": [{
+          "mrfStats": {"failedCount_last5min": mrf_failed},
+        }]},
+      },
+      "remoteTargets": [{
+        "endpoint": endpoint,
+        "arn": arn,
+        "isOnline": True,
+      }],
+    }, "", 1.0
+
+  async def read_resync_status(*_args, **_kwargs):
+    return True, {"resyncInfo": {"target": []}}, "", 1.0
+
+  monkeypatch.setattr(operations.storage_crud, "read_minio_server_list", read_servers)
+  monkeypatch.setattr(operations.public_crud, "read_application_list", read_applications)
+  monkeypatch.setattr(operations.minio_op, "get_bucket_replication_metrics", read_metrics)
+  monkeypatch.setattr(
+    operations.minio_op,
+    "get_bucket_replication_resync_status",
+    read_resync_status,
+  )
+
+  result = await operations.get_replication_overview("mesh-e2e-20260731")
+
+  assert result["buckets"][0]["status"] == "degraded"
+  bucket_reasons = {
+    item["code"]: item for item in result["buckets"][0]["status_reasons"]
+  }
+  assert bucket_reasons["degraded_sources"]["value"] == 1
+  assert bucket_reasons["mrf_recent_backlog_observed"]["value"] == 1
+  assert bucket_reasons["mrf_recent_backlog_observed"]["severity"] == "info"
+
+  assert result["summary"]["status"] == "degraded"
+  summary_reasons = {
+    item["code"]: item for item in result["summary"]["status_reasons"]
+  }
+  assert summary_reasons["degraded_sources"]["value"] == 1
+  assert summary_reasons["mrf_recent_backlog_observed"]["value"] == 1
+  schema.ReplicationOperationsResponse.model_validate(result)
+
+
 def test_completed_resync_with_failed_objects_is_partial():
   arn = "arn:minio:replication::target-1:one-v2"
 
