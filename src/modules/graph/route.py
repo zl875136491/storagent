@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends
-from src.core.auth import get_current_user, require_admin
+from src.core.auth import check_permissions, get_current_user
 from src.modules.auth.model import User
 
 from src.modules.graph import service as graph_service
@@ -16,7 +16,7 @@ async def update_bucket_node_position(
   """
   更新 Bucket 拓扑节点位置信息（仅管理员）
   """
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await graph_service.update_bucket_node_position(payload)
 
 @router.post(
@@ -29,7 +29,7 @@ async def update_bucket_edge_position(
   """
   更新 Bucket 拓扑边位置信息（仅管理员）
   """
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await graph_service.update_bucket_edge_position(payload)
 
 @router.get(

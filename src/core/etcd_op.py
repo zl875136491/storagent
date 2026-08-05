@@ -13,6 +13,15 @@ from src.core import sync as sync_module
 
 ETCD_PREFIX = "/storagent/"
 CAS_MAX_RETRIES = 8
+_WATCH_IGNORED_PREFIXES = (
+  f"{ETCD_PREFIX}locks/",
+  f"{ETCD_PREFIX}quota/",
+)
+
+
+def _is_runtime_etcd_key(key: str) -> bool:
+  """Return whether a key is ephemeral runtime state, not control-plane data."""
+  return key.startswith(_WATCH_IGNORED_PREFIXES)
 
 
 async def get_etcd_client() -> aetcd.Client:
@@ -102,6 +111,8 @@ async def watch_etcd_task(client: aetcd.Client):
       async for event in await client.watch_prefix(encoded_prefix):
         backoff = 1.0
         key = event.kv.key.decode("utf-8")
+        if _is_runtime_etcd_key(key):
+          continue
         value = event.kv.value.decode("utf-8") if event.kv.value else ""
         kind = getattr(event, "kind", "PUT")
         logger.info(f"Etcd 变更: {kind} {key}")
@@ -141,6 +152,7 @@ async def reconcile_etcd_task():
       await sync_module.publish_roles(client=client)
       await sync_module.publish_local_users(client=client)
       await sync_module.bootstrap_topology_layout(client=client)
+      await sync_module.backfill_application_quotas(client=client)
       await sync_module.pull_all_and_sync(client=client)
       from src.core import metrics as metrics_mod
       metrics_mod.incr("sync_reconcile_runs_total")
@@ -246,6 +258,7 @@ async def merge_update_etcd_key(
   mutator: Callable[[dict], dict],
   client: aetcd.Client | None = None,
   max_retries: int = CAS_MAX_RETRIES,
+  lease=None,
 ) -> dict:
   """
   基于 mod_revision 的 compare-and-swap 合并更新，避免多节点互相覆盖。
@@ -266,18 +279,23 @@ async def merge_update_etcd_key(
       base = deepcopy(current) if current else {}
       updated = mutator(base)
       plain = json_dumps(updated).encode()
+      put_operation = (
+        client.transactions.put(full_key, plain)
+        if lease is None
+        else client.transactions.put(full_key, plain, lease=lease)
+      )
 
       if mod_rev is None:
         # 创建：仅当 create_revision == 0（键不存在）
         status, _ = await client.transaction(
           compare=[client.transactions.create(full_key) == 0],
-          success=[client.transactions.put(full_key, plain)],
+          success=[put_operation],
           failure=[],
         )
       else:
         status, _ = await client.transaction(
           compare=[client.transactions.mod(full_key) == mod_rev],
-          success=[client.transactions.put(full_key, plain)],
+          success=[put_operation],
           failure=[],
         )
 

@@ -151,12 +151,17 @@ async def read_minio_server_list() -> List[MinioServer]:
 
 async def read_minio_server_names() -> List[str]:
   """
-  获取 Minio 服务器名称列表
+  获取可供 mc 使用的区域别名列表。
   """
   server_names = []
   server_objs = await read_minio_server_list()
   for server_obj in server_objs:
-    server_name = server_obj.name
+    # setup_mc_aliases uses Region.name as the stable alias. MinioServer.name
+    # is user-facing and may differ from the region identifier.
+    server_name = (
+      getattr(getattr(server_obj, "region", None), "name", None)
+      or server_obj.name
+    )
     server_names.append(server_name)
   return server_names
 

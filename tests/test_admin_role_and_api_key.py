@@ -1,10 +1,25 @@
 """管理员角色管理与 API Key 管理员吊销相关单测。"""
+from contextlib import asynccontextmanager
 import pytest
 from types import SimpleNamespace
 
 from src.core.exception import CustomException, ErrorDesc
 from src.modules.auth import service as auth_service
 from src.modules.public import service as public_service
+
+
+@pytest.fixture(autouse=True)
+def no_role_update_lock(monkeypatch):
+  @asynccontextmanager
+  async def unlocked(*_args, **_kwargs):
+    yield
+
+  monkeypatch.setattr("src.core.sync.user_role_update_lock", unlocked)
+
+  async def no_refresh(_username):
+    return None
+
+  monkeypatch.setattr("src.core.sync.refresh_user_identity_from_etcd", no_refresh)
 
 
 @pytest.mark.asyncio
@@ -37,7 +52,8 @@ async def test_update_user_role_promotes_to_admin(monkeypatch):
     user.roles = [role]
     return user
 
-  async def publish_user(_user):
+  async def publish_user(_user, **kwargs):
+    assert kwargs["fields"] == {"roles"}
     return None
 
   monkeypatch.setattr(auth_service.user_crud, "read_user_by_id", read_user_by_id)

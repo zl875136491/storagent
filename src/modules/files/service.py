@@ -1,6 +1,7 @@
 import asyncio
 import io
-from typing import Optional, List
+import weakref
+from typing import Any, Callable, Optional, List
 
 from minio.datatypes import Part
 from fastapi import UploadFile
@@ -12,9 +13,78 @@ from src.core.minio_op import get_minio_client
 from src.modules.storage import crud as storage_crud
 from src.modules.files import schema as files_schema
 from src.modules.files import locate as files_locate
+from src.modules.files import quota as files_quota
+from src.modules.public import service as public_service
 from src.modules.usage.service import record_transfer
 
 _READ_CHUNK = 1024 * 1024
+_QUOTA_EXCEEDED_REASON = "APP 存储超出限额，请联系管理员处理"
+_upload_part_semaphores = weakref.WeakKeyDictionary()
+
+
+def _upload_part_semaphore() -> asyncio.Semaphore:
+  loop = asyncio.get_running_loop()
+  limit = max(int(settings.APPLICATION_UPLOAD_MAX_IN_MEMORY_PARTS), 1)
+  existing = _upload_part_semaphores.get(loop)
+  if existing is None or existing[0] != limit:
+    existing = (limit, asyncio.Semaphore(limit))
+    _upload_part_semaphores[loop] = existing
+  return existing[1]
+
+
+async def _run_thread_to_completion(call: Callable[[], Any]):
+  """Let an in-flight MinIO call settle even if the HTTP task is cancelled."""
+  task = asyncio.create_task(asyncio.to_thread(call))
+  try:
+    result = await asyncio.shield(task)
+    files_quota.raise_if_quota_lock_lost()
+    return result, None
+  except asyncio.CancelledError as cancellation:
+    result = await task
+    files_quota.raise_if_quota_lock_lost()
+    return result, cancellation
+
+
+def _is_bucket_quota_exceeded(error: Exception) -> bool:
+  values = [
+    str(error),
+    str(getattr(error, "code", "")),
+    str(getattr(error, "message", "")),
+  ]
+  normalized = " ".join(values).lower()
+  return (
+    "xminioadminbucketquotaexceeded" in normalized
+    or "bucket quota exceeded" in normalized
+  )
+
+
+def _is_no_such_upload(error: BaseException) -> bool:
+  values = (
+    str(error),
+    str(getattr(error, "code", "")),
+    str(getattr(error, "message", "")),
+  )
+  normalized = " ".join(values).lower().replace("_", "")
+  return "nosuchupload" in normalized or "upload does not exist" in normalized
+
+
+def _is_no_such_object(error: BaseException) -> bool:
+  code = str(getattr(error, "code", "")).lower()
+  normalized = f"{code} {error}".lower().replace("_", "")
+  return any(value in normalized for value in (
+    "nosuchkey",
+    "nosuchobject",
+    "object does not exist",
+  ))
+
+
+def _raise_minio_write_error(error: Exception) -> None:
+  if _is_bucket_quota_exceeded(error):
+    raise CustomException(
+      ErrorDesc.APP_STORAGE_QUOTA_EXCEEDED,
+      _QUOTA_EXCEEDED_REASON,
+    )
+  raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(error))
 
 def _normalize_etag(etag: str) -> str:
   e = etag.strip()
@@ -30,29 +100,137 @@ def gen_object_key() -> str:
   import uuid
   return str(uuid.uuid4())
 
-async def _get_minio_client():
-  ms = await storage_crud.read_master_minio_server()
+async def _get_minio_client_with_server():
+  ms = await storage_crud.read_minio_server_by_region_name(settings.REGION)
   if not ms:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
   access_key, secret_key = storage_crud.plain_minio_credentials(ms)
-  return get_minio_client(ms.host, ms.minio_port, access_key, secret_key)
+  return (
+    settings.REGION,
+    get_minio_client(ms.host, ms.minio_port, access_key, secret_key),
+  )
+
+
+async def _get_minio_client():
+  _server_name, client = await _get_minio_client_with_server()
+  return client
+
+
+async def _get_minio_client_for_server(server_name: str):
+  server = await storage_crud.read_minio_server_by_region_name(server_name)
+  if not server:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, f"MinioServer: {server_name}")
+  access_key, secret_key = storage_crud.plain_minio_credentials(server)
+  return get_minio_client(
+    server.host,
+    server.minio_port,
+    access_key,
+    secret_key,
+  )
+
+
+async def _recover_completed_result(
+  client,
+  app_name: str,
+  object_key: str,
+  declared_size_bytes: int,
+) -> dict[str, Any] | None:
+  def _stat():
+    return client.stat_object(app_name, object_key)
+
+  try:
+    metadata = await asyncio.to_thread(_stat)
+  except Exception as error:
+    if _is_no_such_object(error):
+      return None
+    raise CustomException(
+      ErrorDesc.MINIO_ACCESS_FAILED,
+      f"无法确认完成中的对象状态: {error}",
+    ) from error
+  if int(getattr(metadata, "size", -1)) != declared_size_bytes:
+    raise CustomException(
+      ErrorDesc.STATUS_ERR,
+      "完成中的对象大小与上传声明不一致，已保留配额预留等待人工确认",
+    )
+  return {
+    "etag": getattr(metadata, "etag", None),
+    "version_id": getattr(metadata, "version_id", None),
+  }
 
 
 async def multipart_init(
   app_context: dict,
-  content_type: str) -> files_schema.MultipartInitResponse:
+  content_type: str,
+  *,
+  size_bytes: int,
+) -> files_schema.MultipartInitResponse:
   app_name = app_context["app_name"]
+  api_key_id = str(app_context.get("api_key_id") or "")
+  source_server, client = await _get_minio_client_with_server()
   object_key = gen_object_key()
-  client = await _get_minio_client()
+
+  async def quota_loader(quota_client) -> int:
+    return await public_service.get_application_quota_limit(
+      app_name,
+      client=quota_client,
+    )
+
+  async def usage_loader() -> int:
+    _quota_bytes, usage_bytes = await public_service.get_application_quota_usage(
+      app_name,
+      force=True,
+      require_all=True,
+    )
+    return usage_bytes
+
+  reservation = await files_quota.reserve_upload(
+    app_name=app_name,
+    api_key_id=api_key_id,
+    object_key=object_key,
+    source_server=source_server,
+    declared_size_bytes=size_bytes,
+    quota_loader=quota_loader,
+    usage_loader=usage_loader,
+  )
   headers = {"Content-Type": content_type}
 
   def _create():
     return client._create_multipart_upload(app_name, object_key, headers)
 
   try:
-    upload_id = await asyncio.to_thread(_create)
-  except Exception as e:
-    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
+    upload_id, cancellation = await _run_thread_to_completion(_create)
+  except BaseException as error:
+    await files_quota.cancel_reservation(reservation)
+    if isinstance(error, asyncio.CancelledError):
+      raise
+    _raise_minio_write_error(error)
+
+  if cancellation is not None:
+    try:
+      await asyncio.to_thread(
+        client._abort_multipart_upload,
+        app_name,
+        object_key,
+        upload_id,
+      )
+    finally:
+      await files_quota.cancel_reservation(reservation)
+    raise cancellation
+
+  try:
+    await files_quota.activate_reservation(reservation, upload_id)
+  except BaseException:
+    try:
+      await asyncio.to_thread(
+        client._abort_multipart_upload,
+        app_name,
+        object_key,
+        upload_id,
+      )
+    except Exception:
+      pass
+    await files_quota.cancel_reservation(reservation)
+    raise
 
   return files_schema.MultipartInitResponse(
     upload_id=upload_id,
@@ -72,18 +250,71 @@ async def multipart_upload_part(
   if part_number < 1 or part_number > 10000:
     raise CustomException(ErrorDesc.INVALID_PARAMS, "part_number 必须在 1-10000 之间")
   key = object_key.strip()
-  data = await file.read()
-  client = await _get_minio_client()
+  api_key_id = str(app_context.get("api_key_id") or "")
 
-  def _upload():
-    return client._upload_part(app_name, key, data, None, upload_id, part_number)
+  max_part_bytes = max(int(settings.APPLICATION_UPLOAD_MAX_PART_BYTES), 1)
+  async with _upload_part_semaphore():
+    async with files_quota.upload_part_lock(
+      app_name,
+      key,
+      part_number,
+    ) as quota_client:
+      reservation = await files_quota.get_upload_session(
+        quota_client,
+        app_name=app_name,
+        api_key_id=api_key_id,
+        object_key=key,
+        upload_id=upload_id,
+      )
+      read_limit = min(max_part_bytes, reservation.declared_size_bytes) + 1
+      data = await file.read(read_limit)
+      if len(data) > max_part_bytes:
+        raise CustomException(
+          ErrorDesc.UPLOAD_PART_TOO_LARGE,
+          f"单个上传分片不能超过 {max_part_bytes} 字节",
+        )
+      prepared = await files_quota.prepare_part(
+        quota_client,
+        app_name=app_name,
+        api_key_id=api_key_id,
+        object_key=key,
+        upload_id=upload_id,
+        part_number=part_number,
+        size_bytes=len(data),
+      )
+      try:
+        client = await _get_minio_client_for_server(
+          prepared.reservation.source_server
+        )
 
-  try:
-    etag = await asyncio.to_thread(_upload)
-  except Exception as e:
-    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
+        def _upload():
+          return client._upload_part(app_name, key, data, None, upload_id, part_number)
+
+        etag, cancellation = await _run_thread_to_completion(_upload)
+      except BaseException as error:
+        if isinstance(error, asyncio.CancelledError):
+          raise
+        await files_quota.rollback_part(quota_client, prepared, part_number)
+        _raise_minio_write_error(error)
+      try:
+        await files_quota.commit_part(
+          quota_client,
+          prepared,
+          part_number,
+          _normalize_etag(etag),
+        )
+      except BaseException as error:
+        if isinstance(error, asyncio.CancelledError):
+          raise
+        await files_quota.rollback_part(quota_client, prepared, part_number)
+        raise CustomException(
+          ErrorDesc.SYNC_FAILED,
+          "分片已写入 MinIO，但上传状态同步失败，请重试该分片",
+        ) from error
 
   await record_transfer(app_context, "upload", len(data))
+  if cancellation is not None:
+    raise cancellation
   return files_schema.MultipartPartResponse(
     part_number=part_number,
     etag=_normalize_etag(etag),
@@ -99,44 +330,157 @@ async def multipart_complete(
   完成分片上传
   """
   app_name = app_context["app_name"]
+  api_key_id = str(app_context.get("api_key_id") or "")
   parts_sorted = sorted(parts, key=lambda p: p.part_number)
-  parts = [
+  submitted_parts = [
     Part(part_number=p.part_number, etag=_normalize_etag(p.etag))
     for p in parts_sorted
   ]
-  client = await _get_minio_client()
+  key = object_key.strip()
 
-  def _complete():
-    return client._complete_multipart_upload(app_name, object_key, upload_id, parts)
+  async with files_quota.application_quota_lock(app_name) as quota_client:
+    prepared = await files_quota.prepare_completion(
+      quota_client,
+      app_name=app_name,
+      api_key_id=api_key_id,
+      object_key=key,
+      upload_id=upload_id,
+      parts=[(part.part_number, part.etag) for part in parts_sorted],
+    )
+    if prepared.already_completed:
+      saved_result = prepared.result or {}
+      await files_quota.finalize_completed_session(
+        quota_client,
+        prepared.reservation,
+      )
+      return files_schema.MultipartCompleteResponse(
+        bucket=app_name,
+        object_key=key,
+        etag=saved_result.get("etag"),
+        version_id=saved_result.get("version_id"),
+      )
 
-  try:
-    result = await asyncio.to_thread(_complete)
-  except Exception as e:
-    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
+    client = await _get_minio_client_for_server(
+      prepared.reservation.source_server
+    )
 
+    def _complete():
+      return client._complete_multipart_upload(
+        app_name,
+        key,
+        upload_id,
+        submitted_parts,
+      )
+
+    saved_result = None
+    cancellation = None
+    if prepared.recovering:
+      saved_result = await _recover_completed_result(
+        client,
+        app_name,
+        key,
+        prepared.reservation.declared_size_bytes,
+      )
+    if saved_result is None:
+      try:
+        result, cancellation = await _run_thread_to_completion(_complete)
+        saved_result = {
+          "etag": result.etag,
+          "version_id": result.version_id,
+        }
+      except BaseException as error:
+        if isinstance(error, asyncio.CancelledError):
+          raise
+        if _is_no_such_upload(error):
+          saved_result = await _recover_completed_result(
+            client,
+            app_name,
+            key,
+            prepared.reservation.declared_size_bytes,
+          )
+          if saved_result is None:
+            await files_quota.record_aborted_session(
+              quota_client,
+              prepared.reservation,
+            )
+            await files_quota.finalize_aborted_session(
+              quota_client,
+              prepared.reservation,
+            )
+            raise CustomException(
+              ErrorDesc.MINIO_ACCESS_FAILED,
+              "上传会话已不在 MinIO 中，请重新初始化上传",
+            ) from error
+        if saved_result is None:
+          await files_quota.restore_active_session(
+            quota_client,
+            prepared.reservation,
+          )
+          _raise_minio_write_error(error)
+
+    try:
+      await files_quota.record_completed_session(
+        quota_client,
+        prepared.reservation,
+        saved_result,
+      )
+      await files_quota.finalize_completed_session(
+        quota_client,
+        prepared.reservation,
+      )
+    except BaseException as error:
+      if isinstance(error, asyncio.CancelledError):
+        raise
+      raise CustomException(
+        ErrorDesc.SYNC_FAILED,
+        "对象已完成上传，但配额状态同步失败；预留将保留至自动校准",
+      ) from error
+
+  if cancellation is not None:
+    raise cancellation
   return files_schema.MultipartCompleteResponse(
     bucket=app_name,
-    object_key=object_key,
-    etag=result.etag,
-    version_id=result.version_id,
+    object_key=key,
+    etag=saved_result.get("etag"),
+    version_id=saved_result.get("version_id"),
   )
 
 
 async def multipart_abort(body: files_schema.MultipartAbortRequest,
   app_context: dict) -> dict:
   app_name = app_context["app_name"]
+  api_key_id = str(app_context.get("api_key_id") or "")
   b = app_name
   object_key = body.object_key.strip()
-  client = await _get_minio_client()
+  async with files_quota.application_quota_lock(app_name) as quota_client:
+    prepared = await files_quota.prepare_abort(
+      quota_client,
+      app_name=app_name,
+      api_key_id=api_key_id,
+      object_key=object_key,
+      upload_id=body.upload_id,
+    )
+    reservation = prepared.reservation
+    cancellation = None
+    if not prepared.already_aborted:
+      client = await _get_minio_client_for_server(reservation.source_server)
 
-  def _abort():
-    client._abort_multipart_upload(b, object_key, body.upload_id)
+      def _abort():
+        client._abort_multipart_upload(b, object_key, body.upload_id)
 
-  try:
-    await asyncio.to_thread(_abort)
-  except Exception as e:
-    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
+      try:
+        _result, cancellation = await _run_thread_to_completion(_abort)
+      except BaseException as error:
+        if isinstance(error, asyncio.CancelledError):
+          raise
+        if not _is_no_such_upload(error):
+          await files_quota.restore_aborted_session(quota_client, reservation)
+          raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(error))
+      await files_quota.record_aborted_session(quota_client, reservation)
+    await files_quota.finalize_aborted_session(quota_client, reservation)
 
+  if cancellation is not None:
+    raise cancellation
   return {"bucket": b, "object_key": object_key, "upload_id": body.upload_id, "aborted": True}
 
 
@@ -147,9 +491,18 @@ async def multipart_list_parts(
   part_number_marker: Optional[str],
 ) -> files_schema.MultipartListPartsResponse:
   app_name = app_context["app_name"]
+  api_key_id = str(app_context.get("api_key_id") or "")
   b = app_name
   key = object_key.strip()
-  client = await _get_minio_client()
+  async with files_quota.application_quota_lock(app_name) as quota_client:
+    reservation = await files_quota.get_upload_session(
+      quota_client,
+      app_name=app_name,
+      api_key_id=api_key_id,
+      object_key=key,
+      upload_id=upload_id,
+    )
+  client = await _get_minio_client_for_server(reservation.source_server)
 
   def _list():
     return client._list_parts(

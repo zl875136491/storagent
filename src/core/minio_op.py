@@ -1,5 +1,6 @@
 import json
 import asyncio
+import re
 import shlex
 import subprocess
 from time import perf_counter
@@ -120,6 +121,158 @@ async def run_mc_json(
   if not items:
     return False, [], "MinIO 命令未返回 JSON 数据", elapsed_ms
   return True, items, "", elapsed_ms
+
+
+def _parse_mc_size_bytes(value: Any) -> int | None:
+  if isinstance(value, bool):
+    return None
+  if isinstance(value, (int, float)):
+    return max(int(value), 0)
+  if not isinstance(value, str):
+    return None
+  normalized = value.strip().replace(" ", "")
+  match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([A-Za-z]*)", normalized)
+  if not match:
+    return None
+  amount = float(match.group(1))
+  unit = match.group(2).lower()
+  factors = {
+    "": 1,
+    "b": 1,
+    "k": 1000,
+    "kb": 1000,
+    "ki": 1024,
+    "kib": 1024,
+    "m": 1000 ** 2,
+    "mb": 1000 ** 2,
+    "mi": 1024 ** 2,
+    "mib": 1024 ** 2,
+    "g": 1000 ** 3,
+    "gb": 1000 ** 3,
+    "gi": 1024 ** 3,
+    "gib": 1024 ** 3,
+    "t": 1000 ** 4,
+    "tb": 1000 ** 4,
+    "ti": 1024 ** 4,
+    "tib": 1024 ** 4,
+    "p": 1000 ** 5,
+    "pb": 1000 ** 5,
+    "pi": 1024 ** 5,
+    "pib": 1024 ** 5,
+  }
+  factor = factors.get(unit)
+  return int(amount * factor) if factor is not None else None
+
+
+async def set_bucket_hard_quota(
+  server_name: str,
+  bucket_name: str,
+  quota_bytes: int,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, str]:
+  if quota_bytes <= 0:
+    return False, "存储桶配额必须大于 0"
+  success, _, error, _ = await run_mc_json(
+    [
+      "quota", "set", f"{server_name}/{bucket_name}",
+      "--size", f"{int(quota_bytes)}B",
+    ],
+    timeout=timeout,
+  )
+  return success, error
+
+
+async def clear_bucket_hard_quota(
+  server_name: str,
+  bucket_name: str,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, str]:
+  success, _, error, _ = await run_mc_json(
+    ["quota", "clear", f"{server_name}/{bucket_name}"],
+    timeout=timeout,
+  )
+  return success, error
+
+
+async def get_bucket_hard_quota(
+  server_name: str,
+  bucket_name: str,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, int | None, str]:
+  success, items, error, _ = await run_mc_json(
+    ["quota", "info", f"{server_name}/{bucket_name}"],
+    timeout=timeout,
+    record=False,
+  )
+  if not success:
+    quota_error = f"{error} {json.dumps(items, ensure_ascii=False)}".lower()
+    if (
+      "xminioadminnosuchquotaconfiguration" in quota_error
+      or "quota configuration does not exist" in quota_error
+      or "quota is not set" in quota_error
+    ):
+      return True, None, ""
+    return False, None, error
+  for item in reversed(items):
+    for field in ("quota", "size", "hardQuota", "hard_quota"):
+      if field not in item:
+        continue
+      parsed = _parse_mc_size_bytes(item.get(field))
+      if parsed is not None:
+        return True, parsed, ""
+  return True, None, ""
+
+
+async def get_bucket_usage_bytes(
+  server_name: str,
+  bucket_name: str,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, int, str]:
+  success, items, error, _ = await run_mc_json(
+    ["du", "--recursive", "--versions", f"{server_name}/{bucket_name}"],
+    timeout=timeout,
+    record=False,
+  )
+  if not success:
+    return False, 0, error
+  sizes = [
+    parsed
+    for item in items
+    if (parsed := _parse_mc_size_bytes(item.get("size"))) is not None
+  ]
+  if not sizes:
+    return False, 0, "MinIO 用量命令未返回 size"
+  # mc du normally returns one summary line. max also tolerates clients that
+  # emit both intermediate and final summary records.
+  return True, max(sizes), ""
+
+
+async def ensure_bucket_hard_quota(
+  server_name: str,
+  bucket_name: str,
+  quota_bytes: int,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, str]:
+  success, current, error = await get_bucket_hard_quota(
+    server_name,
+    bucket_name,
+    timeout=timeout,
+  )
+  if not success:
+    return False, error
+  if current == quota_bytes:
+    return True, ""
+  return await set_bucket_hard_quota(
+    server_name,
+    bucket_name,
+    quota_bytes,
+    timeout=timeout,
+  )
 
 
 async def get_cluster_admin_info(

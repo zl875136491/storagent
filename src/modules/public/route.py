@@ -104,6 +104,24 @@ async def get_application_list(
   """
   return await public_service.get_application_list()
 
+
+@router.put(
+  path="/application/{application_id}/quota",
+  response_model=public_schema.ApplicationResponse,
+  summary="更新应用存储配额",
+)
+async def update_application_quota(
+  application_id: public_schema.PydanticObjectId,
+  payload: public_schema.ApplicationQuotaUpdateRequest,
+  current_user: User = Depends(get_current_user),
+) -> public_schema.ApplicationResponse:
+  await check_permissions(current_user, ["application_quota_manage"])
+  return await public_service.update_application_quota(
+    application_id,
+    payload.quota_bytes,
+    current_user,
+  )
+
 @router.post(
   path="/application/{application_id}/approval",
   summary="授权应用（SSE 进度）")

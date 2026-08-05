@@ -10,6 +10,7 @@ from typing import List
 from src.utils.helpers import utc_now, get_full_permissions
 from src.core.exception import CustomException, ErrorDesc
 from src.utils.logger import logger
+from src.configs.consts import ROLE_SUPERADMIN, ROLE_USER
 
 async def read_user_by_username(username: str) -> User:
   """
@@ -152,17 +153,41 @@ async def create_role(name: str, is_admin: bool, permissions: List[str]) -> Role
   await role.save()
   return role
 
+
+async def upsert_role(name: str, is_admin: bool, permissions: List[str]) -> Role:
+  """Create or update a system role by its stable name."""
+  desired_permissions = sorted(set(permissions))
+  role = await Role.find_one(Role.name == name)
+  if role is None:
+    return await create_role(name, is_admin, desired_permissions)
+  if (
+    bool(role.is_admin) != bool(is_admin)
+    or sorted(role.permissions or []) != desired_permissions
+  ):
+    role.is_admin = is_admin
+    role.permissions = desired_permissions
+    await role.save()
+  return role
+
+
+async def get_role_by_name(name: str) -> Role | None:
+  return await Role.find_one(Role.name == name)
+
 async def get_admin_role() -> Role:
   """
   获取管理员角色
   """
+  role = await get_role_by_name(ROLE_SUPERADMIN)
+  if role:
+    return role
+  # Compatibility for installations created before roles had stable names.
   return await Role.find_one(Role.is_admin == True)
 
 async def get_basic_role() -> Role:
   """
   获取基础用户角色
   """
-  return await Role.find_one(Role.is_admin == False)
+  return await get_role_by_name(ROLE_USER)
 
 async def list_local_users() -> List[User]:
   """列出本系统可登录用户（排除跨区同步占位用户）。"""
@@ -182,18 +207,82 @@ async def count_admin_users() -> int:
   count = 0
   for user in users:
     for role in user.roles or []:
-      if getattr(role, "id", None) == admin_role.id:
+      if (
+        getattr(role, "id", None) == admin_role.id
+        or getattr(role, "name", None) == ROLE_SUPERADMIN
+      ):
         count += 1
         break
   return count
 
 async def update_user_role(user: User, role: Role) -> User:
-  """将用户角色替换为指定角色，并重算 permissions。"""
-  user.roles = [role]
-  user.permissions = await get_all_permissions([role])
+  """Compatibility wrapper for callers that still submit one role."""
+  return await update_user_roles(user, [role])
+
+
+async def update_user_roles(user: User, roles: List[Role]) -> User:
+  """Replace specialty roles while always retaining the basic user role."""
+  basic_role = await get_basic_role()
+  selected = [basic_role] if basic_role else []
+  selected.extend(roles or [])
+  deduplicated = []
+  seen = set()
+  for role in selected:
+    if role is None:
+      continue
+    identity = getattr(role, "name", None) or str(getattr(role, "id", ""))
+    if not identity or identity in seen:
+      continue
+    seen.add(identity)
+    deduplicated.append(role)
+  user.roles = deduplicated
+  user.permissions = await get_all_permissions(deduplicated)
   user.updated_at = utc_now()
   await user.save()
   return user
+
+
+async def recompute_all_user_permissions() -> int:
+  """Normalize stored roles and cached permissions after role definitions change."""
+  basic_role = await get_basic_role()
+  if basic_role is None:
+    return 0
+  users = await User.find_all(fetch_links=True).to_list()
+  changed_count = 0
+  for user in users:
+    current_roles = list(user.roles or [])
+    normalized = [basic_role]
+    seen_names = {ROLE_USER}
+    for role in current_roles:
+      role_name = getattr(role, "name", None)
+      if not role_name or role_name in seen_names:
+        continue
+      seen_names.add(role_name)
+      normalized.append(role)
+    permissions = await get_all_permissions(normalized)
+    current_names = [
+      getattr(role, "name", None) for role in current_roles
+      if getattr(role, "name", None)
+    ]
+    normalized_names = [role.name for role in normalized]
+    if (
+      current_names == normalized_names
+      and sorted(user.permissions or []) == permissions
+    ):
+      continue
+    user.roles = normalized
+    user.permissions = permissions
+    await user.save()
+    changed_count += 1
+  return changed_count
+
+
+async def list_users_with_permission(permission: str) -> List[User]:
+  users = await list_local_users()
+  return [
+    user for user in users
+    if permission in (getattr(user, "permissions", []) or [])
+  ]
 
 def blacklist_expiry_for_token(token: str):
   """
@@ -288,5 +377,4 @@ async def get_all_permissions(roles: List[Role]) -> List[str]:
   for role in roles:
     full_permissions = get_full_permissions(role.permissions)
     permissions.extend(full_permissions)
-  permissions = list(set(permissions))
-  return permissions
+  return sorted(set(permissions))

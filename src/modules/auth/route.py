@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Request
 from src.modules.auth import service as auth_service
 from src.modules.auth import schema as auth_schema
-from src.core.auth import get_current_user, oauth2_scheme, require_admin
+from src.core.auth import check_permissions, get_current_user, oauth2_scheme
 from src.core.rate_limit import (
   rate_limit_login,
   rate_limit_oa_request,
@@ -123,7 +123,7 @@ async def logout(
 async def list_users(
   current_user: User = Depends(get_current_user),
 ) -> auth_schema.AdminUserListResponse:
-  await require_admin(current_user)
+  await check_permissions(current_user, ["user_manage"])
   return await auth_service.list_users_for_admin()
 
 @router.put(
@@ -135,5 +135,9 @@ async def update_user_role(
   payload: auth_schema.UpdateUserRoleRequest,
   current_user: User = Depends(get_current_user),
 ) -> auth_schema.UpdateUserRoleResponse:
-  await require_admin(current_user)
-  return await auth_service.update_user_role_for_admin(user_id, payload.role)
+  await check_permissions(current_user, ["user_manage"])
+  return await auth_service.update_user_role_for_admin(
+    user_id,
+    payload.role_names,
+    current_user,
+  )

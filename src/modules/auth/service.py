@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 from jose import JWTError, jwt
 from datetime import timedelta
@@ -12,6 +13,13 @@ from src.core.auth import (
   preset_admin_user,
 )
 from src.configs.configs import settings
+from src.configs.consts import (
+  ROLE_APPLICATION_ADMIN,
+  ROLE_OPERATIONS_ADMIN,
+  ROLE_SUPERADMIN,
+  ROLE_USER,
+  ROLE_USER_ADMIN,
+)
 from src.utils.helpers import (
   convert_utc_to_local_str,
   import_user_from_springboard,
@@ -26,6 +34,11 @@ AUTH_PURPOSE_PASSWORD_RESET = "password_reset"
 AUTH_PURPOSE_LOGIN = "login"
 
 
+async def _ensure_user_lock_owned(guard) -> None:
+  if guard is not None:
+    await guard.ensure_owned()
+
+
 def _directory_display_name(user_info: dict | None, username: str) -> str:
   if not isinstance(user_info, dict):
     return username
@@ -33,19 +46,6 @@ def _directory_display_name(user_info: dict | None, username: str) -> str:
   if not isinstance(nested, dict):
     return username
   return str(nested.get("l") or nested.get("name") or username).strip() or username
-
-
-async def _publish_user_best_effort(user: User) -> None:
-  try:
-    from src.core import sync as sync_module
-    await sync_module.publish_user(user)
-  except Exception as exc:
-    from src.core import metrics as metrics_mod
-    from src.utils.logger import logger
-    metrics_mod.incr("sync_failures_total")
-    logger.warning(
-      f"User {user.username} 同步到 Etcd 失败，将由周期校准重试: {exc}"
-    )
 
 
 async def _request_oa_challenge(
@@ -155,48 +155,146 @@ async def request_login_link(username: str) -> dict:
 
 
 async def _complete_registration(challenge) -> User:
-  user = await user_crud.read_user_by_username(challenge.username)
-  if user and not getattr(user, "is_sync", False):
-    return user
-  if not challenge.password_hash:
-    raise CustomException(ErrorDesc.AUTH_CODE_INVALID)
+  from src.core import sync as sync_module
 
-  if preset_admin_user(challenge.username):
-    role = await user_crud.get_admin_role()
-  else:
-    role = await user_crud.get_basic_role()
-  if role is None:
-    raise CustomException(ErrorDesc.STATUS_ERR, "系统角色尚未初始化")
+  try:
+    async with sync_module.user_role_update_lock(
+      challenge.username,
+      timeout=0,
+    ) as guard:
+      user = await sync_module.refresh_user_identity_from_etcd(challenge.username)
+      if user and not getattr(user, "is_sync", False):
+        return user
+      if not challenge.password_hash:
+        raise CustomException(ErrorDesc.AUTH_CODE_INVALID)
 
-  if user:
-    user.name = challenge.display_name or challenge.username
-    user.hashed_password = challenge.password_hash
-    user.roles = [role]
-    user.permissions = await user_crud.get_all_permissions([role])
-    user.is_sync = False
-    user.updated_at = utc_now()
-    await user.save()
-  else:
-    user = await user_crud.create_user(
-      username=challenge.username,
-      name=challenge.display_name or challenge.username,
-      hashed_password=challenge.password_hash,
-      roles=[role],
-    )
-  await _publish_user_best_effort(user)
-  return user
+      basic_role = await user_crud.get_basic_role()
+      admin_role = (
+        await user_crud.get_admin_role()
+        if preset_admin_user(challenge.username) else None
+      )
+      if basic_role is None or (
+        preset_admin_user(challenge.username) and admin_role is None
+      ):
+        raise CustomException(ErrorDesc.STATUS_ERR, "系统角色尚未初始化")
+      roles = [basic_role]
+      if admin_role:
+        roles.append(admin_role)
+
+      previous = None
+      created = user is None
+      if user:
+        previous = {
+          "name": user.name,
+          "hashed_password": user.hashed_password,
+          "roles": list(user.roles or []),
+          "permissions": list(getattr(user, "permissions", []) or []),
+          "is_sync": bool(getattr(user, "is_sync", False)),
+          "auth_version": int(getattr(user, "auth_version", 0)),
+          "roles_version": int(getattr(user, "roles_version", 0)),
+          "updated_at": getattr(user, "updated_at", None),
+        }
+      try:
+        await _ensure_user_lock_owned(guard)
+        if user:
+          user.name = challenge.display_name or challenge.username
+          user.hashed_password = challenge.password_hash
+          user.roles = roles
+          user.permissions = await user_crud.get_all_permissions(roles)
+          user.is_sync = False
+          user.roles_version = int(getattr(user, "roles_version", 0)) + 1
+          user.updated_at = utc_now()
+          await user.save()
+        else:
+          user = await user_crud.create_user(
+            username=challenge.username,
+            name=challenge.display_name or challenge.username,
+            hashed_password=challenge.password_hash,
+            roles=roles,
+          )
+          user.roles_version = 1
+          await user.save()
+        await _ensure_user_lock_owned(guard)
+        await sync_module.publish_user(
+          user,
+          fields={"auth", "roles", "profile"},
+        )
+        await _ensure_user_lock_owned(guard)
+      except BaseException:
+        if created and user is not None:
+          await asyncio.shield(user.delete())
+        elif user is not None and previous is not None:
+          for field, value in previous.items():
+            setattr(user, field, value)
+          await asyncio.shield(user.save())
+        raise
+      return user
+  except (
+    sync_module.UserIdentityUpdateLockBusyError,
+    sync_module.UserIdentityUpdateLockLostError,
+  ) as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "用户身份正在其他区域更新，请稍后重试",
+    ) from error
+  except sync_module.UserIdentityVersionConflictError as error:
+    raise CustomException(ErrorDesc.SYNC_FAILED, str(error)) from error
+  except CustomException:
+    raise
+  except Exception as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "用户注册信息未能同步到所有区域，请稍后重试",
+    ) from error
 
 
 async def _complete_password_reset(challenge) -> User:
-  user = await user_crud.read_user_by_username(challenge.username)
-  if not user or getattr(user, "is_sync", False) or not challenge.password_hash:
-    raise CustomException(ErrorDesc.AUTH_CODE_INVALID)
-  user.hashed_password = challenge.password_hash
-  user.auth_version = int(getattr(user, "auth_version", 0)) + 1
-  user.updated_at = utc_now()
-  await user.save()
-  await _publish_user_best_effort(user)
-  return user
+  from src.core import sync as sync_module
+
+  try:
+    async with sync_module.user_role_update_lock(
+      challenge.username,
+      timeout=0,
+    ) as guard:
+      user = await sync_module.refresh_user_identity_from_etcd(challenge.username)
+      if not user or getattr(user, "is_sync", False) or not challenge.password_hash:
+        raise CustomException(ErrorDesc.AUTH_CODE_INVALID)
+      previous_hash = user.hashed_password
+      previous_auth_version = int(getattr(user, "auth_version", 0))
+      previous_updated_at = getattr(user, "updated_at", None)
+      try:
+        await _ensure_user_lock_owned(guard)
+        user.hashed_password = challenge.password_hash
+        user.auth_version = previous_auth_version + 1
+        user.updated_at = utc_now()
+        await user.save()
+        await _ensure_user_lock_owned(guard)
+        await sync_module.publish_user(user, fields={"auth"})
+        await _ensure_user_lock_owned(guard)
+      except BaseException:
+        user.hashed_password = previous_hash
+        user.auth_version = previous_auth_version
+        user.updated_at = previous_updated_at
+        await asyncio.shield(user.save())
+        raise
+      return user
+  except (
+    sync_module.UserIdentityUpdateLockBusyError,
+    sync_module.UserIdentityUpdateLockLostError,
+  ) as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "用户身份正在其他区域更新，请稍后重试",
+    ) from error
+  except sync_module.UserIdentityVersionConflictError as error:
+    raise CustomException(ErrorDesc.SYNC_FAILED, str(error)) from error
+  except CustomException:
+    raise
+  except Exception as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "密码重置未能同步到所有区域，请稍后重试",
+    ) from error
 
 
 async def login_by_code(username: str, code: str) -> dict:
@@ -304,24 +402,25 @@ async def get_user_profile(user: User) -> dict:
   user_roles = []
   is_admin = False
   admin_role = await user_crud.get_admin_role()
-  for role in user_obj.roles:
-    if role.id == admin_role.id:
+  for role in user_obj.roles or []:
+    if (
+      getattr(role, "name", None) == ROLE_SUPERADMIN
+      or (admin_role and getattr(role, "id", None) == admin_role.id)
+    ):
       is_admin = True
     user_roles.append({
       "id": str(role.id),
       "name": role.name
     })
-  # user_permissions = []
-  # for permission in user.permissions:
-  #   user_permissions.append(permission)
   return dict[str, str | datetime | list](
-    id=str(user.id),
-    username=user.username,
-    name=user.name,
+    id=str(user_obj.id),
+    username=user_obj.username,
+    name=user_obj.name,
     roles=user_roles,
+    permissions=sorted(getattr(user_obj, "permissions", []) or []),
     is_admin=is_admin,
-    created_at=convert_utc_to_local_str(user.created_at),
-    updated_at=convert_utc_to_local_str(user.updated_at),
+    created_at=convert_utc_to_local_str(user_obj.created_at),
+    updated_at=convert_utc_to_local_str(user_obj.updated_at),
     system_time=convert_utc_to_local_str(local_utc_now())
   )
 
@@ -342,21 +441,27 @@ async def logout_user(token: str) -> dict:
 
 
 def _user_role_summary(user: User, admin_role) -> dict:
-  is_admin = False
-  role_name = "用户"
+  role_items = []
   for role in user.roles or []:
-    if admin_role and getattr(role, "id", None) == admin_role.id:
-      is_admin = True
-      role_name = role.name or "管理员"
-      break
-    if getattr(role, "name", None):
-      role_name = role.name
+    if not getattr(role, "name", None):
+      continue
+    role_items.append({"id": str(role.id), "name": role.name})
+  role_names = [item["name"] for item in role_items]
+  is_admin = ROLE_SUPERADMIN in role_names or any(
+    admin_role and item["id"] == str(admin_role.id) for item in role_items
+  )
+  specialty_names = [name for name in role_names if name != ROLE_USER]
+  role_name = ROLE_SUPERADMIN if is_admin else (
+    specialty_names[-1] if specialty_names else ROLE_USER
+  )
   return {
     "id": str(user.id),
     "username": user.username,
     "name": user.name,
     "is_admin": is_admin,
     "role_name": role_name,
+    "roles": role_items,
+    "permissions": sorted(getattr(user, "permissions", []) or []),
     "created_at": convert_utc_to_local_str(user.created_at),
     "updated_at": convert_utc_to_local_str(user.updated_at),
   }
@@ -371,11 +476,73 @@ async def list_users_for_admin() -> dict:
   return {"data": data}
 
 
-async def update_user_role_for_admin(user_id: str, role_name: str) -> dict:
-  """管理员：将用户角色设为「用户」或「管理员」。"""
-  role_name = (role_name or "").strip()
-  if role_name not in ("用户", "管理员"):
-    raise CustomException(ErrorDesc.INVALID_PARAMS, "角色仅支持「用户」或「管理员」")
+async def update_user_role_for_admin(
+  user_id: str,
+  role_names: list[str] | str,
+  actor: User | None = None,
+) -> dict:
+  """Update a user's system roles, preserving the mandatory basic role."""
+  legacy_call = isinstance(role_names, str)
+  submitted = [role_names] if legacy_call else list(role_names or [])
+  desired_names = []
+  for value in submitted:
+    role_name = (value or "").strip()
+    if role_name and role_name not in desired_names:
+      desired_names.append(role_name)
+  if ROLE_USER not in desired_names:
+    desired_names.insert(0, ROLE_USER)
+  allowed_names = {
+    ROLE_USER,
+    ROLE_APPLICATION_ADMIN,
+    ROLE_OPERATIONS_ADMIN,
+    ROLE_USER_ADMIN,
+    ROLE_SUPERADMIN,
+  }
+  unknown_names = sorted(set(desired_names) - allowed_names)
+  if unknown_names:
+    raise CustomException(
+      ErrorDesc.INVALID_PARAMS,
+      f"不支持的系统角色: {', '.join(unknown_names)}",
+    )
+
+  # Resolve the stable username before taking the cross-region lock. The
+  # target is read again inside the lock so authorization and rollback state
+  # come from the serialized snapshot.
+  target = await user_crud.read_user_by_id(user_id)
+  if not target or getattr(target, "is_sync", False):
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "用户不存在")
+  from src.core import sync as sync_module
+  try:
+    async with sync_module.user_role_update_lock(
+      target.username,
+      timeout=0,
+    ) as guard:
+      await sync_module.refresh_user_identity_from_etcd(target.username)
+      return await _update_user_roles_locked(
+        user_id,
+        desired_names,
+        actor,
+        legacy_call=legacy_call,
+        guard=guard,
+      )
+  except sync_module.UserRoleUpdateLockBusyError as error:
+    raise CustomException(ErrorDesc.STATUS_ERR, str(error)) from error
+  except sync_module.UserIdentityUpdateLockLostError as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "用户身份更新锁已丢失，角色变更已回滚，请重试",
+    ) from error
+
+
+async def _update_user_roles_locked(
+  user_id: str,
+  desired_names: list[str],
+  actor: User | None,
+  *,
+  legacy_call: bool,
+  guard=None,
+) -> dict:
+  from src.core import sync as sync_module
 
   target = await user_crud.read_user_by_id(user_id)
   if not target or getattr(target, "is_sync", False):
@@ -386,26 +553,66 @@ async def update_user_role_for_admin(user_id: str, role_name: str) -> dict:
   if not admin_role or not basic_role:
     raise CustomException(ErrorDesc.STATUS_ERR, "系统角色未初始化")
 
-  currently_admin = any(
+  current_names = {
+    getattr(role, "name", None) for role in (target.roles or [])
+    if getattr(role, "name", None)
+  }
+  currently_admin = ROLE_SUPERADMIN in current_names or any(
     getattr(role, "id", None) == admin_role.id for role in (target.roles or [])
   )
-  if currently_admin and role_name == "用户":
+  wants_admin = ROLE_SUPERADMIN in desired_names
+  actor_is_admin = actor is None or any(
+    getattr(role, "name", None) == ROLE_SUPERADMIN
+    or getattr(role, "id", None) == admin_role.id
+    for role in (getattr(actor, "roles", []) or [])
+  )
+  if currently_admin != wants_admin and not actor_is_admin:
+    raise CustomException(
+      ErrorDesc.INSUFFICIENT_PERMISSIONS,
+      "只有管理员可以授予或移除管理员角色",
+    )
+  if actor is not None and str(actor.id) == str(target.id) and not actor_is_admin:
+    added_roles = set(desired_names) - current_names - {ROLE_USER}
+    if added_roles:
+      raise CustomException(ErrorDesc.INSUFFICIENT_PERMISSIONS, "不能提升自己的系统角色")
+  if currently_admin and not wants_admin:
     if await user_crud.count_admin_users() <= 1:
       raise CustomException(ErrorDesc.INVALID_PARAMS, "不能取消系统中唯一的管理员")
 
-  new_role = admin_role if role_name == "管理员" else basic_role
+  roles_by_name = {ROLE_USER: basic_role, ROLE_SUPERADMIN: admin_role}
+  for role_name in desired_names:
+    if role_name in roles_by_name:
+      continue
+    role = await user_crud.get_role_by_name(role_name)
+    if role is None:
+      raise CustomException(ErrorDesc.STATUS_ERR, f"系统角色未初始化: {role_name}")
+    roles_by_name[role_name] = role
+  selected_roles = [roles_by_name[name] for name in desired_names]
   previous_roles = list(target.roles or [])
   previous_permissions = list(getattr(target, "permissions", []) or [])
+  previous_roles_version = int(getattr(target, "roles_version", 0))
   previous_updated_at = getattr(target, "updated_at", None)
-  updated = await user_crud.update_user_role(target, new_role)
   try:
-    from src.core import sync as sync_module
-    await sync_module.publish_user(updated)
-  except Exception as e:
+    await _ensure_user_lock_owned(guard)
+    target.roles_version = previous_roles_version + 1
+    if legacy_call:
+      compatibility_role = admin_role if wants_admin else basic_role
+      updated = await user_crud.update_user_role(target, compatibility_role)
+    else:
+      updated = await user_crud.update_user_roles(target, selected_roles)
+    await _ensure_user_lock_owned(guard)
+    await sync_module.publish_user(updated, fields={"roles"})
+    await _ensure_user_lock_owned(guard)
+  except BaseException as e:
     target.roles = previous_roles
     target.permissions = previous_permissions
+    target.roles_version = previous_roles_version
     target.updated_at = previous_updated_at
-    await target.save()
+    await asyncio.shield(target.save())
+    if isinstance(e, sync_module.LastSuperadminError):
+      raise CustomException(ErrorDesc.INVALID_PARAMS, str(e)) from e
+    if isinstance(e, (asyncio.CancelledError, sync_module.UserIdentityUpdateLockLostError)):
+      raise
     raise CustomException(
       ErrorDesc.SYNC_FAILED,
       "用户角色未能同步到所有区域，请稍后重试",
@@ -418,4 +625,8 @@ async def update_user_role_for_admin(user_id: str, role_name: str) -> dict:
     "name": summary["name"],
     "is_admin": summary["is_admin"],
     "role_name": summary["role_name"],
+    "roles": summary["roles"],
+    "permissions": summary["permissions"],
+    "created_at": summary["created_at"],
+    "updated_at": summary["updated_at"],
   }

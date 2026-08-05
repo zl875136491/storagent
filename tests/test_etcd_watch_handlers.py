@@ -1,11 +1,13 @@
-"""Etcd watch PUT/DELETE 分支可导入且应用停用逻辑存在。"""
+"""Etcd watch PUT/DELETE 分支与应用投影行为。"""
 import inspect
 import json
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from src.core import etcd_op
-from src.core.sync import upsert_application_from_etcd
+from src.core import sync as sync_module
 
 
 def test_watch_handlers_exist():
@@ -15,9 +17,64 @@ def test_watch_handlers_exist():
   assert 'kind == "DELETE"' in src
 
 
-def test_upsert_application_source_supports_disable():
-  src = inspect.getsource(upsert_application_from_etcd)
-  assert "elif not enabled and app_obj.enabled" in src
+def test_watch_ignores_runtime_lock_and_quota_keys():
+  assert etcd_op._is_runtime_etcd_key("/storagent/locks/quota/application/demo")
+  assert etcd_op._is_runtime_etcd_key("/storagent/quota/apps/demo")
+  assert etcd_op._is_runtime_etcd_key("/storagent/quota/uploads/demo/object")
+  assert not etcd_op._is_runtime_etcd_key("/storagent/applications")
+
+
+@pytest.mark.asyncio
+async def test_upsert_application_supports_disable(monkeypatch):
+  author = SimpleNamespace(id="author-id")
+
+  class Application:
+    shown_name = "Demo"
+    description = ""
+    enabled = True
+    enabled_at = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    provisioning_status = "ready"
+    provisioning_error = ""
+    provisioning_updated_at = None
+    quota_bytes = 100
+    approver = None
+
+    def __init__(self):
+      self.author = author
+      self.saved = 0
+
+    async def save(self):
+      self.saved += 1
+
+  application = Application()
+
+  async def read_application(_name):
+    return application
+
+  async def read_user(_username, _name=""):
+    return author
+
+  monkeypatch.setattr(
+    "src.modules.public.crud.read_application_by_name",
+    read_application,
+  )
+  monkeypatch.setattr(sync_module, "get_or_create_sync_user", read_user)
+
+  result, changed = await sync_module.upsert_application_from_etcd(
+    "demo",
+    {
+      "shown_name": "Demo",
+      "enabled": False,
+      "author_username": "owner",
+      "quota_bytes": 100,
+    },
+  )
+
+  assert result is application
+  assert changed is True
+  assert application.enabled is False
+  assert application.enabled_at is None
+  assert application.saved == 1
 
 
 def test_unpublish_helpers_exist():

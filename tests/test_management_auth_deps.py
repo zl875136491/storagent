@@ -43,6 +43,7 @@ def test_public_region_and_app_list_require_user():
   assert "current_user" in _endpoint_params(public_route.create_region)
   assert "current_user" in _endpoint_params(public_route.get_region_list)
   assert "current_user" in _endpoint_params(public_route.get_application_list)
+  assert "current_user" in _endpoint_params(public_route.update_application_quota)
 
 
 def test_public_endpoints_remain_unauthenticated_for_bootstrap():

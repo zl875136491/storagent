@@ -18,7 +18,11 @@ async def multipart_init(
   app_context: dict = Depends(get_current_app_context),
 ) -> files_schema.MultipartInitResponse:
   content_type = payload.content_type
-  return await files_service.multipart_init(app_context, content_type)
+  return await files_service.multipart_init(
+    app_context,
+    content_type,
+    size_bytes=payload.size_bytes,
+  )
 
 
 @router.post(

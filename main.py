@@ -11,7 +11,7 @@ from src.core.initialization import init_project, init_service
 from src.core.etcd_op import get_etcd_client, reconcile_etcd_task, watch_etcd_task
 from src.core.sync import reconcile_replication_policies_task
 from src.core.exception import register_exception
-from src.core.middleware import RequestContextMiddleware
+from src.core.middleware import RequestContextMiddleware, UploadBodyLimitMiddleware
 from src.modules.auth.crud import cleanup_expired_tokens_task
 from src.modules.storage.operations import (
   monitor_cluster_health_task,
@@ -118,6 +118,10 @@ def create_app() -> FastAPI:
       allow_methods=["*"],
       allow_headers=["*"],
     )
+
+  # Keep this outermost so chunked oversized bodies cannot be converted into
+  # a generic parser error by an inner middleware.
+  app.add_middleware(UploadBodyLimitMiddleware)
   
   return app
 

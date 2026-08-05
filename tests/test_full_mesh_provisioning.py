@@ -234,6 +234,7 @@ def test_application_sync_serializes_provisioning_state():
     provisioning_status="failed",
     provisioning_error="rule missing",
     provisioning_updated_at=now,
+    quota_bytes=100 * 1024 ** 3,
     author=SimpleNamespace(username="owner", name="Owner"),
     approver=None,
     enabled_at=None,
@@ -243,6 +244,7 @@ def test_application_sync_serializes_provisioning_state():
   assert entry["provisioning_status"] == "failed"
   assert entry["provisioning_error"] == "rule missing"
   assert entry["provisioning_updated_at"] == now.isoformat()
+  assert entry["quota_bytes"] == 100 * 1024 ** 3
   assert "setup_bucket_replication" not in inspect.getsource(
     sync_module.upsert_application_from_etcd
   )
@@ -336,10 +338,15 @@ def _patch_authorization_dependencies(monkeypatch, app, provision):
   async def bulk_create(_app):
     return None
 
+  async def ensure_quotas(_bucket, quota_bytes, servers):
+    assert quota_bytes == 100 * 1024 ** 3
+    assert servers == ["beijing", "shenzhen"]
+
   monkeypatch.setattr(public_service.public_crud, "read_application_by_id", read_app)
   monkeypatch.setattr(sync_module, "application_replication_lock", lock)
   monkeypatch.setattr(sync_module, "publish_application", publish)
   monkeypatch.setattr(sync_module, "setup_bucket_replication", provision)
+  monkeypatch.setattr(sync_module, "ensure_bucket_quotas", ensure_quotas)
   monkeypatch.setattr(public_service.storage_crud, "read_minio_server_names", server_names)
   monkeypatch.setattr(public_service.storage_crud, "bulk_create_minio_bucket", bulk_create)
   monkeypatch.setattr(public_service.minio_op, "check_server_bucket_existed", bucket_exists)
@@ -393,12 +400,18 @@ async def test_authority_reconcile_repairs_degraded_enabled_application(monkeypa
   app.enabled = True
   app.provisioning_status = "degraded"
   app.provisioning_error = "missing"
+  app.quota_bytes = 1
   repaired = asyncio.Event()
+  published_quotas = []
 
   @asynccontextmanager
   async def lock(_name, timeout=0):
     assert timeout == 0
     yield
+
+  @asynccontextmanager
+  async def quota_lock(_name):
+    yield object()
 
   async def applications():
     return [app]
@@ -411,12 +424,24 @@ async def test_authority_reconcile_repairs_degraded_enabled_application(monkeypa
     return {"complete": True}
 
   async def publish(_app):
+    published_quotas.append(_app.quota_bytes)
+
+  async def ensure_quotas(_bucket, _quota_bytes, _servers):
+    assert _quota_bytes == 100 * 1024 ** 3
     return None
+
+  async def quota_limit(_app_name, *, client=None):
+    return 100 * 1024 ** 3
 
   monkeypatch.setattr(sync_module.settings, "REGION", "beijing")
   monkeypatch.setattr(sync_module.settings, "SYNC_AUTHORITY_REGION", "beijing")
   monkeypatch.setattr(sync_module, "application_replication_lock", lock)
+  from src.modules.files import quota as files_quota
+  from src.modules.public import service as public_service
+  monkeypatch.setattr(files_quota, "application_quota_lock", quota_lock)
+  monkeypatch.setattr(public_service, "get_application_quota_limit", quota_limit)
   monkeypatch.setattr(sync_module, "setup_bucket_replication", setup)
+  monkeypatch.setattr(sync_module, "ensure_bucket_quotas", ensure_quotas)
   monkeypatch.setattr(sync_module, "publish_application", publish)
   from src.modules.public import crud as public_crud
   from src.modules.storage import crud as storage_crud
@@ -435,3 +460,69 @@ async def test_authority_reconcile_repairs_degraded_enabled_application(monkeypa
 
   assert app.provisioning_status == "ready"
   assert app.provisioning_error == ""
+  assert app.quota_bytes == 100 * 1024 ** 3
+  assert published_quotas == [100 * 1024 ** 3]
+
+
+@pytest.mark.asyncio
+async def test_authority_reconcile_preserves_newer_quota_when_policy_fails(monkeypatch):
+  app = _FakeApplication()
+  app.enabled = True
+  app.provisioning_status = "ready"
+  app.quota_bytes = 1
+  published = asyncio.Event()
+  published_quotas = []
+
+  @asynccontextmanager
+  async def lock(_name, timeout=0):
+    assert timeout == 0
+    yield
+
+  @asynccontextmanager
+  async def quota_lock(_name):
+    yield object()
+
+  async def applications():
+    return [app]
+
+  async def server_names():
+    return ["beijing", "shenzhen"]
+
+  async def setup(_bucket, _servers):
+    raise sync_module.ReplicationPolicyError("missing rule")
+
+  async def quota_limit(_app_name, *, client=None):
+    return 200 * 1024 ** 3
+
+  async def ensure_quotas(*_args, **_kwargs):
+    pytest.fail("hard quota reconciliation must wait for a valid replication policy")
+
+  async def publish(_app):
+    published_quotas.append(_app.quota_bytes)
+    published.set()
+
+  monkeypatch.setattr(sync_module.settings, "REGION", "beijing")
+  monkeypatch.setattr(sync_module.settings, "SYNC_AUTHORITY_REGION", "beijing")
+  monkeypatch.setattr(sync_module, "application_replication_lock", lock)
+  from src.modules.files import quota as files_quota
+  from src.modules.public import service as public_service
+  monkeypatch.setattr(files_quota, "application_quota_lock", quota_lock)
+  monkeypatch.setattr(public_service, "get_application_quota_limit", quota_limit)
+  monkeypatch.setattr(sync_module, "setup_bucket_replication", setup)
+  monkeypatch.setattr(sync_module, "ensure_bucket_quotas", ensure_quotas)
+  monkeypatch.setattr(sync_module, "publish_application", publish)
+  from src.modules.public import crud as public_crud
+  from src.modules.storage import crud as storage_crud
+  monkeypatch.setattr(public_crud, "read_application_list", applications)
+  monkeypatch.setattr(storage_crud, "read_minio_server_names", server_names)
+
+  task = asyncio.create_task(sync_module.reconcile_replication_policies_task())
+  await asyncio.wait_for(published.wait(), timeout=1)
+  task.cancel()
+  with pytest.raises(asyncio.CancelledError):
+    await task
+
+  assert app.provisioning_status == "degraded"
+  assert app.provisioning_error == "missing rule"
+  assert app.quota_bytes == 200 * 1024 ** 3
+  assert published_quotas == [200 * 1024 ** 3]
