@@ -10,7 +10,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from src.core.auth import require_admin
+from src.core.auth import get_current_user, require_admin
 from src.core.exception import CustomException, ErrorDesc
 from src.modules.storage import download, route as storage_route
 from src.utils.helpers import utc_now
@@ -255,7 +255,7 @@ async def test_download_admin_dependency_accepts_admin_and_rejects_non_admin(mon
     item for item in storage_route.router.routes
     if item.path == "/{minio_server_id}/objects/presigned-download"
   )
-  assert require_admin in {dependency.call for dependency in api_route.dependant.dependencies}
+  assert get_current_user in {dependency.call for dependency in api_route.dependant.dependencies}
 
 
 def test_create_contract_keeps_capability_in_fragment_only(monkeypatch):
@@ -270,12 +270,16 @@ def test_create_contract_keeps_capability_in_fragment_only(monkeypatch):
     }
 
   async def admin():
-    return SimpleNamespace(username="admin")
+    return SimpleNamespace(
+      username="operator",
+      roles=[],
+      permissions=["storage_operations_manage"],
+    )
 
   monkeypatch.setattr(storage_route.storage_download, "issue_one_time_download", issue)
   app = FastAPI()
   app.include_router(storage_route.router, prefix="/api/storage")
-  app.dependency_overrides[require_admin] = admin
+  app.dependency_overrides[get_current_user] = admin
   client = TestClient(app, base_url="http://backend.example:6783")
 
   response = client.post(

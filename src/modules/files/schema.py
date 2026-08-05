@@ -6,6 +6,11 @@ from fastapi import UploadFile
 class MultipartInitRequest(BaseModel):
   """初始化 S3 分片上传"""
   content_type: str = Field(default="application/octet-stream", description="对象 Content-Type")
+  size_bytes: int = Field(
+    ...,
+    gt=0,
+    description="上传对象的精确总字节数，用于跨区域配额预留",
+  )
 
 
 class MultipartInitResponse(BaseModel):

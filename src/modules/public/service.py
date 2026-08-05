@@ -1,13 +1,18 @@
 import json
 import logging
+import asyncio
+import weakref
 from collections.abc import AsyncGenerator
 from typing import List
 
 from bson import ObjectId
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from os import urandom
 
 logger = logging.getLogger(__name__)
+
+_quota_usage_refresh_tasks = weakref.WeakKeyDictionary()
+_quota_usage_command_semaphores = weakref.WeakKeyDictionary()
 
 from src.modules.auth.model import User
 from src.modules.public.model import Region
@@ -22,7 +27,8 @@ from src.utils.helpers import (
 from src.modules.public.model import (
   APIKey,
   Region,
-  Application
+  Application,
+  DEFAULT_APPLICATION_QUOTA_BYTES,
 )
 from src.core import sync as sync_module
 from src.configs.configs import settings
@@ -135,11 +141,50 @@ async def get_region_list() -> dict[str, List[Region]]:
   region_objs = await public_crud.read_region_list()
   return dict[str, List[Region]](data=region_objs)
 
+
+async def _notify_application_managers(
+  application: Application,
+  author: User,
+) -> None:
+  """Best-effort OA notification after the application is durable in Etcd."""
+  from src.modules.auth import crud as auth_crud
+  from src.modules.auth import oa as oa_service
+
+  try:
+    recipients = await auth_crud.list_users_with_permission("application_manage")
+    link = f"{settings.FRONT_URL.rstrip('/')}/data/basic/application"
+    deliveries = await asyncio.gather(*(
+      oa_service.send_agenda_message(
+        recipient.username,
+        "Storagent 新应用待审批",
+        (
+          f"{author.name or author.username} 创建了应用 "
+          f"{application.shown_name}（{application.name}），请及时处理。"
+        ),
+        link,
+      )
+      for recipient in recipients
+    ), return_exceptions=True)
+    for recipient, result in zip(recipients, deliveries):
+      if isinstance(result, Exception):
+        logger.warning(
+          f"应用创建 OA 通知异常 app={application.name} "
+          f"recipient={recipient.username}: {result}"
+        )
+      elif not result.accepted:
+        logger.warning(
+          f"应用创建 OA 通知失败 app={application.name} "
+          f"recipient={recipient.username}: {result.detail or result.status}"
+        )
+  except Exception as error:
+    logger.warning(f"应用创建 OA 通知失败 app={application.name}: {error}")
+
+
 async def create_application(
   name: str,
   shown_name: str,
   description: str,
-  current_user: User) -> Application:
+  current_user: User) -> dict:
   """
   创建应用
   """
@@ -148,38 +193,512 @@ async def create_application(
   # region_objs = await public_crud.read_many_region_by_ids(regions)
   # if len(region_objs) != len(regions):
   #   raise CustomException(ErrorDesc.RES_NOT_FOUND, "Region.id")
-  existed_name = await public_crud.read_application_by_name(name)
-  if existed_name:
-    raise CustomException(ErrorDesc.NAME_EXISTED, "Application.name")
-  existed_shown_name = await public_crud.read_application_by_shown_name(shown_name)
-  if existed_shown_name:
-    raise CustomException(ErrorDesc.NAME_EXISTED, "Application.shown_name")
-  # 创建所有桶, 并且开启版本控制
-  app = await public_crud.create_application(name, shown_name, description, current_user)
+  # Claim the cross-region business identity before materializing the local
+  # Mongo projection. CAS retries make APPID and shown_name globally unique.
+  entry = {
+    "shown_name": shown_name,
+    "description": description,
+    "enabled": False,
+    "provisioning_status": "pending",
+    "provisioning_error": "",
+    "provisioning_updated_at": None,
+    "quota_bytes": DEFAULT_APPLICATION_QUOTA_BYTES,
+    "author_username": current_user.username,
+    "author_name": current_user.name,
+    "approver_username": "",
+    "enabled_at": None,
+    "updated_at": utc_now().isoformat(),
+    "origin_region": settings.REGION,
+  }
   try:
-    await sync_module.publish_application(app)
-  except Exception as e:
-    await app.delete()
+    from src.core import etcd_op
+
+    def create_mutator(applications: dict) -> dict:
+      if name in applications:
+        raise CustomException(ErrorDesc.NAME_EXISTED, "Application.name")
+      for existing in applications.values():
+        if (
+          isinstance(existing, dict)
+          and str(existing.get("shown_name") or "") == shown_name
+        ):
+          raise CustomException(ErrorDesc.NAME_EXISTED, "Application.shown_name")
+      applications[name] = dict(entry)
+      return applications
+
+    applications = await etcd_op.merge_update_etcd_key(
+      sync_module.ETCD_KEY_APPLICATIONS,
+      create_mutator,
+    )
+    authoritative = applications[name]
+  except CustomException:
+    raise
+  except Exception as error:
     from src.core import audit, metrics as metrics_mod
     metrics_mod.incr("sync_failures_total")
     audit.audit(
       "application.create",
       actor=current_user.username,
       resource=name,
-      detail=str(e),
+      detail=str(error),
       success=False,
     )
-    raise CustomException(ErrorDesc.SYNC_FAILED, f"Application 同步到 Etcd 失败: {e}")
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      f"Application 同步到 Etcd 失败: {error}",
+    ) from error
+
+  try:
+    app, _created = await sync_module.upsert_application_from_etcd(
+      name,
+      authoritative,
+    )
+  except Exception as error:
+    # The Etcd claim is already authoritative; periodic reconciliation will
+    # repair this node without risking a second owner for the same bucket.
+    from src.core import audit, metrics as metrics_mod
+    metrics_mod.incr("sync_failures_total")
+    audit.audit(
+      "application.create",
+      actor=current_user.username,
+      resource=name,
+      detail=f"本地投影失败: {error}",
+      success=False,
+    )
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "应用已写入跨节点配置，本地数据正在自动收敛，请稍后刷新",
+    ) from error
+
+  await _notify_application_managers(app, current_user)
   from src.core import audit
   audit.audit("application.create", actor=current_user.username, resource=name)
-  return app
+  return await _application_response(app)
 
 async def get_application_list() -> dict[str, List[Application]]:
   """
   获取应用列表
   """
   application_objs = await public_crud.read_application_list()
-  return dict[str, List[Application]](data=application_objs)
+  data = await asyncio.gather(*(
+    _application_response(application)
+    for application in application_objs
+  ))
+  return {"data": list(data)}
+
+
+def _quota_cache_is_fresh(application: Application) -> bool:
+  updated_at = getattr(application, "quota_usage_updated_at", None)
+  if not updated_at:
+    return False
+  if updated_at.tzinfo is None:
+    updated_at = updated_at.replace(tzinfo=timezone.utc)
+  else:
+    updated_at = updated_at.astimezone(timezone.utc)
+  age = (utc_now() - updated_at).total_seconds()
+  return age <= max(float(settings.APPLICATION_QUOTA_USAGE_CACHE_SECONDS), 0.0)
+
+
+def _quota_usage_command_semaphore() -> asyncio.Semaphore:
+  loop = asyncio.get_running_loop()
+  limit = max(int(settings.APPLICATION_QUOTA_USAGE_MAX_CONCURRENCY), 1)
+  existing = _quota_usage_command_semaphores.get(loop)
+  if existing is None or existing[0] != limit:
+    existing = (limit, asyncio.Semaphore(limit))
+    _quota_usage_command_semaphores[loop] = existing
+  return existing[1]
+
+
+async def _get_bucket_usage_limited(
+  server_name: str,
+  bucket_name: str,
+) -> tuple[bool, int, str]:
+  async with _quota_usage_command_semaphore():
+    return await minio_op.get_bucket_usage_bytes(
+      server_name,
+      bucket_name,
+      timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+    )
+
+
+async def _collect_application_quota_usage(
+  application: Application,
+) -> tuple[int, datetime | None, dict[str, str]]:
+  cached = max(int(getattr(application, "quota_usage_bytes", 0) or 0), 0)
+  if not application.enabled:
+    return cached, getattr(application, "quota_usage_updated_at", None), {}
+
+  from src.modules.files import quota as upload_quota
+  failures: dict[str, str] = {}
+  try:
+    observed = await upload_quota.get_observed_usage_bytes(application.name)
+  except Exception as error:
+    observed = cached
+    failures["quota_state"] = str(error)
+
+  server_names = sorted(set(await storage_crud.read_minio_server_names()))
+  if not server_names:
+    failures["*"] = "没有可读取用量的 MinIO 站点"
+    return max(cached, observed), getattr(
+      application,
+      "quota_usage_updated_at",
+      None,
+    ), failures
+  results = await asyncio.gather(*(
+    _get_bucket_usage_limited(
+      server_name,
+      application.name,
+    )
+    for server_name in server_names
+  ))
+  failures.update({
+    server_name: error
+    for server_name, (success, _usage, error) in zip(server_names, results)
+    if not success
+  })
+  usages = [usage for success, usage, _error in results if success]
+  if not usages:
+    return max(cached, observed), getattr(
+      application,
+      "quota_usage_updated_at",
+      None,
+    ), failures
+  usage = max(cached, observed, *(max(int(value), 0) for value in usages))
+  updated_at = utc_now()
+  application.quota_usage_bytes = usage
+  application.quota_usage_updated_at = updated_at
+  await application.save()
+  return usage, updated_at, failures
+
+
+async def refresh_application_quota_usage(
+  application: Application,
+  *,
+  force: bool = False,
+  require_all: bool = False,
+) -> int:
+  cached = max(int(getattr(application, "quota_usage_bytes", 0) or 0), 0)
+  if not force and _quota_cache_is_fresh(application):
+    return cached
+
+  loop = asyncio.get_running_loop()
+  tasks = _quota_usage_refresh_tasks.setdefault(loop, {})
+  task = tasks.get(application.name)
+  if task is None or task.done():
+    task = asyncio.create_task(_collect_application_quota_usage(application))
+    tasks[application.name] = task
+  try:
+    usage, updated_at, failures = await asyncio.shield(task)
+  finally:
+    if task.done() and tasks.get(application.name) is task:
+      tasks.pop(application.name, None)
+
+  application.quota_usage_bytes = usage
+  if updated_at is not None:
+    application.quota_usage_updated_at = updated_at
+  if failures and require_all:
+    detail = "; ".join(
+      f"{server_name}: {error}" for server_name, error in failures.items()
+    )
+    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, f"读取五地存储用量失败: {detail}")
+  return usage
+
+
+async def _application_response(
+  application: Application,
+  *,
+  force_usage: bool = False,
+  require_all_usage: bool = False,
+) -> dict:
+  usage = await refresh_application_quota_usage(
+    application,
+    force=force_usage,
+    require_all=require_all_usage,
+  )
+  quota = max(int(application.quota_bytes), 1)
+  return {
+    "id": application.id,
+    "name": application.name,
+    "shown_name": application.shown_name,
+    "created_at": application.created_at,
+    "updated_at": application.updated_at,
+    "description": application.description,
+    "enabled": application.enabled,
+    "enabled_at": application.enabled_at,
+    "provisioning_status": application.provisioning_status,
+    "provisioning_error": application.provisioning_error,
+    "provisioning_updated_at": application.provisioning_updated_at,
+    "quota_bytes": quota,
+    "quota_usage_bytes": usage,
+    "quota_usage_ratio": usage / quota,
+    "quota_usage_updated_at": application.quota_usage_updated_at,
+    "author": application.author,
+  }
+
+
+async def get_application_quota_usage(
+  app_name: str,
+  *,
+  force: bool = True,
+  require_all: bool = True,
+) -> tuple[int, int]:
+  application = await public_crud.read_application_by_name(app_name)
+  if not application:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
+  usage = await refresh_application_quota_usage(
+    application,
+    force=force,
+    require_all=require_all,
+  )
+  return int(application.quota_bytes), usage
+
+
+async def get_application_quota_limit(app_name: str, *, client=None) -> int:
+  """Read the cross-region authoritative quota directly from Etcd."""
+  from src.core import etcd_op
+
+  try:
+    applications = await etcd_op.pull_from_etcd_by_key(
+      sync_module.ETCD_KEY_APPLICATIONS,
+      client=client,
+    )
+    entry = applications.get(app_name)
+    if not isinstance(entry, dict):
+      raise ValueError("应用未写入跨节点配置")
+    quota_bytes = int(entry.get("quota_bytes"))
+    if quota_bytes <= 0:
+      raise ValueError("应用配额不是正整数")
+    return quota_bytes
+  except CustomException:
+    raise
+  except Exception as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      f"无法读取应用权威配额，上传已安全拒绝: {error}",
+    ) from error
+
+
+async def _read_authoritative_application(app_name: str) -> dict:
+  from src.core import etcd_op
+
+  applications = await etcd_op.pull_from_etcd_by_key(
+    sync_module.ETCD_KEY_APPLICATIONS,
+  )
+  entry = applications.get(app_name)
+  if not isinstance(entry, dict):
+    raise CustomException(ErrorDesc.SYNC_FAILED, "应用未写入跨节点配置")
+  return dict(entry)
+
+
+async def _write_authoritative_application_quota(
+  app_name: str,
+  quota_bytes: int,
+) -> dict:
+  """Update only quota fields so a delayed Mongo projection cannot overwrite APP state."""
+  from src.core import etcd_op
+
+  updated_at = utc_now().isoformat()
+
+  def mutator(applications: dict) -> dict:
+    current = applications.get(app_name)
+    if not isinstance(current, dict):
+      raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
+    current["quota_bytes"] = int(quota_bytes)
+    current["updated_at"] = updated_at
+    return applications
+
+  applications = await etcd_op.merge_update_etcd_key(
+    sync_module.ETCD_KEY_APPLICATIONS,
+    mutator,
+  )
+  return dict(applications[app_name])
+
+
+async def _restore_bucket_quotas(
+  bucket_name: str,
+  previous: dict[str, int | None],
+) -> dict[str, str]:
+  rollback_errors: dict[str, str] = {}
+  for server_name, quota in previous.items():
+    if quota is None:
+      success, error = await minio_op.clear_bucket_hard_quota(
+        server_name,
+        bucket_name,
+        timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+      )
+    else:
+      success, error = await minio_op.set_bucket_hard_quota(
+        server_name,
+        bucket_name,
+        quota,
+        timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+      )
+    if not success:
+      rollback_errors[server_name] = error
+  return rollback_errors
+
+
+async def update_application_quota(
+  application_id: ObjectId,
+  quota_bytes: int,
+  current_user: User,
+) -> dict:
+  from src.modules.files import quota as upload_quota
+
+  application = await public_crud.read_application_by_id(application_id)
+  if not application:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
+  application_name = application.name
+
+  try:
+    async with sync_module.application_replication_lock(application_name):
+      authoritative = await _read_authoritative_application(application_name)
+      enabled = bool(authoritative.get("enabled", False))
+
+      async def load_current_usage() -> int:
+        nonlocal application
+        application = await public_crud.read_application_by_id(application_id)
+        if not application:
+          raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
+        return await refresh_application_quota_usage(
+          application,
+          force=enabled,
+          require_all=enabled,
+        )
+
+      async with upload_quota.quota_update_guard(
+        application_name,
+        usage_loader=load_current_usage,
+      ) as quota_state:
+        usage, active_reserved = quota_state
+        committed_and_reserved = usage + active_reserved
+        if quota_bytes < committed_and_reserved:
+          raise CustomException(
+            ErrorDesc.INVALID_PARAMS,
+            (
+              f"配额不能低于当前使用量与活动上传预留之和 "
+              f"{committed_and_reserved} 字节"
+            ),
+          )
+
+        server_names = (
+          sorted(set(await storage_crud.read_minio_server_names()))
+          if enabled else []
+        )
+        previous: dict[str, int | None] = {}
+        if server_names:
+          current_results = await asyncio.gather(*(
+            minio_op.get_bucket_hard_quota(
+              server_name,
+              application_name,
+              timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+            )
+            for server_name in server_names
+          ))
+          read_failures = {
+            server_name: error
+            for server_name, (success, _current, error) in zip(
+              server_names,
+              current_results,
+            )
+            if not success
+          }
+          if read_failures:
+            detail = "; ".join(
+              f"{server_name}: {error}"
+              for server_name, error in read_failures.items()
+            )
+            raise CustomException(
+              ErrorDesc.MINIO_ACCESS_FAILED,
+              f"读取原配额失败: {detail}",
+            )
+          previous = {
+            server_name: current
+            for server_name, (_success, current, _error) in zip(
+              server_names,
+              current_results,
+            )
+          }
+
+        changed: dict[str, int | None] = {}
+        authoritative_committed = False
+        try:
+          for server_name in server_names:
+            if previous[server_name] == quota_bytes:
+              continue
+            changed[server_name] = previous[server_name]
+            success, error = await minio_op.set_bucket_hard_quota(
+              server_name,
+              application_name,
+              quota_bytes,
+              timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+            )
+            if not success:
+              raise RuntimeError(f"{server_name}: {error}")
+
+          upload_quota.raise_if_quota_lock_lost()
+          authoritative = await _write_authoritative_application_quota(
+            application_name,
+            quota_bytes,
+          )
+          authoritative_committed = True
+          upload_quota.raise_if_quota_lock_lost()
+        except BaseException as error:
+          compensation_errors = []
+          if not authoritative_committed:
+            try:
+              rollback_errors = await _restore_bucket_quotas(application_name, changed)
+              if rollback_errors:
+                compensation_errors.append(f"MinIO 回滚失败: {rollback_errors}")
+            except BaseException as rollback_error:
+              compensation_errors.append(f"MinIO 回滚异常: {rollback_error}")
+
+          if authoritative_committed:
+            raise CustomException(
+              ErrorDesc.SYNC_FAILED,
+              "配额已写入跨节点权威配置，站点正在自动收敛，请稍后刷新确认",
+            ) from error
+
+          if isinstance(error, asyncio.CancelledError):
+            if compensation_errors:
+              raise CustomException(
+                ErrorDesc.SYNC_FAILED,
+                "应用配额锁已失效且回滚不完整: " + "；".join(compensation_errors),
+              ) from error
+            raise
+          detail = str(error)
+          if compensation_errors:
+            detail += "；" + "；".join(compensation_errors)
+          raise CustomException(
+            ErrorDesc.MINIO_ACCESS_FAILED,
+            f"应用配额更新失败: {detail}",
+          ) from error
+
+        try:
+          projected, _created = await sync_module.upsert_application_from_etcd(
+            application_name,
+            authoritative,
+          )
+          application = projected
+        except Exception as error:
+          logger.warning(
+            f"应用配额本地投影延迟 app={application_name}: {error}"
+          )
+          application.quota_bytes = quota_bytes
+
+        from src.core import audit
+        audit.audit(
+          "application.quota.update",
+          actor=current_user.username,
+          resource=application_name,
+          detail={
+            "quota_bytes": quota_bytes,
+            "usage_bytes": usage,
+            "active_reserved_bytes": active_reserved,
+          },
+        )
+        return await _application_response(application)
+  except sync_module.ReplicationLockBusyError as error:
+    raise CustomException(ErrorDesc.STATUS_ERR, str(error))
 
 def _sse_line(payload: dict) -> bytes:
   return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
@@ -364,6 +883,31 @@ async def enable_application(
           "message": f"站点 {server_name} 已启用版本控制",
         }):
           yield chunk
+
+      failure_step = "bucket_quota"
+      async for chunk in _emit({
+        "step": "bucket_quota",
+        "server_name": None,
+        "status": "running",
+        "message": f"设置 {len(server_names)} 个站点的应用存储配额",
+      }):
+        yield chunk
+      await sync_module.ensure_bucket_quotas(
+        application_obj.name,
+        int(getattr(
+          application_obj,
+          "quota_bytes",
+          DEFAULT_APPLICATION_QUOTA_BYTES,
+        )),
+        server_names,
+      )
+      async for chunk in _emit({
+        "step": "bucket_quota",
+        "server_name": None,
+        "status": "ok",
+        "message": "各站点应用存储配额已生效",
+      }):
+        yield chunk
 
       failure_step = "replicate"
       async for chunk in _emit({

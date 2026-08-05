@@ -8,6 +8,9 @@ from src.modules.auth.model import User
 from typing import List, Literal
 from pydantic import BaseModel
 
+
+DEFAULT_APPLICATION_QUOTA_BYTES = 100 * 1024 ** 3
+
 class Region(Document):
   name: str
   shown_name: str
@@ -30,6 +33,10 @@ class Application(Document):
   provisioning_status: Literal["pending", "provisioning", "ready", "failed", "degraded"] | None = Field(default=None)
   provisioning_error: str = Field(default="")
   provisioning_updated_at: datetime | None = Field(default=None)
+  quota_bytes: int = Field(default=DEFAULT_APPLICATION_QUOTA_BYTES, gt=0)
+  # Usage is a node-local cache. The quota itself is synchronized through Etcd.
+  quota_usage_bytes: int = Field(default=0, ge=0)
+  quota_usage_updated_at: datetime | None = Field(default=None)
   # regions: List[Link[Region]] = Field(default=[])
   author: Link[User]
   approver: Link[User] | None = Field(default=None)

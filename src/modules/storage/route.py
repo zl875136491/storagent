@@ -4,7 +4,7 @@ from urllib.parse import parse_qs
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import HTMLResponse
 
-from src.core.auth import get_current_user, check_permissions, require_admin
+from src.core.auth import get_current_user, check_permissions
 from src.core.rate_limit import rate_limit_one_time_download
 from src.modules.auth.model import User
 from src.modules.storage import service as storage_service
@@ -133,8 +133,9 @@ async def create_one_time_object_download(
   payload: storage_schema.OneTimeDownloadCreateRequest,
   request: Request,
   response: Response,
-  current_user: User = Depends(require_admin),
+  current_user: User = Depends(get_current_user),
 ) -> storage_schema.OneTimeDownloadCreateResponse:
+  await check_permissions(current_user, ["storage_operations_manage"])
   issued = await storage_download.issue_one_time_download(
     minio_server_id,
     payload.bucket,
@@ -262,7 +263,7 @@ async def create_bucket_replicate(
   current_user: User = Depends(get_current_user),
 ) -> storage_schema.BucketReplicateRuleResponse:
   """创建一条单向 Bucket 复制规则（需管理员）。"""
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await storage_service.create_bucket_replicate(bucket_name, payload)
 
 @router.delete(
@@ -276,7 +277,7 @@ async def delete_bucket_replicate(
   rule_id: str | None = Query(None, max_length=128),
 ):
   """删除一条单向 Bucket 复制规则（需管理员）；会执行 mc replicate remove。"""
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await storage_service.delete_bucket_replicate(
     bucket_name,
     from_server=from_server,
@@ -294,7 +295,7 @@ async def get_replication_operations(
   bucket: str | None = Query(None, min_length=3, max_length=63),
   current_user: User = Depends(get_current_user),
 ):
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await storage_operations.get_replication_overview(bucket)
 
 
@@ -307,7 +308,7 @@ async def reconcile_bucket_replication(
   bucket_name: str,
   current_user: User = Depends(get_current_user),
 ):
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await storage_operations.reconcile_bucket_replication(
     bucket_name,
     current_user.username,
@@ -324,7 +325,7 @@ async def start_bucket_replication_resync(
   payload: storage_schema.ReplicationResyncRequest,
   current_user: User = Depends(get_current_user),
 ):
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await storage_operations.start_replication_resync(
     bucket_name,
     payload.source_server,
@@ -342,7 +343,7 @@ async def start_bucket_replication_resync(
 async def get_cluster_health_operations(
   current_user: User = Depends(get_current_user),
 ):
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await storage_operations.get_cluster_health_overview()
 
 
@@ -355,7 +356,7 @@ async def get_cluster_heal_status(
   server_name: str,
   current_user: User = Depends(get_current_user),
 ):
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await storage_operations.get_cluster_heal_status(server_name)
 
 
@@ -368,7 +369,7 @@ async def start_cluster_heal(
   server_name: str,
   current_user: User = Depends(get_current_user),
 ):
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await storage_operations.start_cluster_heal(
     server_name,
     current_user.username,
@@ -384,5 +385,5 @@ async def get_storage_operations(
   limit: int = Query(20, ge=1, le=100),
   current_user: User = Depends(get_current_user),
 ):
-  await require_admin(current_user)
+  await check_permissions(current_user, ["storage_operations_manage"])
   return await storage_operations.list_storage_operations(limit)

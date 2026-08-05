@@ -87,6 +87,7 @@ class UserProfileResponse(BaseModel):
   name: str
   is_admin: bool
   roles: List[SimpleRole]
+  permissions: List[str]
   created_at: str
   updated_at: str
   system_time: str
@@ -97,6 +98,8 @@ class AdminUserItem(BaseModel):
   name: str
   is_admin: bool
   role_name: str
+  roles: List[SimpleRole]
+  permissions: List[str]
   created_at: str
   updated_at: str
 
@@ -104,7 +107,27 @@ class AdminUserListResponse(BaseModel):
   data: List[AdminUserItem]
 
 class UpdateUserRoleRequest(BaseModel):
-  role: str  # "用户" | "管理员"
+  roles: List[str] | None = Field(default=None, min_length=1, max_length=5)
+  role: str | None = None
+
+  @model_validator(mode="after")
+  def validate_role_payload(self):
+    if self.roles is not None and self.role is not None:
+      raise ValueError("roles 与 role 只能提交一个")
+    values = self.roles if self.roles is not None else [self.role]
+    normalized = []
+    for value in values:
+      role_name = (value or "").strip()
+      if not role_name:
+        raise ValueError("角色不能为空")
+      if role_name not in normalized:
+        normalized.append(role_name)
+    self.roles = normalized
+    return self
+
+  @property
+  def role_names(self) -> List[str]:
+    return list(self.roles or [])
 
 class UpdateUserRoleResponse(BaseModel):
   id: str
@@ -112,3 +135,7 @@ class UpdateUserRoleResponse(BaseModel):
   name: str
   is_admin: bool
   role_name: str
+  roles: List[SimpleRole]
+  permissions: List[str]
+  created_at: str
+  updated_at: str

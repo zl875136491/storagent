@@ -105,7 +105,7 @@ def get_full_permissions(selected_permissions: list) -> list:
   for pmt in selected_permissions:
     discover(pmt)
       
-  return list[str](full_set)
+  return sorted(full_set)
 
 def try_to_obj_id(obj_id: ObjectId | str | Document) -> ObjectId:
   """

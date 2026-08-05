@@ -10,7 +10,7 @@ from src.modules.auth.model import User
 from src.utils.helpers import utc_now
 from src.modules.auth import crud as user_crud
 from src.core.exception import CustomException, ErrorDesc
-from src.configs.consts import preset_permissions
+from src.configs.consts import ROLE_SUPERADMIN, preset_permissions
 
 
 # OAuth2 密码流（用于从请求中提取 token）
@@ -203,29 +203,55 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
   
   return user
 
-async def check_permissions(user: User = Depends(get_current_user), permissions: List[str] = []) -> bool:
+def _role_id(role):
+  role_id = getattr(role, "id", None)
+  if role_id is not None:
+    return role_id
+  to_ref = getattr(role, "to_ref", None)
+  if callable(to_ref):
+    try:
+      return to_ref().id
+    except (AttributeError, TypeError):
+      return None
+  return None
+
+
+async def _is_superadmin(user: User) -> bool:
+  roles = list(getattr(user, "roles", []) or [])
+  for role in roles:
+    if getattr(role, "name", None) == ROLE_SUPERADMIN:
+      return True
+  # Fully fetched roles have stable names; only legacy/unfetched links need an ID lookup.
+  if not any(getattr(role, "name", None) is None for role in roles):
+    return False
+  admin_role = await user_crud.get_admin_role()
+  for role in roles:
+    if admin_role and _role_id(role) == admin_role.id:
+      return True
+  return False
+
+
+async def check_permissions(
+  user: User = Depends(get_current_user),
+  permissions: List[str] | None = None,
+) -> bool:
   """
   检查用户是否具有指定的权限
   """
-  admin_role = await user_crud.get_admin_role()
-  if admin_role:
-    for role in user.roles:
-      if role.to_ref().id == admin_role.id:
-        return True
-  for permission in permissions:
-    if permission not in user.permissions:
-      permission_name = preset_permissions[permission]["name"]
+  if await _is_superadmin(user):
+    return user
+  user_permissions = set(getattr(user, "permissions", []) or [])
+  for permission in permissions or []:
+    if permission not in user_permissions:
+      permission_name = preset_permissions.get(permission, {}).get("name", permission)
       raise CustomException(ErrorDesc.INSUFFICIENT_PERMISSIONS, f"用户缺少权限: {permission_name}")
   return user
 
 
 async def require_admin(user: User = Depends(get_current_user)) -> User:
   """Require the preset administrator role for sensitive system settings."""
-  admin_role = await user_crud.get_admin_role()
-  if admin_role:
-    for role in user.roles:
-      if role.to_ref().id == admin_role.id:
-        return user
+  if await _is_superadmin(user):
+    return user
   raise CustomException(ErrorDesc.INSUFFICIENT_PERMISSIONS, "仅管理员可以管理系统配置")
 
 # 从请求头中提取 API-KEY 字段作为 App 数据源

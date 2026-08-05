@@ -25,6 +25,8 @@ from src.core.crypto import (
   encrypt_server_entry,
 )
 from src.utils.helpers import utc_now
+from src.modules.public.model import DEFAULT_APPLICATION_QUOTA_BYTES
+from src.configs.consts import ROLE_SUPERADMIN, ROLE_USER
 
 ETCD_KEY_REGION = "region"
 ETCD_KEY_SERVERS = "servers"
@@ -39,6 +41,26 @@ ETCD_KEY_TOPOLOGY_LAYOUT = "topology_layout"
 TOPOLOGY_LAYOUT_SCHEMA_VERSION = 1
 
 SYNC_USER_PLACEHOLDER = "__sync__"
+
+
+class LastSuperadminError(RuntimeError):
+  pass
+
+
+class UserIdentityUpdateLockBusyError(RuntimeError):
+  pass
+
+
+class UserIdentityUpdateLockLostError(RuntimeError):
+  pass
+
+
+# Compatibility for imports/tests written when only role writes used this lock.
+UserRoleUpdateLockBusyError = UserIdentityUpdateLockBusyError
+
+
+class UserIdentityVersionConflictError(RuntimeError):
+  pass
 
 
 def _parse_sync_datetime(value: Any) -> datetime | None:
@@ -61,6 +83,31 @@ def _same_sync_datetime(left: datetime | None, right: datetime | None) -> bool:
   if right.tzinfo is None:
     right = right.replace(tzinfo=timezone.utc)
   return left.astimezone(timezone.utc) == right.astimezone(timezone.utc)
+
+
+def _linked_document_id(value: Any) -> str | None:
+  """Return a stable id for either a fetched Document or a Beanie Link."""
+  if value is None:
+    return None
+  value_id = getattr(value, "id", None)
+  if value_id is not None:
+    return str(value_id)
+  ref_id = getattr(getattr(value, "ref", None), "id", None)
+  if ref_id is not None:
+    return str(ref_id)
+  return None
+
+
+def _is_newer_sync_datetime(candidate: datetime | None, current: datetime | None) -> bool:
+  if candidate is None:
+    return False
+  if current is None:
+    return True
+  if candidate.tzinfo is None:
+    candidate = candidate.replace(tzinfo=timezone.utc)
+  if current.tzinfo is None:
+    current = current.replace(tzinfo=timezone.utc)
+  return candidate.astimezone(timezone.utc) > current.astimezone(timezone.utc)
 
 
 def _prefer_user_entry(current: dict | None, candidate: dict) -> bool:
@@ -99,6 +146,11 @@ def _prefer_authority_entry(current: dict | None, candidate: dict) -> bool:
   authority = settings.SYNC_AUTHORITY_REGION
   current_origin = str(current.get("origin_region") or "")
   candidate_origin = str(candidate.get("origin_region") or "")
+  if candidate_origin == current_origin:
+    # Built-in role definitions are deterministic. Let a rolling upgrade from
+    # the same origin replace its older permissions instead of pulling them
+    # back into Mongo on startup.
+    return True
   if candidate_origin == authority and current_origin != authority:
     return True
   if current_origin == authority and candidate_origin != authority:
@@ -117,14 +169,132 @@ def user_to_etcd_entry(user) -> dict:
     "hashed_password_enc": encrypt_secret(user.hashed_password),
     "auth_version": int(getattr(user, "auth_version", 0)),
     "role_names": role_names,
+    "roles_version": int(getattr(user, "roles_version", 0)),
     "created_at": user.created_at.isoformat() if user.created_at else None,
     "updated_at": user.updated_at.isoformat() if user.updated_at else None,
     "origin_region": settings.REGION,
   }
 
 
+def _entry_role_names(entry: dict | None) -> set[str]:
+  if not isinstance(entry, dict):
+    return set()
+  role_names = entry.get("role_names") or []
+  if not role_names and entry.get("role_name"):
+    role_names = [entry["role_name"]]
+  return {str(name) for name in role_names if name}
+
+
+def _entry_version(entry: dict | None, field: str) -> int:
+  if not isinstance(entry, dict):
+    return 0
+  try:
+    return max(int(entry.get(field) or 0), 0)
+  except (TypeError, ValueError):
+    return 0
+
+
+def _same_user_password(left: dict, right: dict) -> bool:
+  left_value = str(left.get("hashed_password_enc") or "")
+  right_value = str(right.get("hashed_password_enc") or "")
+  try:
+    return decrypt_secret(left_value) == decrypt_secret(right_value)
+  except ValueError:
+    return left_value == right_value
+
+
+def _merge_user_entry(
+  data: dict,
+  username: str,
+  entry: dict,
+  *,
+  fields: set[str] | None = None,
+) -> dict:
+  """Merge password and roles independently using monotonic field versions.
+
+  Explicit identity mutations pass ``fields`` and must advance the matching
+  version. Periodic reconciliation omits it and may only publish a field whose
+  local version is newer than Etcd. Equal-version disagreements always keep
+  Etcd authoritative, which safely converges legacy records.
+  """
+  current = data.get(username)
+  if not isinstance(current, dict):
+    data[username] = entry
+    return data
+
+  explicit = fields is not None
+  selected = fields or set()
+  merge_auth = "auth" in selected if explicit else (
+    _entry_version(entry, "auth_version")
+    > _entry_version(current, "auth_version")
+  )
+  merge_roles = "roles" in selected if explicit else (
+    _entry_version(entry, "roles_version")
+    > _entry_version(current, "roles_version")
+  )
+
+  if explicit and merge_auth:
+    current_version = _entry_version(current, "auth_version")
+    candidate_version = _entry_version(entry, "auth_version")
+    same_auth = (
+      candidate_version == current_version
+      and _same_user_password(entry, current)
+    )
+    if candidate_version < current_version or (
+      candidate_version == current_version and not same_auth
+    ):
+      raise UserIdentityVersionConflictError(
+        f"用户 {username} 的密码版本已变化，请重试"
+      )
+
+  current_roles = _entry_role_names(current)
+  desired_roles = _entry_role_names(entry)
+  if explicit and merge_roles:
+    current_version = _entry_version(current, "roles_version")
+    candidate_version = _entry_version(entry, "roles_version")
+    same_roles = candidate_version == current_version and desired_roles == current_roles
+    if candidate_version < current_version or (
+      candidate_version == current_version and not same_roles
+    ):
+      raise UserIdentityVersionConflictError(
+        f"用户 {username} 的角色版本已变化，请重试"
+      )
+
+  if merge_roles and ROLE_SUPERADMIN in current_roles and ROLE_SUPERADMIN not in desired_roles:
+    superadmin_count = sum(
+      ROLE_SUPERADMIN in _entry_role_names(item)
+      for item in data.values()
+    )
+    if superadmin_count <= 1:
+      raise LastSuperadminError("不能取消系统中唯一的管理员")
+
+  merged = dict(current)
+  if merge_auth:
+    for key in ("hashed_password_enc", "auth_version"):
+      merged[key] = entry.get(key)
+  if merge_roles:
+    merged["role_names"] = list(entry.get("role_names") or [])
+    merged["roles_version"] = _entry_version(entry, "roles_version")
+    merged.pop("role_name", None)
+
+  merge_profile = "profile" in selected if explicit else _prefer_user_entry(
+    current,
+    entry,
+  )
+  if merge_profile:
+    for key in ("name", "created_at"):
+      if entry.get(key) is not None:
+        merged[key] = entry[key]
+  if merge_auth or merge_roles or merge_profile:
+    merged["updated_at"] = entry.get("updated_at")
+    merged["origin_region"] = entry.get("origin_region")
+  data[username] = merged
+  return data
+
+
 async def sync_roles_to_mongo(roles_data: dict) -> None:
   from src.modules.auth.model import Role
+  from src.modules.auth import crud as user_crud
 
   for role_name, data in roles_data.items():
     if not role_name or not isinstance(data, dict):
@@ -147,83 +317,120 @@ async def sync_roles_to_mongo(roles_data: dict) -> None:
       role.permissions = permissions
       await role.save()
       logger.info(f"Etcd sync: 更新 Role {role_name}")
+  await user_crud.recompute_all_user_permissions()
 
 
-async def sync_users_to_mongo(users_data: dict) -> None:
+async def _sync_user_to_mongo_locked(username: str, data: dict):
   from src.modules.auth import crud as user_crud
   from src.modules.auth.model import Role
 
+  encrypted_hash = str(data.get("hashed_password_enc") or "")
+  if not encrypted_hash:
+    logger.warning(f"Etcd sync: User {username} 缺少密码哈希，已跳过")
+    return None
+  try:
+    hashed_password = decrypt_secret(encrypted_hash)
+  except ValueError as e:
+    logger.warning(f"Etcd sync: User {username} 密码哈希解密失败: {e}")
+    return None
+
+  basic_role = await user_crud.get_basic_role()
+  roles = [basic_role] if basic_role else []
+  seen_role_names = {ROLE_USER} if basic_role else set()
+  role_names = data.get("role_names") or []
+  if not role_names and data.get("role_name"):
+    role_names = [data["role_name"]]
+  for role_name in role_names:
+    role = await Role.find_one(Role.name == str(role_name))
+    if role and role.name not in seen_role_names:
+      roles.append(role)
+      seen_role_names.add(role.name)
+  desired_permissions = await user_crud.get_all_permissions(roles)
+  created_at = _parse_sync_datetime(data.get("created_at")) or utc_now()
+  incoming_updated_at = _parse_sync_datetime(data.get("updated_at")) or created_at
+  auth_version = _entry_version(data, "auth_version")
+  roles_version = _entry_version(data, "roles_version")
+
+  user = await user_crud.read_user_by_username(username)
+  if not user:
+    user = await user_crud.create_user(
+      username=username,
+      name=str(data.get("name") or username),
+      hashed_password=hashed_password,
+      roles=roles,
+      is_sync=False,
+    )
+    user.created_at = created_at
+    user.updated_at = incoming_updated_at
+    user.auth_version = auth_version
+    user.roles_version = roles_version
+    await user.save()
+    logger.info(f"Etcd sync: 创建可登录 User {username}")
+    return user
+
+  current_auth_version = max(int(getattr(user, "auth_version", 0)), 0)
+  current_roles_version = max(int(getattr(user, "roles_version", 0)), 0)
+  apply_auth = auth_version >= current_auth_version
+  apply_roles = roles_version >= current_roles_version
+  current_role_names = sorted({
+    role.name
+    for role in (user.roles or [])
+    if getattr(role, "name", None)
+  })
+  desired_role_names = sorted(role.name for role in roles)
+  changed = any((
+    user.name != str(data.get("name") or username),
+    apply_auth and user.hashed_password != hashed_password,
+    apply_roles and current_role_names != desired_role_names,
+    apply_roles and sorted(user.permissions or []) != sorted(desired_permissions),
+    bool(getattr(user, "is_sync", False)),
+    apply_auth and current_auth_version != auth_version,
+    apply_roles and current_roles_version != roles_version,
+    not _same_sync_datetime(user.created_at, created_at),
+    _is_newer_sync_datetime(incoming_updated_at, user.updated_at),
+  ))
+  if not changed:
+    return user
+  user.name = str(data.get("name") or username)
+  if apply_auth:
+    user.hashed_password = hashed_password
+    user.auth_version = auth_version
+  if apply_roles:
+    user.roles = roles
+    user.permissions = desired_permissions
+    user.roles_version = roles_version
+  user.is_sync = False
+  user.created_at = created_at
+  if _is_newer_sync_datetime(incoming_updated_at, user.updated_at):
+    user.updated_at = incoming_updated_at
+  await user.save()
+  logger.info(f"Etcd sync: 更新可登录 User {username}")
+  return user
+
+
+async def sync_users_to_mongo(users_data: dict) -> None:
   for username, data in users_data.items():
     if not username or not isinstance(data, dict):
       continue
-    encrypted_hash = str(data.get("hashed_password_enc") or "")
-    if not encrypted_hash:
-      logger.warning(f"Etcd sync: User {username} 缺少密码哈希，已跳过")
-      continue
     try:
-      hashed_password = decrypt_secret(encrypted_hash)
-    except ValueError as e:
-      logger.warning(f"Etcd sync: User {username} 密码哈希解密失败: {e}")
-      continue
+      async with user_role_update_lock(username, timeout=30):
+        await _sync_user_to_mongo_locked(username, data)
+    except UserIdentityUpdateLockBusyError:
+      logger.warning(f"Etcd sync: User {username} 正在更新，将由周期校准重试")
+    except UserIdentityUpdateLockLostError as error:
+      logger.warning(f"Etcd sync: User {username} 同步锁已丢失: {error}")
 
-    roles = []
-    for role_name in data.get("role_names") or []:
-      role = await Role.find_one(Role.name == str(role_name))
-      if role:
-        roles.append(role)
-    if not roles:
-      basic_role = await user_crud.get_basic_role()
-      if basic_role:
-        roles = [basic_role]
-    permissions = await user_crud.get_all_permissions(roles)
-    created_at = _parse_sync_datetime(data.get("created_at")) or utc_now()
-    updated_at = _parse_sync_datetime(data.get("updated_at")) or created_at
-    auth_version = max(int(data.get("auth_version") or 0), 0)
 
-    user = await user_crud.read_user_by_username(username)
-    if not user:
-      user = await user_crud.create_user(
-        username=username,
-        name=str(data.get("name") or username),
-        hashed_password=hashed_password,
-        roles=roles,
-        is_sync=False,
-      )
-      user.created_at = created_at
-      user.updated_at = updated_at
-      user.auth_version = auth_version
-      await user.save()
-      logger.info(f"Etcd sync: 创建可登录 User {username}")
-      continue
+async def refresh_user_identity_from_etcd(username: str, client=None):
+  """Pull one authoritative identity while the caller holds its user lock."""
+  from src.core import etcd_op
+  from src.modules.auth import crud as user_crud
 
-    current_role_names = sorted({
-      role.name
-      for role in (user.roles or [])
-      if getattr(role, "name", None)
-    })
-    desired_role_names = sorted(role.name for role in roles)
-    changed = any((
-      user.name != str(data.get("name") or username),
-      user.hashed_password != hashed_password,
-      current_role_names != desired_role_names,
-      sorted(user.permissions or []) != sorted(permissions),
-      bool(getattr(user, "is_sync", False)),
-      int(getattr(user, "auth_version", 0)) != auth_version,
-      not _same_sync_datetime(user.created_at, created_at),
-      not _same_sync_datetime(user.updated_at, updated_at),
-    ))
-    if not changed:
-      continue
-    user.name = str(data.get("name") or username)
-    user.hashed_password = hashed_password
-    user.roles = roles
-    user.permissions = permissions
-    user.is_sync = False
-    user.auth_version = auth_version
-    user.created_at = created_at
-    user.updated_at = updated_at
-    await user.save()
-    logger.info(f"Etcd sync: 更新可登录 User {username}")
+  users_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_USERS, client=client)
+  entry = users_data.get(username)
+  if isinstance(entry, dict):
+    return await _sync_user_to_mongo_locked(username, entry)
+  return await user_crud.read_user_by_username(username)
 
 
 async def publish_roles(client=None) -> None:
@@ -242,41 +449,54 @@ async def publish_roles(client=None) -> None:
   await etcd_op.merge_update_etcd_key(ETCD_KEY_ROLES, mutator, client=client)
 
 
-async def publish_user(user, client=None) -> None:
+async def publish_user(
+  user,
+  client=None,
+  *,
+  fields: set[str] | None = None,
+) -> dict | None:
   from src.core import etcd_op
   from src.modules.auth import crud as user_crud
 
   refreshed = await user_crud.read_user_by_id(user.id)
   if not refreshed or getattr(refreshed, "is_sync", False):
-    return
+    return None
   username = refreshed.username
   entry = user_to_etcd_entry(refreshed)
 
   def mutator(data: dict) -> dict:
-    if _prefer_user_entry(data.get(username), entry):
-      data[username] = entry
-    return data
+    return _merge_user_entry(data, username, entry, fields=fields)
 
-  await etcd_op.merge_update_etcd_key(ETCD_KEY_USERS, mutator, client=client)
+  users_data = await etcd_op.merge_update_etcd_key(
+    ETCD_KEY_USERS,
+    mutator,
+    client=client,
+  )
+  return users_data.get(username)
 
 
 async def publish_local_users(client=None) -> None:
-  from src.core import etcd_op
   from src.modules.auth import crud as user_crud
 
   users = await user_crud.list_local_users()
-  entries = {
-    user.username: user_to_etcd_entry(user)
-    for user in users
-  }
-
-  def mutator(data: dict) -> dict:
-    for username, entry in entries.items():
-      if _prefer_user_entry(data.get(username), entry):
-        data[username] = entry
-    return data
-
-  await etcd_op.merge_update_etcd_key(ETCD_KEY_USERS, mutator, client=client)
+  for user in users:
+    try:
+      async with user_role_update_lock(
+        user.username,
+        client=client,
+        timeout=0,
+      ) as guard:
+        if guard is not None:
+          await guard.ensure_owned()
+        await publish_user(user, client=client)
+    except UserIdentityUpdateLockBusyError:
+      continue
+    except (LastSuperadminError, UserIdentityUpdateLockLostError) as error:
+      # A crashed identity update can leave Mongo stale while Etcd retains the
+      # authoritative fields. The following pull repairs this node.
+      logger.warning(
+        f"跳过本地 User {user.username} 的身份发布，将由 Etcd 回拉修复: {error}"
+      )
 
 
 def application_to_etcd_entry(app) -> dict:
@@ -292,6 +512,11 @@ def application_to_etcd_entry(app) -> dict:
       app.provisioning_updated_at.isoformat()
       if app.provisioning_updated_at else None
     ),
+    "quota_bytes": int(getattr(
+      app,
+      "quota_bytes",
+      DEFAULT_APPLICATION_QUOTA_BYTES,
+    )),
     "author_username": author.username if author else "",
     "author_name": author.name if author else "",
     "approver_username": approver.username if approver else "",
@@ -299,6 +524,43 @@ def application_to_etcd_entry(app) -> dict:
     "updated_at": app.updated_at.isoformat() if app.updated_at else None,
     "origin_region": settings.REGION,
   }
+
+
+async def backfill_application_quotas(client=None) -> int:
+  """Idempotently add the deterministic default to legacy Etcd APP entries."""
+
+  from src.core import etcd_op
+
+  current = await etcd_op.pull_from_etcd_by_key(
+    ETCD_KEY_APPLICATIONS,
+    client=client,
+  )
+
+  def needs_backfill(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+      return False
+    try:
+      return int(entry.get("quota_bytes")) <= 0
+    except (TypeError, ValueError):
+      return True
+
+  pending = sum(needs_backfill(entry) for entry in current.values())
+  if not pending:
+    return 0
+
+  def mutator(data: dict) -> dict:
+    for entry in data.values():
+      if needs_backfill(entry):
+        entry["quota_bytes"] = DEFAULT_APPLICATION_QUOTA_BYTES
+    return data
+
+  await etcd_op.merge_update_etcd_key(
+    ETCD_KEY_APPLICATIONS,
+    mutator,
+    client=client,
+  )
+  logger.info(f"Etcd migration: 已为 {pending} 个历史应用补齐默认存储配额")
+  return pending
 
 
 def api_key_to_etcd_entry(api_key_obj) -> dict:
@@ -351,23 +613,25 @@ async def get_or_create_sync_user(username: str, name: str = "") -> Any:
 
   if not username:
     username = SYNC_USER_PLACEHOLDER
-  user = await user_crud.read_user_by_username(username)
-  if user:
-    return user
-  basic_role = await user_crud.get_basic_role()
-  roles = [basic_role] if basic_role else []
-  return await user_crud.create_user(
-    username=username,
-    name=name or username,
-    hashed_password=get_password_hash(secrets.token_urlsafe(48)),
-    roles=roles,
-    is_sync=True,
-  )
+  async with user_role_update_lock(username, timeout=30):
+    user = await user_crud.read_user_by_username(username)
+    if user:
+      return user
+    basic_role = await user_crud.get_basic_role()
+    roles = [basic_role] if basic_role else []
+    return await user_crud.create_user(
+      username=username,
+      name=name or username,
+      hashed_password=get_password_hash(secrets.token_urlsafe(48)),
+      roles=roles,
+      is_sync=True,
+    )
 
 
 async def upsert_application_from_etcd(app_name: str, data: dict):
   from src.modules.public import crud as public_crud
   from src.modules.public.model import Application
+  from pymongo.errors import DuplicateKeyError
 
   author_username = data.get("author_username") or SYNC_USER_PLACEHOLDER
   author = await get_or_create_sync_user(author_username, data.get("author_name", ""))
@@ -391,9 +655,15 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
   provisioning_updated_at = _parse_sync_datetime(
     data.get("provisioning_updated_at")
   )
+  try:
+    quota_bytes = int(data.get("quota_bytes", DEFAULT_APPLICATION_QUOTA_BYTES))
+  except (TypeError, ValueError):
+    quota_bytes = DEFAULT_APPLICATION_QUOTA_BYTES
+  if quota_bytes <= 0:
+    quota_bytes = DEFAULT_APPLICATION_QUOTA_BYTES
 
   if not app_obj:
-    app_obj = Application(
+    candidate = Application(
       name=app_name,
       shown_name=data.get("shown_name", app_name),
       description=data.get("description", ""),
@@ -404,10 +674,19 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
       provisioning_status=provisioning_status,
       provisioning_error=data.get("provisioning_error", ""),
       provisioning_updated_at=provisioning_updated_at,
+      quota_bytes=quota_bytes,
     )
-    await app_obj.save()
-    logger.info(f"Etcd sync: 创建 Application {app_name}")
-    return app_obj, True
+    try:
+      await candidate.save()
+    except DuplicateKeyError:
+      # A watch event and the request that won the Etcd claim may project the
+      # same APP concurrently. Re-read the winner and converge below.
+      app_obj = await public_crud.read_application_by_name(app_name)
+      if not app_obj:
+        raise
+    else:
+      logger.info(f"Etcd sync: 创建 Application {app_name}")
+      return candidate, True
 
   changed = False
   if app_obj.shown_name != data.get("shown_name", app_obj.shown_name):
@@ -416,14 +695,18 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
   if app_obj.description != data.get("description", app_obj.description):
     app_obj.description = data.get("description", app_obj.description)
     changed = True
-  if enabled and not app_obj.enabled:
-    app_obj.enabled = True
-    app_obj.enabled_at = enabled_at or utc_now()
-    if approver:
-      app_obj.approver = approver
+  if _linked_document_id(app_obj.author) != _linked_document_id(author):
+    app_obj.author = author
     changed = True
-  elif not enabled and app_obj.enabled:
-    app_obj.enabled = False
+  if _linked_document_id(app_obj.approver) != _linked_document_id(approver):
+    app_obj.approver = approver
+    changed = True
+  if app_obj.enabled != enabled:
+    app_obj.enabled = enabled
+    changed = True
+  incoming_enabled_at = enabled_at if enabled else None
+  if not _same_sync_datetime(app_obj.enabled_at, incoming_enabled_at):
+    app_obj.enabled_at = incoming_enabled_at
     changed = True
   if app_obj.provisioning_status != provisioning_status:
     app_obj.provisioning_status = provisioning_status
@@ -437,6 +720,9 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
     provisioning_updated_at,
   ):
     app_obj.provisioning_updated_at = provisioning_updated_at
+    changed = True
+  if getattr(app_obj, "quota_bytes", DEFAULT_APPLICATION_QUOTA_BYTES) != quota_bytes:
+    app_obj.quota_bytes = quota_bytes
     changed = True
   if changed:
     app_obj.updated_at = utc_now()
@@ -934,6 +1220,107 @@ class ReplicationLockBusyError(RuntimeError):
 
 
 @asynccontextmanager
+async def user_role_update_lock(
+  username: str,
+  *,
+  client=None,
+  timeout: int = 0,
+):
+  """Serialize every password/role write for one user across regions."""
+  from src.core import etcd_op
+
+  own_client = client is None
+  if own_client:
+    client = await etcd_op.get_etcd_client()
+  ttl = 30
+  lock = client.lock(
+    f"/storagent/locks/user-role-update/{username}".encode(),
+    ttl=ttl,
+  )
+  acquired = False
+  refresh_job = None
+  owner_task = asyncio.current_task()
+  lease_failure: BaseException | None = None
+
+  class Guard:
+    async def ensure_owned(self) -> None:
+      nonlocal lease_failure
+      if lease_failure is not None:
+        raise UserIdentityUpdateLockLostError(
+          f"用户 {username} 的身份更新锁续租失败"
+        ) from lease_failure
+      checker = getattr(lock, "is_acquired", None)
+      if checker is None:
+        return
+      try:
+        still_owned = await checker()
+      except asyncio.CancelledError:
+        raise
+      except BaseException as error:
+        lease_failure = error
+        raise UserIdentityUpdateLockLostError(
+          f"用户 {username} 的身份更新锁状态无法确认"
+        ) from error
+      if not still_owned:
+        lease_failure = RuntimeError("Etcd lock ownership lost")
+        raise UserIdentityUpdateLockLostError(
+          f"用户 {username} 的身份更新锁已丢失"
+        ) from lease_failure
+
+  guard = Guard()
+
+  async def refresh_lock():
+    nonlocal lease_failure
+    try:
+      while True:
+        await asyncio.sleep(ttl / 3)
+        await lock.refresh()
+        await guard.ensure_owned()
+    except asyncio.CancelledError:
+      raise
+    except BaseException as error:
+      lease_failure = error
+      if owner_task is not None and not owner_task.done():
+        owner_task.cancel()
+
+  try:
+    acquired = await lock.acquire(timeout=timeout)
+    if not acquired:
+      raise UserIdentityUpdateLockBusyError(
+        f"用户 {username} 的身份信息正在由其他节点更新"
+      )
+    refresh_job = asyncio.create_task(refresh_lock())
+    try:
+      yield guard
+      await guard.ensure_owned()
+    except asyncio.CancelledError as error:
+      if lease_failure is not None:
+        raise UserIdentityUpdateLockLostError(
+          f"用户 {username} 的身份更新锁续租失败"
+        ) from lease_failure
+      raise error
+  finally:
+    if refresh_job is not None:
+      refresh_job.cancel()
+      try:
+        await refresh_job
+      except asyncio.CancelledError:
+        pass
+      except Exception as error:
+        logger.warning(f"用户身份锁续租任务异常 username={username}: {error}")
+    if acquired:
+      try:
+        await lock.release()
+      except Exception as error:
+        logger.warning(f"用户身份锁释放失败 username={username}: {error}")
+    if own_client:
+      try:
+        await client.close()
+      except Exception as error:
+        logger.warning(f"用户身份锁 Etcd 连接关闭失败 username={username}: {error}")
+
+
+@asynccontextmanager
 async def application_replication_lock(
   application_name: str,
   *,
@@ -1083,6 +1470,36 @@ async def setup_bucket_replication(
   )
 
 
+async def ensure_bucket_quotas(
+  bucket_name: str,
+  quota_bytes: int,
+  server_names: list[str],
+) -> None:
+  """Idempotently enforce the same hard quota on every regional bucket."""
+  from src.core import minio_op
+
+  names = sorted(set(server_names))
+  results = await asyncio.gather(*(
+    minio_op.ensure_bucket_hard_quota(
+      server_name,
+      bucket_name,
+      quota_bytes,
+      timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+    )
+    for server_name in names
+  ))
+  failures = {
+    server_name: error
+    for server_name, (success, error) in zip(names, results)
+    if not success
+  }
+  if failures:
+    detail = "; ".join(
+      f"{server_name}: {error}" for server_name, error in failures.items()
+    )
+    raise RuntimeError(f"存储桶配额设置失败: {detail}")
+
+
 async def reconcile_replication_policies_task():
   """Authority-region loop that repairs missing rules for enabled apps."""
   if settings.REGION != settings.SYNC_AUTHORITY_REGION:
@@ -1090,6 +1507,8 @@ async def reconcile_replication_policies_task():
     return
 
   from src.modules.public import crud as public_crud
+  from src.modules.public import service as public_service
+  from src.modules.files import quota as files_quota
   from src.modules.storage import crud as storage_crud
 
   interval = max(float(settings.REPLICATION_RECONCILE_INTERVAL_SECONDS), 30.0)
@@ -1102,26 +1521,64 @@ async def reconcile_replication_policies_task():
           continue
         try:
           async with application_replication_lock(app.name, timeout=0):
-            await setup_bucket_replication(app.name, server_names)
-          if app.provisioning_status != "ready" or app.provisioning_error:
-            app.provisioning_status = "ready"
-            app.provisioning_error = ""
-            app.provisioning_updated_at = utc_now()
-            app.updated_at = utc_now()
-            await app.save()
-            await publish_application(app)
+            reconcile_error = None
+            try:
+              await setup_bucket_replication(app.name, server_names)
+            except Exception as error:
+              reconcile_error = error
+
+            authoritative_quota = None
+            try:
+              async with files_quota.application_quota_lock(app.name) as quota_client:
+                authoritative_quota = await public_service.get_application_quota_limit(
+                  app.name,
+                  client=quota_client,
+                )
+                if reconcile_error is None:
+                  await ensure_bucket_quotas(
+                    app.name,
+                    authoritative_quota,
+                    server_names,
+                  )
+            except Exception as error:
+              # Without the authoritative value, saving the stale object loaded
+              # before the locks could overwrite a newer cross-region quota.
+              if authoritative_quota is None:
+                raise
+              reconcile_error = error
+
+            quota_changed = int(getattr(
+              app,
+              "quota_bytes",
+              DEFAULT_APPLICATION_QUOTA_BYTES,
+            )) != authoritative_quota
+            app.quota_bytes = authoritative_quota
+            if reconcile_error is None:
+              if (
+                app.provisioning_status != "ready"
+                or app.provisioning_error
+                or quota_changed
+              ):
+                app.provisioning_status = "ready"
+                app.provisioning_error = ""
+                app.provisioning_updated_at = utc_now()
+                app.updated_at = utc_now()
+                await app.save()
+                await publish_application(app)
+            else:
+              app.provisioning_status = "degraded"
+              app.provisioning_error = str(reconcile_error)
+              app.provisioning_updated_at = utc_now()
+              app.updated_at = utc_now()
+              await app.save()
+              try:
+                await publish_application(app)
+              except Exception as publish_error:
+                logger.warning(f"复制策略异常状态同步失败 {app.name}: {publish_error}")
+              logger.warning(f"复制策略校准失败 {app.name}: {reconcile_error}")
         except ReplicationLockBusyError:
           continue
         except Exception as e:
-          app.provisioning_status = "degraded"
-          app.provisioning_error = str(e)
-          app.provisioning_updated_at = utc_now()
-          app.updated_at = utc_now()
-          await app.save()
-          try:
-            await publish_application(app)
-          except Exception as publish_error:
-            logger.warning(f"复制策略异常状态同步失败 {app.name}: {publish_error}")
           logger.warning(f"复制策略校准失败 {app.name}: {e}")
     except asyncio.CancelledError:
       logger.info("复制策略周期校准已停止")
@@ -1138,7 +1595,7 @@ async def ensure_local_buckets_for_app(app_name: str):
   local_server = await storage_crud.read_minio_server_by_region_name(settings.REGION)
   if not local_server:
     return
-  server_name = local_server.name
+  server_name = settings.REGION
   existed = await minio_op.check_server_bucket_existed(server_name, app_name)
   if not existed:
     success, err = await minio_op.create_bucket(server_name, app_name)
@@ -1146,6 +1603,17 @@ async def ensure_local_buckets_for_app(app_name: str):
       logger.warning(f"本地建桶失败 {app_name}: {err}")
       return
   await minio_op.enable_bucket_versioning(server_name, app_name)
+  from src.modules.public import crud as public_crud
+  app = await public_crud.read_application_by_name(app_name)
+  quota_bytes = int(getattr(app, "quota_bytes", DEFAULT_APPLICATION_QUOTA_BYTES))
+  success, error = await minio_op.ensure_bucket_hard_quota(
+    server_name,
+    app_name,
+    quota_bytes,
+    timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+  )
+  if not success:
+    logger.warning(f"本地存储桶配额设置失败 {server_name}/{app_name}: {error}")
 
 
 async def publish_application(app) -> None:
@@ -1159,7 +1627,33 @@ async def publish_application(app) -> None:
   name = app.name
 
   def mutator(data: dict) -> dict:
-    data[name] = entry
+    current = data.get(name)
+    if not isinstance(current, dict):
+      data[name] = entry
+      return data
+
+    # Lifecycle writers may run from a delayed local projection. Preserve the
+    # Etcd-owned identity and quota fields while publishing only authorization
+    # and replication-operational state.
+    for field in (
+      "enabled",
+      "provisioning_status",
+      "provisioning_error",
+      "provisioning_updated_at",
+      "approver_username",
+      "enabled_at",
+      "updated_at",
+    ):
+      current[field] = entry[field]
+    for field in (
+      "shown_name",
+      "description",
+      "quota_bytes",
+      "author_username",
+      "author_name",
+      "origin_region",
+    ):
+      current.setdefault(field, entry[field])
     return data
 
   await etcd_op.merge_update_etcd_key(ETCD_KEY_APPLICATIONS, mutator)

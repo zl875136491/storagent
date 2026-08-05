@@ -81,6 +81,8 @@ class ErrorDesc(Enum):
   USER_ALREADY_REGISTERED = ("用户已完成注册", 400046)
   ONE_TIME_DOWNLOAD_INVALID = ("下载链接无效、已使用或已过期", 410047)
   DOWNLOAD_SOURCE_UNAVAILABLE = ("下载源服务不可用", 503048)
+  APP_STORAGE_QUOTA_EXCEEDED = ("APP 存储超出限额，请联系管理员处理", 413049)
+  UPLOAD_PART_TOO_LARGE = ("上传分片超过服务端单片限制", 413050)
   
 
   

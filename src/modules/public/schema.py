@@ -86,10 +86,18 @@ class ApplicationResponse(BaseModel):
   provisioning_status: Literal["pending", "provisioning", "ready", "failed", "degraded"]
   provisioning_error: str
   provisioning_updated_at: datetime | None
+  quota_bytes: int = Field(gt=0)
+  quota_usage_bytes: int = Field(default=0, ge=0)
+  quota_usage_ratio: float = Field(default=0.0, ge=0)
+  quota_usage_updated_at: datetime | None = None
   author: SimpleUserResponse
 
 class ApplicationListResponse(BaseModel):
   data: List[ApplicationResponse]
+
+
+class ApplicationQuotaUpdateRequest(BaseModel):
+  quota_bytes: int = Field(..., gt=0)
 
 class SimpleApplicationResponse(BaseModel):
   id: PydanticObjectId

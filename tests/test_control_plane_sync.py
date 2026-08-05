@@ -7,6 +7,8 @@ import pytest
 
 from src.core import etcd_op
 from src.core import sync as sync_module
+from src.modules.auth import crud as auth_crud
+from src.modules.auth.model import Role
 from src.modules.graph import service as graph_service
 from src.modules.public import crud as public_crud
 
@@ -34,6 +36,21 @@ def test_user_conflict_prefers_newest_then_authority(monkeypatch):
   assert sync_module._prefer_user_entry(same_time_authority, same_time_remote) is False
 
 
+def test_authority_role_definition_replaces_older_same_origin_entry(monkeypatch):
+  monkeypatch.setattr(sync_module.settings, "SYNC_AUTHORITY_REGION", "beijing")
+  current = {
+    "name": "管理员",
+    "permissions": ["system_manage"],
+    "origin_region": "beijing",
+  }
+  upgraded = {
+    "name": "管理员",
+    "permissions": ["system_manage", "application_quota_manage"],
+    "origin_region": "beijing",
+  }
+  assert sync_module._prefer_authority_entry(current, upgraded) is True
+
+
 def test_user_entry_encrypts_password_hash_and_uses_role_names(monkeypatch):
   monkeypatch.setattr(sync_module.settings, "SECRET_KEY", "unit-test-secret-key")
   monkeypatch.setattr(sync_module.settings, "REGION", "shenzhen")
@@ -42,6 +59,7 @@ def test_user_entry_encrypts_password_hash_and_uses_role_names(monkeypatch):
     name="Alice",
     hashed_password="$2b$04$hash",
     auth_version=3,
+    roles_version=2,
     roles=[SimpleNamespace(name="user"), SimpleNamespace(name="admin")],
     created_at=now,
     updated_at=now,
@@ -52,7 +70,146 @@ def test_user_entry_encrypts_password_hash_and_uses_role_names(monkeypatch):
   assert "$2b$04$hash" not in entry["hashed_password_enc"]
   assert entry["role_names"] == ["admin", "user"]
   assert entry["auth_version"] == 3
+  assert entry["roles_version"] == 2
   assert entry["origin_region"] == "shenzhen"
+
+
+def test_role_publish_cannot_roll_back_password_or_auth_version():
+  users = {
+    "alice": {
+      "name": "Alice",
+      "hashed_password_enc": "new-password",
+      "auth_version": 4,
+      "role_names": ["用户"],
+      "roles_version": 2,
+      "updated_at": "2026-08-05T02:00:00+00:00",
+      "origin_region": "beijing",
+    },
+  }
+  stale_role_writer = {
+    **users["alice"],
+    "hashed_password_enc": "old-password",
+    "auth_version": 3,
+    "role_names": ["用户", "应用管理员"],
+    "roles_version": 3,
+    "updated_at": "2026-08-05T03:00:00+00:00",
+    "origin_region": "shenzhen",
+  }
+
+  sync_module._merge_user_entry(
+    users,
+    "alice",
+    stale_role_writer,
+    fields={"roles"},
+  )
+
+  assert users["alice"]["hashed_password_enc"] == "new-password"
+  assert users["alice"]["auth_version"] == 4
+  assert users["alice"]["role_names"] == ["用户", "应用管理员"]
+  assert users["alice"]["roles_version"] == 3
+
+
+def test_password_publish_preserves_newer_roles_and_reconcile_never_decreases_versions():
+  users = {
+    "alice": {
+      "name": "Alice",
+      "hashed_password_enc": "old-password",
+      "auth_version": 4,
+      "role_names": ["用户", "运维管理员"],
+      "roles_version": 7,
+      "updated_at": "2026-08-05T02:00:00+00:00",
+      "origin_region": "beijing",
+    },
+  }
+  password_writer = {
+    **users["alice"],
+    "hashed_password_enc": "new-password",
+    "auth_version": 5,
+    "role_names": ["用户"],
+    "roles_version": 6,
+  }
+  sync_module._merge_user_entry(
+    users,
+    "alice",
+    password_writer,
+    fields={"auth"},
+  )
+  assert users["alice"]["hashed_password_enc"] == "new-password"
+  assert users["alice"]["auth_version"] == 5
+  assert users["alice"]["role_names"] == ["用户", "运维管理员"]
+  assert users["alice"]["roles_version"] == 7
+
+  stale_reconcile = {
+    **password_writer,
+    "hashed_password_enc": "very-old-password",
+    "auth_version": 2,
+    "role_names": ["用户"],
+    "roles_version": 3,
+    "updated_at": "2026-08-05T04:00:00+00:00",
+  }
+  sync_module._merge_user_entry(users, "alice", stale_reconcile)
+  assert users["alice"]["hashed_password_enc"] == "new-password"
+  assert users["alice"]["auth_version"] == 5
+  assert users["alice"]["role_names"] == ["用户", "运维管理员"]
+  assert users["alice"]["roles_version"] == 7
+
+
+@pytest.mark.asyncio
+async def test_etcd_pull_updates_roles_without_decreasing_local_auth_version(monkeypatch):
+  monkeypatch.setattr(sync_module.settings, "SECRET_KEY", "unit-test-secret-key")
+  now = datetime(2026, 8, 5, tzinfo=timezone.utc)
+  basic = SimpleNamespace(name="用户", permissions=[])
+  operations = SimpleNamespace(name="运维管理员", permissions=["storage_operations_manage"])
+
+  class FakeUser:
+    username = "alice"
+    name = "Alice"
+    hashed_password = "new-password"
+    auth_version = 4
+    roles = [basic]
+    roles_version = 2
+    permissions = []
+    is_sync = False
+    created_at = now
+    updated_at = now
+
+    async def save(self):
+      return None
+
+  user = FakeUser()
+
+  async def get_basic():
+    return basic
+
+  async def find_role(*_args, **_kwargs):
+    return operations
+
+  async def get_permissions(roles):
+    return sorted({permission for role in roles for permission in role.permissions})
+
+  async def read_user(_username):
+    return user
+
+  monkeypatch.setattr(auth_crud, "get_basic_role", get_basic)
+  monkeypatch.setattr(auth_crud, "get_all_permissions", get_permissions)
+  monkeypatch.setattr(auth_crud, "read_user_by_username", read_user)
+  monkeypatch.setattr(Role, "name", object(), raising=False)
+  monkeypatch.setattr(Role, "find_one", find_role)
+
+  await sync_module._sync_user_to_mongo_locked("alice", {
+    "name": "Alice",
+    "hashed_password_enc": sync_module.encrypt_secret("old-password"),
+    "auth_version": 3,
+    "role_names": ["用户", "运维管理员"],
+    "roles_version": 3,
+    "created_at": now.isoformat(),
+    "updated_at": now.isoformat(),
+  })
+
+  assert user.hashed_password == "new-password"
+  assert user.auth_version == 4
+  assert [role.name for role in user.roles] == ["用户", "运维管理员"]
+  assert user.roles_version == 3
 
 
 def test_topology_layout_validation_keeps_minio_rules_out_of_payload():
@@ -168,6 +325,56 @@ async def test_watch_dispatches_identity_and_topology_keys(monkeypatch):
     ("users", {"alice": {}}),
     ("topology", {"_meta": {"initialized": True}}),
   ]
+
+
+@pytest.mark.asyncio
+async def test_authority_backfills_legacy_application_quota(monkeypatch):
+  current = {
+    "legacy": {"enabled": True, "shown_name": "Legacy"},
+    "invalid": {"enabled": True, "quota_bytes": 0},
+    "configured": {"enabled": True, "quota_bytes": 123},
+  }
+  captured = {}
+
+  async def pull(key, client=None):
+    assert key == sync_module.ETCD_KEY_APPLICATIONS
+    return current
+
+  async def merge(key, mutator, client=None):
+    assert key == sync_module.ETCD_KEY_APPLICATIONS
+    captured.update(mutator(current))
+    return captured
+
+  monkeypatch.setattr(sync_module.settings, "REGION", "beijing")
+  monkeypatch.setattr(sync_module.settings, "SYNC_AUTHORITY_REGION", "beijing")
+  monkeypatch.setattr(etcd_op, "pull_from_etcd_by_key", pull)
+  monkeypatch.setattr(etcd_op, "merge_update_etcd_key", merge)
+
+  assert await sync_module.backfill_application_quotas(client=object()) == 2
+  assert captured["legacy"]["quota_bytes"] == sync_module.DEFAULT_APPLICATION_QUOTA_BYTES
+  assert captured["invalid"]["quota_bytes"] == sync_module.DEFAULT_APPLICATION_QUOTA_BYTES
+  assert captured["configured"]["quota_bytes"] == 123
+
+
+@pytest.mark.asyncio
+async def test_non_authority_safely_backfills_deterministic_application_quota(monkeypatch):
+  current = {"legacy": {"enabled": True}}
+  captured = {}
+
+  async def pull(*_args, **_kwargs):
+    return current
+
+  async def merge(_key, mutator, client=None):
+    captured.update(mutator(current))
+    return captured
+
+  monkeypatch.setattr(sync_module.settings, "REGION", "shenzhen")
+  monkeypatch.setattr(sync_module.settings, "SYNC_AUTHORITY_REGION", "beijing")
+  monkeypatch.setattr(etcd_op, "pull_from_etcd_by_key", pull)
+  monkeypatch.setattr(etcd_op, "merge_update_etcd_key", merge)
+
+  assert await sync_module.backfill_application_quotas(client=object()) == 1
+  assert captured["legacy"]["quota_bytes"] == sync_module.DEFAULT_APPLICATION_QUOTA_BYTES
 
 
 @pytest.mark.asyncio

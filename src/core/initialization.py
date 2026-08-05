@@ -5,16 +5,17 @@ async def init_project():
   初始化项目
   """
   from src.modules.auth import crud as user_crud
+  from src.configs.consts import system_role_definitions
   from src.utils.helpers import get_full_permissions
-  basic_role = await user_crud.get_basic_role()
-  admin_role = await user_crud.get_admin_role()
-  admin_permissions = get_full_permissions(["system_manage"])
-  basic_permissions = get_full_permissions(["application_view", "region_view"])
-  if not basic_role:
-    await user_crud.create_role(name="用户", is_admin=False, permissions=basic_permissions)
-  if not admin_role:
-    await user_crud.create_role(name="管理员", is_admin=True, permissions=admin_permissions)
-  logger.info("Role Data Created.")
+
+  for role_name, definition in system_role_definitions.items():
+    await user_crud.upsert_role(
+      name=role_name,
+      is_admin=bool(definition["is_admin"]),
+      permissions=get_full_permissions(definition["permissions"]),
+    )
+  updated_users = await user_crud.recompute_all_user_permissions()
+  logger.info(f"System roles initialized; normalized {updated_users} users.")
 
 async def init_service():
   """
@@ -63,6 +64,9 @@ async def init_service():
 
     # 4. 拓扑布局仅首次由权威区域写入；后续所有区域均走共享 CAS 更新。
     await sync_module.bootstrap_topology_layout(client=etcd_client)
+
+    # 任一节点都可用确定性默认值原子补齐历史应用，不覆盖合法自定义配额。
+    await sync_module.backfill_application_quotas(client=etcd_client)
 
     # 5. 全量同步 Etcd -> MongoDB（含身份、应用、API Key、拓扑布局）
     await sync_module.pull_all_and_sync(client=etcd_client)
