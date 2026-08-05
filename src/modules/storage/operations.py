@@ -104,6 +104,21 @@ def _safe_datetime(value: Any) -> Any:
   return value
 
 
+def _status_reason(
+  code: str,
+  message: str,
+  value: Any = None,
+  *,
+  severity: str = "info",
+) -> dict[str, Any]:
+  return {
+    "code": code,
+    "message": message,
+    "value": value,
+    "severity": severity,
+  }
+
+
 def _validate_alias(value: str, field: str = "server") -> str:
   normalized = value.strip()
   if not _ALIAS_RE.fullmatch(normalized):
@@ -449,6 +464,66 @@ def parse_replication_source(
       "resync_status": "idle" if resync_status_known else "unknown",
     }
     resync_status = str(resync.get("resync_status") or "unknown")
+    current_rate = rates.get(arn, 0.0)
+    target_reasons: list[dict[str, Any]] = []
+    if not arn:
+      target_reasons.append(_status_reason(
+        "replication_rule_missing",
+        "目标方向缺少可用的复制规则",
+        target_name,
+        severity="critical",
+      ))
+    if not online:
+      target_reasons.append(_status_reason(
+        "target_offline",
+        "复制目标当前不可达",
+        target_name,
+        severity="critical",
+      ))
+    if recent_failed_count:
+      target_reasons.append(_status_reason(
+        "recent_replication_failures",
+        "近 1 小时仍有复制失败",
+        recent_failed_count,
+        severity="degraded",
+      ))
+    if resync_status == "partial":
+      target_reasons.append(_status_reason(
+        "resync_partial",
+        "最近一次对象补传存在失败对象",
+        _as_int(resync.get("resync_failed_count")),
+        severity="degraded",
+      ))
+    elif resync_status == "failed":
+      target_reasons.append(_status_reason(
+        "resync_failed",
+        "最近一次对象补传失败",
+        str(resync.get("resync_error") or "") or _as_int(
+          resync.get("resync_failed_count")
+        ),
+        severity="degraded",
+      ))
+    if failed_count > 0 and resync_status != "completed":
+      target_reasons.append(_status_reason(
+        "unresolved_historical_failures",
+        "历史复制失败尚无一次完整成功的补传作为已解决依据",
+        failed_count,
+        severity="degraded",
+      ))
+    if resync_status == "running":
+      target_reasons.append(_status_reason(
+        "resync_running",
+        "对象补传任务正在运行",
+        _as_int(resync.get("resync_object_count")),
+        severity="syncing",
+      ))
+    if current_rate > 0:
+      target_reasons.append(_status_reason(
+        "replication_transfer_active",
+        "复制链路当前有数据传输",
+        current_rate,
+        severity="syncing",
+      ))
     if not arn or not online:
       status = "critical"
     elif resync_status == "running":
@@ -481,8 +556,9 @@ def parse_replication_source(
       "failed_bytes": _as_int(target_failed_totals.get("bytes")),
       "recent_failed_count": recent_failed_count,
       "recent_failed_bytes": _as_int(target_failed_recent.get("bytes")),
-      "current_rate_bps": rates.get(arn, 0.0),
+      "current_rate_bps": current_rate,
       **resync,
+      "status_reasons": target_reasons,
     })
 
   expected_targets = [name for name in server_names if name != source]
@@ -497,6 +573,12 @@ def parse_replication_source(
       "endpoint": endpoint,
       "status": "critical",
       "online": False,
+      "status_reasons": [_status_reason(
+        "replication_rule_missing",
+        "目标方向缺少可用的复制规则",
+        missing,
+        severity="critical",
+      )],
     })
 
   actual_target_count = sum(
@@ -508,13 +590,71 @@ def parse_replication_source(
   failed_count = _as_int(failed_totals.get("count"))
   recent_failed_count = _as_int(failed_recent.get("count"))
   current_rate = sum(rates.values())
-  if any(item["status"] == "critical" for item in targets):
+  critical_target_count = sum(item["status"] == "critical" for item in targets)
+  degraded_target_count = sum(item["status"] == "degraded" for item in targets)
+  syncing_target_count = sum(item["status"] == "syncing" for item in targets)
+  source_reasons: list[dict[str, Any]] = []
+  if critical_target_count:
+    source_reasons.append(_status_reason(
+      "critical_target_links",
+      "存在异常复制链路",
+      critical_target_count,
+      severity="critical",
+    ))
+  if actual_target_count != len(expected_targets):
+    source_reasons.append(_status_reason(
+      "target_count_mismatch",
+      "实际复制目标数与预期不一致",
+      {"actual": actual_target_count, "expected": len(expected_targets)},
+      severity="degraded",
+    ))
+  if recent_failed_count:
+    source_reasons.append(_status_reason(
+      "recent_replication_failures",
+      "源站近 1 小时仍有复制失败",
+      recent_failed_count,
+      severity="degraded",
+    ))
+  if degraded_target_count:
+    source_reasons.append(_status_reason(
+      "degraded_target_links",
+      "存在需要关注的复制链路",
+      degraded_target_count,
+      severity="degraded",
+    ))
+  if queued_count:
+    source_reasons.append(_status_reason(
+      "replication_queue_pending",
+      "源站仍有对象等待复制",
+      queued_count,
+      severity="syncing",
+    ))
+  if current_rate > 0:
+    source_reasons.append(_status_reason(
+      "replication_transfer_active",
+      "源站当前有复制流量",
+      current_rate,
+      severity="syncing",
+    ))
+  if syncing_target_count:
+    source_reasons.append(_status_reason(
+      "syncing_target_links",
+      "存在正在同步的复制链路",
+      syncing_target_count,
+      severity="syncing",
+    ))
+  if mrf_failed:
+    source_reasons.append(_status_reason(
+      "mrf_recent_backlog_observed",
+      "MinIO 报告过 MRF 补偿队列记录；该计数可能粘滞，仅供诊断",
+      mrf_failed,
+    ))
+  if critical_target_count:
     status = "critical"
   elif (
     actual_target_count != len(expected_targets)
     or recent_failed_count
-    or mrf_failed
-    or any(item.get("status") == "degraded" for item in targets)
+    or degraded_target_count
   ):
     status = "degraded"
   elif queued_count or current_rate > 0 or any(
@@ -541,6 +681,7 @@ def parse_replication_source(
     "expected_target_count": len(expected_targets),
     "actual_target_count": actual_target_count,
     "targets": sorted(targets, key=lambda item: item["target"]),
+    "status_reasons": source_reasons,
   }
 
 
@@ -549,6 +690,35 @@ def _worst_replication_status(statuses: list[str]) -> str:
     if status in statuses:
       return status
   return "healthy"
+
+
+def _aggregate_source_status_reasons(
+  sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+  reasons: list[dict[str, Any]] = []
+  messages = {
+    "unreachable": "存在无法读取复制指标的源站检查",
+    "critical": "存在异常源站检查",
+    "degraded": "存在需要关注的源站检查",
+    "syncing": "存在正在同步的源站检查",
+  }
+  for status in ("unreachable", "critical", "degraded", "syncing"):
+    count = sum(item.get("status") == status for item in sources)
+    if count:
+      reasons.append(_status_reason(
+        f"{status}_sources",
+        messages[status],
+        count,
+        severity=status,
+      ))
+  mrf_failed = sum(_as_int(item.get("mrf_failed_last_5m")) for item in sources)
+  if mrf_failed:
+    reasons.append(_status_reason(
+      "mrf_recent_backlog_observed",
+      "MinIO 报告过 MRF 补偿队列记录；该计数可能粘滞，仅供诊断",
+      mrf_failed,
+    ))
+  return reasons
 
 
 async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
@@ -596,6 +766,12 @@ async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
         "expected_target_count": max(len(server_names) - 1, 0),
         "actual_target_count": 0,
         "targets": [],
+        "status_reasons": [_status_reason(
+          "metrics_unreachable",
+          "无法读取源站的 MinIO 复制指标",
+          error,
+          severity="unreachable",
+        )],
       }
     resync_success, resync_payload, _, _ = resync_result
     return parse_replication_source(
@@ -622,21 +798,40 @@ async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
   for bucket_name in bucket_names:
     sources = [await tasks[(bucket_name, source)] for source in server_names]
     all_sources.extend(sources)
+    bucket_status = _worst_replication_status([item["status"] for item in sources])
     buckets.append({
       "bucket": bucket_name,
       "shown_name": app_names.get(bucket_name, ""),
-      "status": _worst_replication_status([item["status"] for item in sources]),
+      "status": bucket_status,
       "sources": sources,
+      "status_reasons": _aggregate_source_status_reasons(sources),
     })
 
   all_targets = [target for source in all_sources for target in source.get("targets", []) if target.get("arn")]
   expected_links = len(bucket_names) * len(server_names) * max(len(server_names) - 1, 0)
+  summary_status = (
+    "degraded"
+    if not bucket_names or len(server_names) < 2
+    else _worst_replication_status([item["status"] for item in all_sources])
+  )
+  summary_reasons: list[dict[str, Any]] = []
+  if not bucket_names:
+    summary_reasons.append(_status_reason(
+      "no_managed_buckets",
+      "当前没有可检查的已启用存储桶",
+      0,
+      severity="degraded",
+    ))
+  if len(server_names) < 2:
+    summary_reasons.append(_status_reason(
+      "insufficient_servers",
+      "至少需要两个存储节点才能形成复制链路",
+      len(server_names),
+      severity="degraded",
+    ))
+  summary_reasons.extend(_aggregate_source_status_reasons(all_sources))
   summary = {
-    "status": (
-      "degraded"
-      if not bucket_names or len(server_names) < 2
-      else _worst_replication_status([item["status"] for item in all_sources])
-    ),
+    "status": summary_status,
     "bucket_count": len(bucket_names),
     "source_count": len(all_sources),
     "reachable_source_count": sum(item.get("reachable", False) for item in all_sources),
@@ -655,6 +850,7 @@ async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
     ),
     "mrf_failed_last_5m": sum(_as_int(item.get("mrf_failed_last_5m")) for item in all_sources),
     "current_rate_bps": sum(_as_float(item.get("current_rate_bps")) for item in all_sources),
+    "status_reasons": summary_reasons,
   }
   return {
     "generated_at": utc_now(),
