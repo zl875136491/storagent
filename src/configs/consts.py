@@ -1,3 +1,11 @@
+# 业务接口版本前缀。v1 起所有业务路由统一挂载在该前缀下，历史未带版本号的 `/api/*`
+# 路径不再提供（其鉴权模型不安全，已被 v1 的能力令牌机制完全取代）。
+API_V1_PREFIX = "/api/v1"
+
+# 数据面能力令牌（capability token）允许的动作：仅覆盖前端可直连的两个数据面接口。
+CAPABILITY_ACTION_UPLOAD_PART = "upload_part"
+CAPABILITY_ACTION_DOWNLOAD = "download"
+
 preset_permissions = {
   "system_manage": {
     "name": "系统管理",

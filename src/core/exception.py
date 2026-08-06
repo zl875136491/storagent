@@ -83,7 +83,11 @@ class ErrorDesc(Enum):
   DOWNLOAD_SOURCE_UNAVAILABLE = ("下载源服务不可用", 503048)
   APP_STORAGE_QUOTA_EXCEEDED = ("APP 存储超出限额，请联系管理员处理", 413049)
   UPLOAD_PART_TOO_LARGE = ("上传分片超过服务端单片限制", 413050)
-  
+
+  # 数据面能力令牌（v1 前端直连上传分片 / 下载专用，见 capability_token 模块）
+  CAPABILITY_TOKEN_INVALID = ("能力令牌无效", 401051)
+  CAPABILITY_TOKEN_EXPIRED = ("能力令牌已过期", 401052)
+  CAPABILITY_TOKEN_SCOPE_MISMATCH = ("能力令牌与请求的动作或对象不匹配", 403053)
 
   
   @property

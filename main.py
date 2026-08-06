@@ -115,8 +115,13 @@ def create_app() -> FastAPI:
       CORSMiddleware,
       allow_origins=cors_origins,
       allow_credentials=True,
-      allow_methods=["*"],
-      allow_headers=["*"],
+      # 收窄为实际用到的方法/请求头（最小权限），而不是笼统的 "*"。
+      # 这不会改变浏览器是否发起预检的判断（凡是非"简单请求"仍会预检），
+      # 但配合下面的 max_age，同一 origin+method+header 组合的预检结果会
+      # 被浏览器缓存复用，避免每次业务请求都重新走一次 OPTIONS 预检。
+      allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allow_headers=["Authorization", "Content-Type", "x-api-key"],
+      max_age=settings.BACKEND_CORS_MAX_AGE_SECONDS,
     )
 
   # Keep this outermost so chunked oversized bodies cannot be converted into

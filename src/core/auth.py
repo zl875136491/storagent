@@ -255,22 +255,23 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:
   raise CustomException(ErrorDesc.INSUFFICIENT_PERMISSIONS, "仅管理员可以管理系统配置")
 
 # 从请求头中提取 API-KEY 字段作为 App 数据源
+from typing import Optional
+
 from fastapi.security import APIKeyHeader
+from src.core import capability_token as capability_token_mod
+from src.core.crypto import decrypt_secret
 from src.modules.public import crud as public_crud
 from src.utils.helpers import before_compare
-async def get_current_app_context(
-  api_key: str = Depends(APIKeyHeader(name="x-api-key")),
-) -> dict:
-  """
-  从请求头中提取 API-KEY 字段作为输入源
-  """
+
+# 数据面接口（分片上传、下载）允许缺省 x-api-key，改由能力令牌（token）鉴权；
+# 控制面接口仍必须使用严格模式的 APIKeyHeader（见 get_current_app_context）。
+optional_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+
+async def _build_app_context(api_key_obj) -> dict:
+  """由已通过有效期校验的 APIKey 文档构造应用上下文（应用是否启用等）。"""
   from beanie.odm.fields import Link
   from src.modules.public.model import Application
-  api_key_obj = await public_crud.read_api_key_by_key(api_key)
-  if not api_key_obj or api_key_obj.deleted:
-    raise CustomException(ErrorDesc.API_KEY_INVALID, "API-KEY 无效")
-  if before_compare(api_key_obj.expired_at) < utc_now():
-    raise CustomException(ErrorDesc.API_KEY_EXPIRED, "API-KEY 已过期")
   application_obj = api_key_obj.application
   if isinstance(application_obj, Link):
     application_obj = await public_crud.read_application_by_id(application_obj.ref.id)
@@ -290,9 +291,71 @@ async def get_current_app_context(
   }
 
 
+async def get_current_app_context(
+  api_key: str = Depends(APIKeyHeader(name="x-api-key")),
+) -> dict:
+  """
+  从请求头中提取 API-KEY 字段作为输入源（控制面：仅限 App 后端到 Storagent 的调用）
+  """
+  api_key_obj = await public_crud.read_api_key_by_key(api_key)
+  if not api_key_obj or api_key_obj.deleted:
+    raise CustomException(ErrorDesc.API_KEY_INVALID, "API-KEY 无效")
+  if before_compare(api_key_obj.expired_at) < utc_now():
+    raise CustomException(ErrorDesc.API_KEY_EXPIRED, "API-KEY 已过期")
+  context = await _build_app_context(api_key_obj)
+  context["auth_mode"] = "api_key"
+  return context
+
+
 async def get_current_app(
   api_key: str = Depends(APIKeyHeader(name="x-api-key")),
 ) -> str:
   """兼容现有文件服务：仅返回 APIKey 绑定的 APP 名称。"""
   context = await get_current_app_context(api_key)
   return str(context["app_name"])
+
+
+async def resolve_data_plane_context(
+  *,
+  api_key: Optional[str],
+  token: Optional[str],
+  action: str,
+  object_key: str,
+  upload_id: Optional[str] = None,
+) -> dict:
+  """
+  数据面（分片上传 / 下载）统一鉴权入口：v1 起前端不再允许持有 x-api-key。
+
+  - 若请求头带 x-api-key：视为 App 后端到 Storagent 的服务端调用，走原有全信任校验。
+  - 否则要求携带能力令牌 token：该令牌由 App 后端使用 x-api-key 本地签发（HMAC-SHA256），
+    只对指定 action + object_key（分片上传另外绑定 upload_id）在极短有效期内生效，
+    Storagent 反查签发所用的 APIKey 重新计算签名后才予放行，全过程 x-api-key 明文
+    不会经过前端或网络传输。算法与流程见文档中心 v1 · 功能接口引导。
+  """
+  if api_key:
+    return await get_current_app_context(api_key)
+  if not token:
+    raise CustomException(ErrorDesc.API_KEY_INVALID, "缺少 x-api-key 请求头或 token 参数")
+
+  ref = capability_token_mod.peek_capability_token_ref(token)
+  api_key_obj = await public_crud.read_api_key_by_hash(ref)
+  if not api_key_obj or api_key_obj.deleted:
+    raise CustomException(ErrorDesc.CAPABILITY_TOKEN_INVALID, "token 关联的 API-KEY 不存在")
+  if before_compare(api_key_obj.expired_at) < utc_now():
+    raise CustomException(ErrorDesc.API_KEY_EXPIRED, "API-KEY 已过期")
+
+  plain_api_key = decrypt_secret(getattr(api_key_obj, "key_enc", "") or "")
+  if not plain_api_key:
+    raise CustomException(ErrorDesc.CAPABILITY_TOKEN_INVALID, "token 关联的 API-KEY 不支持校验")
+
+  capability_token_mod.verify_capability_token(
+    token,
+    plain_api_key,
+    action=action,
+    object_key=object_key,
+    upload_id=upload_id,
+  )
+
+  context = await _build_app_context(api_key_obj)
+  context["auth_mode"] = "token"
+  return context

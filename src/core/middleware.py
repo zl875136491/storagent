@@ -13,6 +13,7 @@ from starlette.responses import Response
 from starlette.responses import JSONResponse
 
 from src.configs.configs import settings
+from src.configs.consts import API_V1_PREFIX
 from src.core import metrics as metrics_mod
 from src.core.exception import ErrorDesc
 
@@ -20,7 +21,7 @@ from src.core.exception import ErrorDesc
 class UploadBodyLimitMiddleware:
   """Reject oversized multipart parts before Starlette spools the request."""
 
-  _PATH = "/api/files/multipart/part"
+  _PATH = f"{API_V1_PREFIX}/files/multipart/part"
   _MULTIPART_OVERHEAD_BYTES = 1024 ** 2
 
   def __init__(self, app: Any):

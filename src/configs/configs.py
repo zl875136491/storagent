@@ -26,9 +26,15 @@ class Settings(BaseSettings):
   """
   # Info
   APP_NAME: str = "Storagent"
-  APP_VERSION: str = "0.1.0"
+  # 业务接口版本随 API_V1_PREFIX（/api/v1）走：v1 完全取代此前未带版本号的接口。
+  APP_VERSION: str = "1.0.0"
   DEBUG: bool = False
   BACKEND_CORS_ORIGINS: list[str] = ["*"]
+  # 预检（OPTIONS）响应缓存时长（秒）。浏览器会在这段时间内对相同
+  # origin+method+header 组合复用已缓存的预检结果，不再重复发起 OPTIONS
+  # 请求。各浏览器自身也有上限（Chromium 最长 2 小时、Firefox 最长 24
+  # 小时），这里设置的值会被浏览器自动截断到其上限，无需按浏览器区分。
+  BACKEND_CORS_MAX_AGE_SECONDS: int = 86400
   TIMEZONE: str = "Asia/Shanghai"
   INIT_SERVICE: bool = True
   RELOAD: bool = False

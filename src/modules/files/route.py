@@ -1,7 +1,8 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, Form, Request
-from src.core.auth import get_current_app_context
+from src.configs.consts import CAPABILITY_ACTION_DOWNLOAD, CAPABILITY_ACTION_UPLOAD_PART
+from src.core.auth import get_current_app_context, optional_api_key_header, resolve_data_plane_context
 from src.core.rate_limit import rate_limit_locate
 from src.modules.auth.model import User
 from src.modules.files import schema as files_schema
@@ -35,8 +36,20 @@ async def multipart_upload_part(
   object_key: str = Form(...),
   part_number: int = Form(...),
   file: UploadFile = File(...),
-  app_context: dict = Depends(get_current_app_context),
+  token: Optional[str] = Query(
+    None,
+    description="前端直传能力令牌，与 x-api-key 二选一；由 App 后端使用 x-api-key 签发，"
+                "绑定当前 object_key 与 upload_id，详见 v1 接口引导的数据面直传说明",
+  ),
+  api_key: Optional[str] = Depends(optional_api_key_header),
 ) -> files_schema.MultipartPartResponse:
+  app_context = await resolve_data_plane_context(
+    api_key=api_key,
+    token=token,
+    action=CAPABILITY_ACTION_UPLOAD_PART,
+    object_key=object_key,
+    upload_id=upload_id,
+  )
   return await files_service.multipart_upload_part(
     app_context=app_context,
     upload_id=upload_id,
@@ -135,6 +148,17 @@ async def download_chunk(
     ge=0,
     description="读取长度；0 表示从 offset 读到末尾（流式）",
   ),
-  app_context: dict = Depends(get_current_app_context),
+  token: Optional[str] = Query(
+    None,
+    description="前端直连下载能力令牌，与 x-api-key 二选一；由 App 后端使用 x-api-key 签发，"
+                "绑定当前 object_key，建议 5-15 分钟极短有效期，详见 v1 接口引导的数据面下载说明",
+  ),
+  api_key: Optional[str] = Depends(optional_api_key_header),
 ):
+  app_context = await resolve_data_plane_context(
+    api_key=api_key,
+    token=token,
+    action=CAPABILITY_ACTION_DOWNLOAD,
+    object_key=object_key,
+  )
   return await files_service.download_chunk(app_context, object_key, offset, length)

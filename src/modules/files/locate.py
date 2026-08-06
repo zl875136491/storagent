@@ -8,6 +8,7 @@ from urllib.parse import urlencode
 from minio.error import S3Error
 
 from src.configs.configs import settings
+from src.configs.consts import API_V1_PREFIX
 from src.core.exception import CustomException, ErrorDesc
 from src.core.minio_op import get_minio_client
 from src.modules.storage import crud as storage_crud
@@ -48,10 +49,12 @@ def _build_location_item(
     shown_name=shown_name,
     master=server.master,
     endpoint=base,
-    stat_url=f"{base}/api/files/object/stat",
+    stat_url=f"{base}{API_V1_PREFIX}/files/object/stat",
     stat_method="POST",
     stat_body={"object_key": object_key},
-    download_url=_build_api_url(server.host, server.server_port, "/api/files/object/download", download_params),
+    download_url=_build_api_url(
+      server.host, server.server_port, f"{API_V1_PREFIX}/files/object/download", download_params,
+    ),
   )
 
 
