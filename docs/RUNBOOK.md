@@ -43,7 +43,7 @@
 
 **处理**：
 
-1. 管理面调用区域下线 API（`DELETE /api/public/region/{id}`，需 `region_manage`）。
+1. 管理面调用区域下线 API（`DELETE /api/v1/public/region/{id}`，需 `region_manage`）。
 2. 确认 Etcd `region` / `servers` map 中已移除该 key，`topology_layout` 中也没有该节点的布局记录。
 3. 其他节点应通过 PUT 收敛删除远程条目；若整 key 被 DELETE，会按空 map 收敛远程拓扑。
 
@@ -92,7 +92,7 @@
 恢复后验证清单：
 
 1. `/ready` 200
-2. `/api/public/endpoints` 拓扑正确
+2. `/api/v1/public/endpoints` 拓扑正确
 3. 管理登录 + 创建/吊销测试 Key
 4. 跨区 locate / 下载指引
 

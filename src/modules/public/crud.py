@@ -314,6 +314,17 @@ async def read_api_key_by_key(key: str) -> APIKey | None:
     return await _migrate_legacy_api_key_plaintext(legacy, key)
   return None
 
+async def read_api_key_by_hash(key_hash: str) -> APIKey | None:
+  """
+  按哈希直接查询有效 APIKey（不含已吊销）。
+
+  用于 v1 数据面能力令牌校验：令牌只携带 APIKey 的 SHA256 摘要（与本表 `key`
+  字段同一算法），Storagent 据此反查记录、解密出明文 Key 后再校验令牌签名，
+  全程不需要、也不会接触到明文 x-api-key 之外的任何敏感信息。
+  """
+  return await APIKey.find_one(APIKey.key == key_hash, APIKey.deleted == False, fetch_links=True)
+
+
 async def read_api_key_by_key_including_deleted(key: str) -> APIKey | None:
   """
   获取API密钥（含已吊销，用于跨节点同步）

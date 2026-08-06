@@ -18,10 +18,10 @@ def test_build_api_url_https(monkeypatch):
   url = _build_api_url(
     "node.example",
     9443,
-    "/api/files/object/download",
+    "/api/v1/files/object/download",
     {"object_key": "path/to.bin", "offset": 0, "length": 0},
   )
-  assert url.startswith("https://node.example:9443/api/files/object/download?")
+  assert url.startswith("https://node.example:9443/api/v1/files/object/download?")
   assert "object_key=path%2Fto.bin" in url
 
 
@@ -35,7 +35,7 @@ def test_location_stat_instruction_uses_post_body(monkeypatch):
     "master": True,
   })()
   item = _build_location_item(server, "path/to.bin")
-  assert item.stat_url == "http://10.32.129.241:6783/api/files/object/stat"
+  assert item.stat_url == "http://10.32.129.241:6783/api/v1/files/object/stat"
   assert item.stat_method == "POST"
   assert item.stat_body == {"object_key": "path/to.bin"}
   assert "object_key" not in item.stat_url
