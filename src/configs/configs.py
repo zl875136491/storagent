@@ -50,6 +50,9 @@ class Settings(BaseSettings):
   SERVER_PORT: int = 9000
   # 对外暴露的 API URL 协议（endpoints / locate 指引）
   PUBLIC_SCHEME: str = "http"
+  # 对外 Nginx 网关域名，不带协议、端口或路径，例如 stor.1oa.com.cn。
+  # 为空时，历史 MinIO 服务仍回退到 host:server_port。
+  PUBLIC_DOMAIN: str = ""
   # 跨节点 locate 单节点 stat 超时（秒）
   OBJECT_LOCATE_TIMEOUT: float = 5.0
 

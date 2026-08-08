@@ -52,6 +52,7 @@ def _decode_server_file_details(payload: bytes) -> list[dict[str, Any]]:
 async def create_minio_server(
   region: Region,
   name: str,
+  domain: str,
   host: str,
   server_port: int,
   minio_port: int,
@@ -68,6 +69,7 @@ async def create_minio_server(
   minio_server = MinioServer(
     region=region,
     name=name,
+    domain=domain,
     host=host,
     server_port=server_port,
     minio_port=minio_port,
@@ -81,6 +83,7 @@ async def create_minio_server(
 
 async def update_minio_server(
   minio_server: MinioServer,
+  domain: str,
   host: str,
   server_port: int,
   minio_port: int,
@@ -90,6 +93,7 @@ async def update_minio_server(
   """
   更新 Minio 服务器（凭证落库前加密）
   """
+  minio_server.domain = domain
   minio_server.host = host
   minio_server.server_port = server_port
   minio_server.minio_port = minio_port

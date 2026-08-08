@@ -5,6 +5,7 @@ from datetime import datetime
 class MinioServerCreateRequest(BaseModel):
   region: PydanticObjectId
   name: str
+  domain: str = Field(min_length=1, max_length=253, description="对外 Nginx 网关域名，不含协议和路径")
   host: str
   server_port: int
   minio_port: int
@@ -24,6 +25,7 @@ class MinioServerResponse(BaseModel):
   id: PydanticObjectId
   region: SimpleRegionResponse
   name: str
+  domain: str
   host: str
   server_port: int
   minio_port: int

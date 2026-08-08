@@ -33,6 +33,24 @@ def _build_api_url(host: str, port: int, path: str, params: dict) -> str:
   return f"{_scheme()}://{host}:{port}{path}?{query}"
 
 
+_GATEWAY_SEGMENTS = {
+  "beijing": "bj",
+  "tianjin": "tj",
+  "kunshan": "ks",
+  "shenzhen": "sz",
+  "hangzhou": "hz",
+}
+
+
+def _server_api_base(server: MinioServer, region_name: str) -> str:
+  """Return the public Nginx route; keep IP fallback for unmigrated sites."""
+  domain = str(getattr(server, "domain", "") or settings.PUBLIC_DOMAIN or "").strip().rstrip("/")
+  segment = _GATEWAY_SEGMENTS.get(region_name)
+  if domain and segment:
+    return f"{_scheme()}://{domain}/server/{segment}"
+  return f"{_scheme()}://{server.host}:{server.server_port}"
+
+
 def _build_location_item(
   server: MinioServer,
   object_key: str,
@@ -43,7 +61,7 @@ def _build_location_item(
   region_name = region.name if region else server.name
   shown_name = region.shown_name if region else server.name
   download_params = {"object_key": object_key, "offset": offset, "length": length}
-  base = f"{_scheme()}://{server.host}:{server.server_port}"
+  base = _server_api_base(server, region_name)
   return files_schema.ObjectLocationItem(
     region=region_name,
     shown_name=shown_name,
@@ -52,9 +70,7 @@ def _build_location_item(
     stat_url=f"{base}{API_V1_PREFIX}/files/object/stat",
     stat_method="POST",
     stat_body={"object_key": object_key},
-    download_url=_build_api_url(
-      server.host, server.server_port, f"{API_V1_PREFIX}/files/object/download", download_params,
-    ),
+    download_url=f"{base}{API_V1_PREFIX}/files/object/download?{urlencode(download_params)}",
   )
 
 

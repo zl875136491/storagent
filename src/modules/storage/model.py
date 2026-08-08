@@ -13,6 +13,8 @@ class MinioServer(Document):
   """
   region: Link[Region]
   name: str = Field(default="")
+  # 对外 Storagent 网关域名；host 仅用于 MinIO 内网连接。
+  domain: str = Field(default="")
   host: str
   server_port: int
   minio_port: int

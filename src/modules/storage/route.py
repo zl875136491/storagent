@@ -67,6 +67,7 @@ async def create_minio_server(
   return await storage_service.create_minio_server(
     region=payload.region,
     name=payload.name.strip(),
+    domain=payload.domain.strip().lower(),
     host=payload.host.strip(),
     server_port=payload.server_port,
     minio_port=payload.minio_port,

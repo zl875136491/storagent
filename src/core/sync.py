@@ -851,10 +851,12 @@ async def sync_servers_to_mongo(servers_data: dict) -> list[str]:
       region_obj = await public_crud.create_region(server_region_name, server_region_name)
     server_obj = await storage_crud.read_minio_server_by_region(region_obj)
     host = server_data.get("host", settings.SERVER_HOST)
+    domain = str(server_data.get("domain", "") or settings.PUBLIC_DOMAIN or "").strip().lower()
     if not server_obj:
       await storage_crud.create_minio_server(
         region=region_obj,
         name=server_region_name,
+        domain=domain,
         host=host,
         server_port=server_data["server_port"],
         minio_port=server_data["minio_port"],
@@ -867,6 +869,7 @@ async def sync_servers_to_mongo(servers_data: dict) -> list[str]:
     else:
       await storage_crud.update_minio_server(
         minio_server=server_obj,
+        domain=domain,
         host=host,
         server_port=server_data["server_port"],
         minio_port=server_data["minio_port"],
@@ -1754,6 +1757,7 @@ async def publish_servers() -> None:
   from src.core import etcd_op
 
   entry = encrypt_server_entry({
+    "domain": settings.PUBLIC_DOMAIN,
     "host": settings.SERVER_HOST,
     "server_port": settings.SERVER_PORT,
     "minio_port": settings.MINIO_PORT,
@@ -1772,6 +1776,7 @@ async def publish_servers() -> None:
 
 async def publish_server_entry(
   region_name: str,
+  domain: str,
   host: str,
   server_port: int,
   minio_port: int,
@@ -1782,6 +1787,7 @@ async def publish_server_entry(
   from src.core import etcd_op
 
   entry = encrypt_server_entry({
+    "domain": domain,
     "host": host,
     "server_port": server_port,
     "minio_port": minio_port,

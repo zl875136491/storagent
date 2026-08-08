@@ -133,6 +133,7 @@ class Endpoint(BaseModel):
   name: str
   shown_name: str
   master: bool
+  domain: str = Field(default="", description="对外 Nginx 网关域名")
   endpoint: str
   minio_endpoint: str
 

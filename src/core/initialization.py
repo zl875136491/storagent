@@ -45,6 +45,9 @@ async def init_service():
     # 2. 注册本节点 MinIO Server 到 Etcd（凭证加密 + CAS）
     from src.core.crypto import encrypt_server_entry
     entry = encrypt_server_entry({
+      # Published separately from the MinIO host so external consumers always
+      # use the host Nginx gateway rather than an internal IP address.
+      "domain": settings.PUBLIC_DOMAIN,
       "host": settings.SERVER_HOST,
       "server_port": settings.SERVER_PORT,
       "minio_port": settings.MINIO_PORT,

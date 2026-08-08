@@ -64,6 +64,7 @@ async def _connect_minio_server(
 async def create_minio_server(
   region: str | ObjectId,
   name: str,
+  domain: str,
   host: str,
   server_port: int,
   minio_port: int,
@@ -76,7 +77,8 @@ async def create_minio_server(
   Args:
     region: 区域ID
     name: 服务器名称
-    host: 服务器主机
+    domain: 对外 Nginx 网关域名
+    host: MinIO 内网连接主机
     server_port: 服务器端口
     minio_port: Minio 端口
     access_key: 访问密钥
@@ -86,6 +88,9 @@ async def create_minio_server(
     MinioServer: Minio 服务器
   """
   # 验证区域
+  domain = domain.strip().lower().replace("http://", "").replace("https://", "").strip("/")
+  if not domain or "/" in domain:
+    raise CustomException(ErrorDesc.INVALID_PARAMS, "domain 必须是无协议、无路径的网关域名")
   region_obj = await public_crud.read_region_by_id(region)
   if not region_obj:
     raise CustomException(ErrorDesc.RES_NOT_FOUND)
@@ -111,6 +116,7 @@ async def create_minio_server(
   minio_server_obj = await storage_crud.create_minio_server(
     region=region_obj,
     name=name,
+    domain=domain,
     host=host,
     server_port=server_port,
     minio_port=minio_port,
@@ -121,6 +127,7 @@ async def create_minio_server(
   try:
     await sync_module.publish_server_entry(
       region_name=region_obj.name,
+      domain=domain,
       host=host,
       server_port=server_port,
       minio_port=minio_port,
@@ -150,6 +157,7 @@ async def update_minio_server(
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
   result = await storage_crud.update_minio_server(
     minio_server_obj,
+    domain=minio_server_obj.domain,
     host=minio_server_obj.host,
     server_port=minio_server_obj.server_port,
     minio_port=minio_server_obj.minio_port,
@@ -163,6 +171,7 @@ async def update_minio_server(
     access_key, secret_key = storage_crud.plain_minio_credentials(result)
     await sync_module.publish_server_entry(
       region_name=region_name,
+      domain=result.domain,
       host=result.host,
       server_port=result.server_port,
       minio_port=result.minio_port,

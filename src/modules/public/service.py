@@ -35,10 +35,37 @@ from src.configs.configs import settings
 
 async def get_endpoints() -> dict[str, List[str]]:
   """
-  获取端点列表
+  获取对外网关端点列表。
+
+  `host` 是 MinIO 内网管理地址；浏览器和 App 后端应以 `domain` 为核心，
+  经宿主 Nginx 的 /server/{region} 路由访问 Storagent。
   """
   from src.modules.storage import service as storage_service
   minio_server_objs = await storage_service.get_minio_server_list()
+  gateway_segments = {
+    "beijing": "bj",
+    "tianjin": "tj",
+    "kunshan": "ks",
+    "shenzhen": "sz",
+    "hangzhou": "hz",
+  }
+
+  def public_domain(server) -> str:
+    # `PUBLIC_DOMAIN` lets old Mongo records migrate without re-registering
+    # every MinIO service. A record-level domain wins once synchronization has
+    # written it, while host:port remains the final legacy fallback.
+    return str(
+      getattr(server, "domain", "") or settings.PUBLIC_DOMAIN or ""
+    ).strip().rstrip("/")
+
+  def public_endpoint(server) -> str:
+    domain = public_domain(server)
+    segment = gateway_segments.get(server.region.name)
+    if domain and segment:
+      return f"{settings.PUBLIC_SCHEME}://{domain}/server/{segment}"
+    # Records from before `domain` was introduced stay usable during migration.
+    return f"{settings.PUBLIC_SCHEME}://{server.host}:{server.server_port}"
+
   data = []
   for minio_server_obj in minio_server_objs["data"]:
     data.append({
@@ -47,7 +74,8 @@ async def get_endpoints() -> dict[str, List[str]]:
       "name": minio_server_obj.region.name,
       "shown_name": minio_server_obj.region.shown_name,
       "master": minio_server_obj.master,
-      "endpoint": f"{settings.PUBLIC_SCHEME}://{minio_server_obj.host}:{minio_server_obj.server_port}",
+      "domain": public_domain(minio_server_obj),
+      "endpoint": public_endpoint(minio_server_obj),
       "minio_endpoint": f"{settings.PUBLIC_SCHEME}://{minio_server_obj.host}:{minio_server_obj.minio_port}",
     })
   return dict[str, List[dict]](data=data)
