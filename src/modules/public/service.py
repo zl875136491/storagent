@@ -68,8 +68,11 @@ async def get_endpoints() -> dict[str, List[str]]:
 
   data = []
   for minio_server_obj in minio_server_objs["data"]:
+    # Test doubles and pre-link records may not expose Region.id; the public
+    # endpoint contract keeps the field nullable until the region is hydrated.
+    region_id = getattr(minio_server_obj.region, "id", None)
     data.append({
-      "region_id": minio_server_obj.region.id,
+      "region_id": region_id,
       "server_id": minio_server_obj.id,
       "name": minio_server_obj.region.name,
       "shown_name": minio_server_obj.region.shown_name,
