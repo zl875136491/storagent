@@ -120,7 +120,7 @@ def create_app() -> FastAPI:
       # 但配合下面的 max_age，同一 origin+method+header 组合的预检结果会
       # 被浏览器缓存复用，避免每次业务请求都重新走一次 OPTIONS 预检。
       allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allow_headers=["Authorization", "Content-Type", "x-api-key"],
+      allow_headers=["Authorization", "Content-Type", "x-api-key", "x-demo-api-key-id"],
       max_age=settings.BACKEND_CORS_MAX_AGE_SECONDS,
     )
 

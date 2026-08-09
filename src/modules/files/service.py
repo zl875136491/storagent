@@ -622,12 +622,13 @@ async def download_chunk(
   content_type = stat.content_type or "application/octet-stream"
 
   async def _stream_with_usage():
+    # MinIO treats a supplied length=0 as an invalid byte-range request.
+    # Omitting length is the SDK contract for streaming from offset to EOF.
     resp = await asyncio.to_thread(
       client.get_object,
       b,
       key,
       offset=offset,
-      length=0,
     )
     transferred = 0
     completed = False

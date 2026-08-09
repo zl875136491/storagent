@@ -60,3 +60,54 @@ async def test_object_stat_does_not_dereference_server_region_link(monkeypatch):
 
   assert result.region == "beijing"
   assert result.local is True
+
+
+@pytest.mark.asyncio
+async def test_stream_download_omits_zero_length_for_minio(monkeypatch):
+  class FakeResponse:
+    def __init__(self):
+      self._chunks = [b"demo-content", b""]
+
+    def read(self, _size):
+      return self._chunks.pop(0)
+
+    def close(self):
+      pass
+
+    def release_conn(self):
+      pass
+
+  class FakeClient:
+    def __init__(self):
+      self.calls = []
+
+    def get_object(self, *args, **kwargs):
+      self.calls.append((args, kwargs))
+      return FakeResponse()
+
+  client = FakeClient()
+  stat = type("Stat", (), {"content_type": "image/jpeg"})()
+  server = type("Server", (), {"host": "minio.local", "minio_port": 9000})()
+
+  async def stat_object_local(_bucket, _object_key):
+    return stat, server
+
+  async def record_transfer(_context, _action, _bytes):
+    pass
+
+  monkeypatch.setattr(files_service.files_locate, "stat_object_local", stat_object_local)
+  monkeypatch.setattr(
+    files_service.storage_crud,
+    "plain_minio_credentials",
+    lambda _server: ("access", "secret"),
+  )
+  monkeypatch.setattr(files_service, "get_minio_client", lambda *_args: client)
+  monkeypatch.setattr(files_service, "record_transfer", record_transfer)
+
+  response = await files_service.download_chunk(
+    {"app_name": "demo-app"}, "images/0eva.jpeg", offset=0, length=0,
+  )
+  payload = b"".join([chunk async for chunk in response.body_iterator])
+
+  assert payload == b"demo-content"
+  assert client.calls == [(("demo-app", "images/0eva.jpeg"), {"offset": 0})]
