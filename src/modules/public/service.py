@@ -1065,7 +1065,7 @@ async def create_api_key(
     or application_obj.provisioning_status != "ready"
   ):
     raise CustomException(ErrorDesc.STATUS_ERR, "应用复制策略尚未就绪")
-  if application_obj.author != current_user:
+  if application_obj.author.id != current_user.id:
     raise CustomException(ErrorDesc.RES_NOT_BELONG_TO_USER, "应用不属于当前用户")
   if expired_at:
     expired_at = expired_at.replace(tzinfo=utc_now().tzinfo)
