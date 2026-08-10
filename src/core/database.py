@@ -38,6 +38,7 @@ from ..modules.graph.model import (
   BucketNodePosition,
   BucketEdgePosition,
 )
+from ..modules.files.model import ObjectCatalog
 
 document_models = [
   Region,
@@ -55,6 +56,7 @@ document_models = [
   StorageOperation,
   BucketNodePosition,
   BucketEdgePosition,
+  ObjectCatalog,
 ]
 
 
@@ -96,6 +98,7 @@ async def init_db():
     StorageOperation,
     BucketNodePosition,
     BucketEdgePosition,
+    ObjectCatalog,
   ]
   await init_beanie(
     database=database,

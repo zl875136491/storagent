@@ -88,6 +88,11 @@ class ErrorDesc(Enum):
   CAPABILITY_TOKEN_INVALID = ("能力令牌无效", 401051)
   CAPABILITY_TOKEN_EXPIRED = ("能力令牌已过期", 401052)
   CAPABILITY_TOKEN_SCOPE_MISMATCH = ("能力令牌与请求的动作或对象不匹配", 403053)
+  OBJECT_DELETED = ("对象已删除", 410054)
+  OBJECT_PURGED = ("对象已永久清理", 410055)
+  QUOTA_RESTORE_EXCEEDED = ("恢复对象将超过存储限额", 409056)
+  SHARE_CONSUMED = ("分享地址已经使用", 410057)
+  SHARE_REVOKED = ("分享地址已失效", 410058)
 
   
   @property
@@ -97,6 +102,34 @@ class ErrorDesc(Enum):
   @property
   def message(self) -> str:
     return self.value[0]
+
+
+V2_ERROR_CODES: dict[ErrorDesc, tuple[str, bool]] = {
+  ErrorDesc.API_KEY_INVALID: ("auth.api_key.invalid", False),
+  ErrorDesc.API_KEY_EXPIRED: ("auth.api_key.expired", False),
+  ErrorDesc.CREDENTIALS_NOT_VALID: ("auth.credentials.invalid", False),
+  ErrorDesc.CAPABILITY_TOKEN_INVALID: ("auth.capability.invalid", False),
+  ErrorDesc.CAPABILITY_TOKEN_EXPIRED: ("auth.capability.expired", False),
+  ErrorDesc.CAPABILITY_TOKEN_SCOPE_MISMATCH: ("auth.capability.scope_mismatch", False),
+  ErrorDesc.APP_NOT_ENABLED: ("app.disabled", False),
+  ErrorDesc.INSUFFICIENT_PERMISSIONS: ("auth.permission.denied", False),
+  ErrorDesc.INVALID_PARAMS: ("request.validation_failed", False),
+  ErrorDesc.STATUS_ERR: ("request.conflict", False),
+  ErrorDesc.OBJECT_NOT_FOUND: ("object.not_found", False),
+  ErrorDesc.OBJECT_NOT_FOUND_LOCAL: ("object.not_found", False),
+  ErrorDesc.OBJECT_DELETED: ("object.deleted", False),
+  ErrorDesc.OBJECT_PURGED: ("object.purged", False),
+  ErrorDesc.QUOTA_RESTORE_EXCEEDED: ("quota.restore_exceeded", False),
+  ErrorDesc.APP_STORAGE_QUOTA_EXCEEDED: ("quota.exceeded", False),
+  ErrorDesc.UPLOAD_PART_TOO_LARGE: ("upload.part_too_large", False),
+  ErrorDesc.ONE_TIME_DOWNLOAD_INVALID: ("share.invalid", False),
+  ErrorDesc.SHARE_CONSUMED: ("share.consumed", False),
+  ErrorDesc.SHARE_REVOKED: ("share.revoked", False),
+  ErrorDesc.DOWNLOAD_SOURCE_UNAVAILABLE: ("storage.unavailable", True),
+  ErrorDesc.RATE_LIMITED: ("rate_limit.exceeded", True),
+  ErrorDesc.SYNC_FAILED: ("system.dependency_unavailable", True),
+  ErrorDesc.MINIO_ACCESS_FAILED: ("storage.unavailable", True),
+}
 
 # 定义泛型类型
 T = TypeVar("T")
@@ -118,6 +151,7 @@ class CustomException(HTTPException):
   """
 
   def __init__(self, msg: str | ErrorDesc, reason: Any = None):
+    self.error_desc = msg if isinstance(msg, ErrorDesc) else None
     if isinstance(msg, ErrorDesc):
       self.message = msg.message
       status_code = msg.code // 1000 # 高3位为状态码, 低3位为错误识别码
@@ -135,6 +169,42 @@ class CustomException(HTTPException):
   def __str__(self):
     return self.message + ": " + str(self.reason)
 
+
+def v2_error_response(exc: CustomException, request_id: str = "") -> dict:
+  code, retryable = V2_ERROR_CODES.get(exc.error_desc, ("system.internal", False))
+  return {
+    "error": {
+      "code": code,
+      "message": exc.message,
+      "retryable": retryable,
+      "details": exc.reason if isinstance(exc.reason, dict) else {},
+    },
+    "request_id": request_id,
+  }
+
+
+def _v2_http_error(status_code: int, detail: Any) -> tuple[str, str, bool, dict]:
+  """Map framework-level errors emitted before a route reaches Service.
+
+  Authentication dependencies, unknown paths and method negotiation use
+  Starlette's HTTPException instead of CustomException. v2 must still expose
+  the stable envelope used by normal domain errors.
+  """
+  text = str(detail or "")
+  if status_code == status.HTTP_401_UNAUTHORIZED:
+    return "auth.credentials.invalid", "无法验证凭据", False, {}
+  if status_code == status.HTTP_403_FORBIDDEN:
+    if text == "Not authenticated":
+      return "auth.api_key.invalid", "API-KEY 无效", False, {}
+    return "auth.permission.denied", "没有执行该操作的权限", False, {}
+  if status_code == status.HTTP_404_NOT_FOUND:
+    return "request.not_found", "请求的接口不存在", False, {}
+  if status_code == status.HTTP_405_METHOD_NOT_ALLOWED:
+    return "request.method_not_allowed", "请求方法不被允许", False, {}
+  if status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+    return "rate_limit.exceeded", "请求过于频繁", True, {}
+  return "request.rejected", "请求被拒绝", False, {}
+
 def error_response(msg: str, data: Optional[Any] = None, code: Optional[int] = None) -> dict:
   """
   生成一个失败的 API 响应（含稳定业务 code，便于前端契约解析）
@@ -149,6 +219,11 @@ async def custom_exception_handler(request: Request, exc: CustomException):
     f"Code: {exc.code} | Detail: {exc.reason}"
   )
   logger.error(log_message)
+  if request.url.path.startswith("/api/v2/"):
+    return JSONResponse(
+      status_code=exc.status_code,
+      content=jsonable_encoder(v2_error_response(exc, getattr(request.state, "request_id", ""))),
+    )
   return JSONResponse(
     status_code=exc.status_code,
     content=jsonable_encoder(
@@ -172,11 +247,48 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
   )
   logger.warning(log_message)
 
+  if request.url.path.startswith("/api/v2/"):
+    return JSONResponse(
+      status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+      content=jsonable_encoder({
+        "error": {
+          "code": "request.validation_failed",
+          "message": "请求参数验证失败",
+          "retryable": False,
+          "details": {"errors": errors},
+        },
+        "request_id": getattr(request.state, "request_id", ""),
+      }),
+    )
   return JSONResponse(
     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
     content=jsonable_encoder(
       error_response(msg="请求参数验证失败", data={"errors": errors})
     ),
+  )
+
+
+async def http_exception_handler(request: Request, exc: HTTPException):
+  """Keep v1 framework errors unchanged while normalizing v2 errors."""
+  if request.url.path.startswith("/api/v2/"):
+    code, message, retryable, details = _v2_http_error(exc.status_code, exc.detail)
+    return JSONResponse(
+      status_code=exc.status_code,
+      content=jsonable_encoder({
+        "error": {
+          "code": code,
+          "message": message,
+          "retryable": retryable,
+          "details": details,
+        },
+        "request_id": getattr(request.state, "request_id", ""),
+      }),
+      headers=getattr(exc, "headers", None),
+    )
+  return JSONResponse(
+    status_code=exc.status_code,
+    content={"detail": exc.detail},
+    headers=getattr(exc, "headers", None),
   )
 
 async def all_exception_handler(request: Request, exc: Exception):
@@ -194,6 +306,19 @@ async def all_exception_handler(request: Request, exc: Exception):
   # 使用 logger.exception 可以自动记录完整的堆栈信息到日志
   logger.exception(log_message)
   
+  if request.url.path.startswith("/api/v2/"):
+    return JSONResponse(
+      status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+      content=jsonable_encoder({
+        "error": {
+          "code": "system.internal",
+          "message": "服务器内部错误",
+          "retryable": False,
+          "details": {},
+        },
+        "request_id": getattr(request.state, "request_id", ""),
+      }),
+    )
   # 根据 DEBUG 标志决定响应内容
   if settings.DEBUG:
     # Debug 模式：返回详细的错误信息和堆栈跟踪
@@ -254,6 +379,7 @@ def register_exception(app: FastAPI):
   # 首先注册 FastAPI 的异常处理器（标准方式）
   app.add_exception_handler(CustomException, custom_exception_handler)
   app.add_exception_handler(RequestValidationError, validation_exception_handler)
+  app.add_exception_handler(HTTPException, http_exception_handler)
   app.add_exception_handler(Exception, all_exception_handler)
   
   # 添加自定义异常处理中间件作为兜底

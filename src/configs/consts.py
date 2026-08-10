@@ -2,6 +2,10 @@
 # 路径不再提供（其鉴权模型不安全，已被 v1 的能力令牌机制完全取代）。
 API_V1_PREFIX = "/api/v1"
 
+# v2 keeps v1 online. New versioned routes live beside their v1 counterparts
+# so clients can upgrade independently instead of relying on a flag in one API.
+API_V2_PREFIX = "/api/v2"
+
 # 数据面能力令牌（capability token）允许的动作：仅覆盖前端可直连的两个数据面接口。
 CAPABILITY_ACTION_UPLOAD_PART = "upload_part"
 CAPABILITY_ACTION_DOWNLOAD = "download"

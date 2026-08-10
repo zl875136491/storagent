@@ -42,6 +42,12 @@ class _DownloadGrant(BaseModel):
   size: int = Field(default=0, ge=0)
   actor: str = Field(default="-", max_length=128)
   expires_at: datetime
+  # v2 App shares bind an object catalog record and deletion generation.
+  # Legacy admin links leave these fields empty and retain their v1 behavior.
+  app_name: str = Field(default="", max_length=128)
+  object_id: str = Field(default="", max_length=128)
+  deletion_generation: int = Field(default=0, ge=0)
+  share_id: str = Field(default="", max_length=128)
 
 
 def _aware_utc(value: datetime) -> datetime:
@@ -229,6 +235,55 @@ async def issue_one_time_download(
   }
 
 
+async def issue_app_one_time_download(
+  *,
+  app_name: str,
+  object_id: str,
+  object_key: str,
+  region_name: str,
+  deletion_generation: int,
+  filename: str | None,
+  ttl: int,
+) -> dict[str, Any]:
+  """Create an App-facing v2 share using the existing Etcd single-use store."""
+  bucket, object_key = _validate_object_request(app_name, object_key)
+  server = await storage_crud.read_minio_server_by_region_name(region_name)
+  if not server:
+    raise CustomException(ErrorDesc.DOWNLOAD_SOURCE_UNAVAILABLE, "对象源区域不可用")
+  access_key, secret_key = storage_crud.plain_minio_credentials(server)
+  client = get_minio_client(server.host, server.minio_port, access_key, secret_key)
+  try:
+    stat = await asyncio.to_thread(client.stat_object, bucket, object_key)
+  except Exception as error:
+    _raise_minio_error(error, bucket, object_key)
+  ttl = min(max(int(ttl), 60), 900)
+  expires_at = utc_now() + timedelta(seconds=ttl)
+  safe_name = filename or PurePosixPath(object_key.rstrip("/")).name or "download"
+  share_id = f"shr_{secrets.token_urlsafe(18)}"
+  grant = _DownloadGrant(
+    region_name=region_name,
+    bucket=bucket,
+    object_key=object_key,
+    filename=safe_name,
+    content_type=getattr(stat, "content_type", None) or "application/octet-stream",
+    size=max(int(getattr(stat, "size", 0) or 0), 0),
+    actor="app-share",
+    expires_at=expires_at,
+    app_name=app_name,
+    object_id=object_id,
+    deletion_generation=deletion_generation,
+    share_id=share_id,
+  )
+  token = await _store_grant(grant, ttl)
+  return {
+    "token": token,
+    "share_id": share_id,
+    "expires_at": expires_at,
+    "expires_in_seconds": ttl,
+    "filename": safe_name,
+  }
+
+
 def _content_disposition(filename: str) -> str:
   cleaned = filename.replace("\r", "").replace("\n", "") or "download"
   fallback = unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode("ascii")
@@ -330,6 +385,17 @@ async def redeem_one_time_download(token: str) -> StreamingResponse:
       await client.delete(key)
       raise invalid_link_error()
 
+    if grant.object_id:
+      from src.modules.files import crud as files_crud
+      item = await files_crud.read_object_by_id(grant.app_name, grant.object_id)
+      if (
+        item is None
+        or item.state != "active"
+        or item.deletion_generation != grant.deletion_generation
+      ):
+        await client.delete(key)
+        raise CustomException(ErrorDesc.SHARE_REVOKED, "对象已删除或分享地址已撤销")
+
     claim_task = asyncio.create_task(
       client.transaction(
         compare=[client.transactions.mod(key) == snapshot.mod_revision],
@@ -349,6 +415,18 @@ async def redeem_one_time_download(token: str) -> StreamingResponse:
       raise cancellation
     if not claimed:
       raise invalid_link_error()
+
+    # The first check gives a fast revoked response. Check again after the
+    # Etcd claim to close the delete/share race before opening MinIO.
+    if grant.object_id:
+      from src.modules.files import crud as files_crud
+      item = await files_crud.read_object_by_id(grant.app_name, grant.object_id)
+      if (
+        item is None
+        or item.state != "active"
+        or item.deletion_generation != grant.deletion_generation
+      ):
+        raise CustomException(ErrorDesc.SHARE_REVOKED, "对象已删除或分享地址已撤销")
 
     server = await storage_crud.read_minio_server_by_region_name(grant.region_name)
     if not server:

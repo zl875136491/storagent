@@ -14,6 +14,7 @@ from src.modules.storage import crud as storage_crud
 from src.modules.files import schema as files_schema
 from src.modules.files import locate as files_locate
 from src.modules.files import quota as files_quota
+from src.modules.files import crud as files_crud
 from src.modules.public import service as public_service
 from src.modules.usage.service import record_transfer
 
@@ -189,6 +190,7 @@ async def multipart_init(
     object_key=object_key,
     source_server=source_server,
     declared_size_bytes=size_bytes,
+    content_type=content_type,
     quota_loader=quota_loader,
     usage_loader=usage_loader,
   )
@@ -438,6 +440,23 @@ async def multipart_complete(
 
   if cancellation is not None:
     raise cancellation
+  # The catalog is intentionally written after the MinIO and quota commits.
+  # A failed catalog write is retried by the v2 migration/reconcile job; it
+  # must not make a completed object invisible to the existing v1 API.
+  try:
+    await files_crud.upsert_completed_object(
+      app_name=app_name,
+      object_key=key,
+      size_bytes=prepared.reservation.declared_size_bytes,
+      etag=saved_result.get("etag"),
+      version_id=saved_result.get("version_id"),
+      # Preserve the type declared when the multipart session was created.
+      content_type=prepared.reservation.content_type,
+      source_region=prepared.reservation.source_server,
+    )
+  except Exception as error:
+    from src.utils.logger import logger
+    logger.warning(f"对象目录写入延迟 app={app_name} object={key}: {error}")
   return files_schema.MultipartCompleteResponse(
     bucket=app_name,
     object_key=key,
@@ -544,6 +563,7 @@ async def locate_object(
   """
   查询对象在哪些服务点存在，并生成各节点的 stat / download 指引 URL
   """
+  await files_crud.require_active_object(app_name, object_key.strip())
   return await files_locate.find_object_locations(app_name, object_key, offset, length)
 
 
@@ -553,6 +573,7 @@ async def stat_object(
 ) -> files_schema.ObjectStatResponse:
   b = app_name
   key = object_key.strip()
+  await files_crud.require_active_object(app_name, key)
   stat, _server = await files_locate.stat_object_local(b, key)
   return files_schema.ObjectStatResponse(
     bucket=b,
@@ -579,6 +600,7 @@ async def download_chunk(
   app_name = app_context["app_name"]
   b = app_name
   key = object_key.strip()
+  await files_crud.require_active_object(app_name, key)
 
   stat, server = await files_locate.stat_object_local(b, key)
   access_key, secret_key = storage_crud.plain_minio_credentials(server)

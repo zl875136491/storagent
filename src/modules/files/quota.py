@@ -36,6 +36,7 @@ class UploadReservation:
   source_server: str
   declared_size_bytes: int
   expires_at: datetime
+  content_type: str = "application/octet-stream"
   status: str = "active"
 
 
@@ -110,6 +111,9 @@ def _normalize_state(raw: dict | None) -> dict:
   state.update({
     "version": _STATE_VERSION,
     "observed_usage_bytes": max(int(state.get("observed_usage_bytes") or 0), 0),
+    "active_usage_bytes": max(int(state.get("active_usage_bytes") or 0), 0),
+    "deleted_retained_bytes": max(int(state.get("deleted_retained_bytes") or 0), 0),
+    "logical_usage_initialized": bool(state.get("logical_usage_initialized", False)),
     "observed_usage_updated_at": state.get("observed_usage_updated_at"),
     "reservations": reservations,
   })
@@ -126,6 +130,7 @@ def _reservation_from_dict(app_name: str, data: dict) -> UploadReservation:
     source_server=str(data.get("source_server") or ""),
     declared_size_bytes=max(int(data.get("declared_size_bytes") or 0), 0),
     expires_at=expiry,
+    content_type=str(data.get("content_type") or "application/octet-stream"),
     status=str(data.get("status") or "active"),
   )
 
@@ -463,6 +468,9 @@ async def _reconcile_state_locked(
         0,
       )
       state["observed_usage_updated_at"] = now.isoformat()
+      if not state["logical_usage_initialized"]:
+        state["active_usage_bytes"] = int(refreshed_usage)
+        state["logical_usage_initialized"] = True
     for reservation_id, data in list(state["reservations"].items()):
       if not isinstance(data, dict):
         state["reservations"].pop(reservation_id, None)
@@ -527,6 +535,7 @@ async def reserve_upload(
   object_key: str,
   source_server: str,
   declared_size_bytes: int,
+  content_type: str = "application/octet-stream",
   quota_loader: Callable[[Any], Awaitable[int]],
   usage_loader: Callable[[], Awaitable[int]],
 ) -> UploadReservation:
@@ -569,7 +578,9 @@ async def reserve_upload(
         if isinstance(item, dict) and _reservation_counts_toward_quota(item, now)
       )
       observed = max(int(current.get("observed_usage_bytes") or 0), 0)
-      if observed + active_reserved + declared_size_bytes > quota_bytes:
+      active_usage = max(int(current.get("active_usage_bytes") or 0), 0)
+      usage_for_quota = active_usage if current["logical_usage_initialized"] else observed
+      if usage_for_quota + active_reserved + declared_size_bytes > quota_bytes:
         raise CustomException(
           ErrorDesc.APP_STORAGE_QUOTA_EXCEEDED,
           _QUOTA_EXCEEDED_REASON,
@@ -580,6 +591,7 @@ async def reserve_upload(
         "upload_id": "",
         "source_server": source_server,
         "declared_size_bytes": int(declared_size_bytes),
+        "content_type": content_type or "application/octet-stream",
         "status": "initializing",
         "created_at": now.isoformat(),
         "expires_at": expires_at.isoformat(),
@@ -610,6 +622,7 @@ async def activate_reservation(
     "upload_id": upload_id,
     "source_server": reservation.source_server,
     "declared_size_bytes": reservation.declared_size_bytes,
+    "content_type": reservation.content_type,
     "status": "active",
     "parts": {},
     "created_at": now.isoformat(),
@@ -1061,6 +1074,11 @@ async def finalize_completed_session(
       max(int(state.get("observed_usage_bytes") or 0), 0)
       + reservation.declared_size_bytes
     )
+    state["active_usage_bytes"] = (
+      max(int(state.get("active_usage_bytes") or 0), 0)
+      + reservation.declared_size_bytes
+    )
+    state["logical_usage_initialized"] = True
     state["observed_usage_updated_at"] = now.isoformat()
     state["reservations"].pop(reservation.object_key, None)
     return state
@@ -1070,6 +1088,70 @@ async def finalize_completed_session(
     mutator,
     client=client,
   )
+
+
+async def mark_object_deleted(app_name: str, size_bytes: int) -> None:
+  """Release logical quota without physically deleting the MinIO object."""
+  size = max(int(size_bytes), 0)
+  async with application_quota_lock(app_name) as client:
+    await mark_object_deleted_locked(app_name, size, client)
+
+
+async def mark_object_deleted_locked(app_name: str, size_bytes: int, client: Any) -> None:
+  """Release logical quota while a caller already owns the App lock."""
+  size = max(int(size_bytes), 0)
+
+  def mutator(raw: dict) -> dict:
+    state = _normalize_state(raw)
+    active = max(int(state.get("active_usage_bytes") or 0), 0)
+    if not state["logical_usage_initialized"]:
+      active = max(int(state.get("observed_usage_bytes") or 0), 0)
+      state["logical_usage_initialized"] = True
+    state["active_usage_bytes"] = max(active - size, 0)
+    state["deleted_retained_bytes"] = max(int(state.get("deleted_retained_bytes") or 0), 0) + size
+    return state
+
+  await etcd_op.merge_update_etcd_key(_state_key(app_name), mutator, client=client)
+
+
+async def restore_deleted_object(app_name: str, size_bytes: int, quota_bytes: int) -> None:
+  """Restore logical quota under the same lock as upload reservations."""
+  size = max(int(size_bytes), 0)
+  now = utc_now()
+  async with application_quota_lock(app_name) as client:
+    await restore_deleted_object_locked(app_name, size, quota_bytes, client, now=now)
+
+
+async def restore_deleted_object_locked(
+  app_name: str,
+  size_bytes: int,
+  quota_bytes: int,
+  client: Any,
+  *,
+  now: datetime | None = None,
+) -> None:
+  """Reclaim logical quota while a caller already owns the App lock."""
+  size = max(int(size_bytes), 0)
+  now = now or utc_now()
+
+  def mutator(raw: dict) -> dict:
+    state = _normalize_state(raw)
+    active = max(int(state.get("active_usage_bytes") or 0), 0)
+    if not state["logical_usage_initialized"]:
+      active = max(int(state.get("observed_usage_bytes") or 0), 0)
+      state["logical_usage_initialized"] = True
+    reserved = sum(
+      max(int(entry.get("declared_size_bytes") or 0), 0)
+      for entry in state["reservations"].values()
+      if isinstance(entry, dict) and _reservation_counts_toward_quota(entry, now)
+    )
+    if active + reserved + size > max(int(quota_bytes), 1):
+      raise CustomException(ErrorDesc.QUOTA_RESTORE_EXCEEDED)
+    state["active_usage_bytes"] = active + size
+    state["deleted_retained_bytes"] = max(int(state.get("deleted_retained_bytes") or 0) - size, 0)
+    return state
+
+  await etcd_op.merge_update_etcd_key(_state_key(app_name), mutator, client=client)
 async def prepare_abort(
   client: Any,
   *,

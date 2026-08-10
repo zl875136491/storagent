@@ -1,5 +1,14 @@
 """稳定业务错误码契约（前端依赖 code 字段）。"""
-from src.core.exception import CustomException, ErrorDesc, error_response
+from fastapi import FastAPI
+
+from src.api import register_api
+from src.core.exception import (
+  CustomException,
+  ErrorDesc,
+  _v2_http_error,
+  error_response,
+  v2_error_response,
+)
 
 
 def test_object_not_found_local_code_and_http_status():
@@ -37,3 +46,39 @@ def test_ai_upstream_failure_uses_502():
   exc = CustomException(ErrorDesc.AI_UPSTREAM_FAILED, "timeout")
   assert exc.code == 502043
   assert exc.status_code == 502
+
+
+def test_v2_error_response_uses_stable_string_code_and_request_id():
+  exc = CustomException(ErrorDesc.OBJECT_DELETED, {"object_id": "obj_1"})
+  assert v2_error_response(exc, "req_1") == {
+    "error": {
+      "code": "object.deleted",
+      "message": "对象已删除",
+      "retryable": False,
+      "details": {"object_id": "obj_1"},
+    },
+    "request_id": "req_1",
+  }
+
+
+def test_v2_framework_auth_error_has_stable_code():
+  assert _v2_http_error(403, "Not authenticated")[:3] == (
+    "auth.api_key.invalid",
+    "API-KEY 无效",
+    False,
+  )
+
+
+def test_every_v1_relative_path_is_registered_for_v2():
+  app = FastAPI()
+  register_api(app)
+  paths = {route.path for route in app.routes}
+  v1 = {path[len("/api/v1"):] for path in paths if path.startswith("/api/v1/")}
+  v2 = {path[len("/api/v2"):] for path in paths if path.startswith("/api/v2/")}
+  assert v1 <= v2
+  assert {
+    "/files/objects",
+    "/files/objects/{object_id}",
+    "/files/objects/{object_id}/restore",
+    "/files/objects/{object_id}/share",
+  } <= v2
