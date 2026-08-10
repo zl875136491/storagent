@@ -563,7 +563,6 @@ async def locate_object(
   """
   查询对象在哪些服务点存在，并生成各节点的 stat / download 指引 URL
   """
-  await files_crud.require_active_object(app_name, object_key.strip())
   return await files_locate.find_object_locations(app_name, object_key, offset, length)
 
 
@@ -573,7 +572,6 @@ async def stat_object(
 ) -> files_schema.ObjectStatResponse:
   b = app_name
   key = object_key.strip()
-  await files_crud.require_active_object(app_name, key)
   stat, _server = await files_locate.stat_object_local(b, key)
   return files_schema.ObjectStatResponse(
     bucket=b,
@@ -600,8 +598,6 @@ async def download_chunk(
   app_name = app_context["app_name"]
   b = app_name
   key = object_key.strip()
-  await files_crud.require_active_object(app_name, key)
-
   stat, server = await files_locate.stat_object_local(b, key)
   access_key, secret_key = storage_crud.plain_minio_credentials(server)
   client = get_minio_client(server.host, server.minio_port, access_key, secret_key)

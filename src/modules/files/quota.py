@@ -469,7 +469,14 @@ async def _reconcile_state_locked(
       )
       state["observed_usage_updated_at"] = now.isoformat()
       if not state["logical_usage_initialized"]:
-        state["active_usage_bytes"] = int(refreshed_usage)
+        # Seed the active logical counter from the reconciled high-water mark.
+        # A regional MinIO scan can lag replication and report less than Etcd
+        # already confirmed, so initializing from `refreshed_usage` here could
+        # temporarily admit an upload beyond the application's hard quota.
+        state["active_usage_bytes"] = max(
+          int(state.get("active_usage_bytes") or 0),
+          int(state["observed_usage_bytes"]),
+        )
         state["logical_usage_initialized"] = True
     for reservation_id, data in list(state["reservations"].items()):
       if not isinstance(data, dict):
@@ -1324,4 +1331,7 @@ async def quota_update_guard(
       for item in state["reservations"].values()
       if isinstance(item, dict) and _reservation_counts_toward_quota(item, now)
     )
-    yield int(observed_usage_bytes), active_reserved
+    # Reconciliation is intentionally monotonic: a lagging regional scan may
+    # report less data than Etcd has already confirmed. Admission must use the
+    # reconciled state, not the stale loader value that initiated this refresh.
+    yield max(int(state.get("observed_usage_bytes") or 0), 0), active_reserved
