@@ -116,6 +116,19 @@ async def demo_multipart_abort(
   return await files_service.multipart_abort(payload, app_context)
 
 
+@router.get("/files/multipart/parts")
+async def demo_multipart_parts(
+  upload_id: str = Query(...),
+  object_key: str = Query(...),
+  part_number_marker: str | None = Query(None),
+  app_context: dict = Depends(_context),
+):
+  """Expose the resumable-upload inspection step to the console demo."""
+  return await files_service.multipart_list_parts(
+    app_context, object_key, upload_id, part_number_marker,
+  )
+
+
 @router.post("/files/object/stat", response_model=files_schema.ObjectStatResponse)
 async def demo_object_stat(
   payload: files_schema.ObjectStatRequest,
