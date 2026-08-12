@@ -152,4 +152,8 @@ class AuditEvent(Document):
       IndexModel([("created_at", -1)]),
       IndexModel(["action"]),
       IndexModel(["actor"]),
+      IndexModel(["region"]),
+      IndexModel([("action", 1), ("created_at", -1)]),
+      IndexModel([("actor", 1), ("created_at", -1)]),
+      IndexModel([("region", 1), ("created_at", -1)]),
     ]

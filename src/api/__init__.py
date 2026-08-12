@@ -18,6 +18,7 @@ from src.modules.graph.v2.route import router as graph_v2_router
 from src.modules.usage.v2.route import router as usage_v2_router
 from src.modules.ai.v2.route import router as ai_v2_router
 from src.modules.demo.v2.route import router as demo_v2_router
+from src.modules.audit.route import router as audit_router
 
 # 在 main.py 中调用后, 会将所有 API 路由注册到 FastAPI 应用实例中
 def register_api(app: FastAPI):
@@ -41,6 +42,7 @@ def register_api(app: FastAPI):
   # Console demos are authenticated with the user's JWT and an opaque APIKey ID.
   # This keeps APIKey plaintext out of browser storage, headers, and URLs.
   api_router.include_router(demo_router, tags=["控制台演示"], prefix="/demo")
+  api_router.include_router(audit_router, tags=["审计日志"], prefix="/audit")
   app.include_router(health_router, tags=["健康检查"])
   
   app.include_router(api_router)
