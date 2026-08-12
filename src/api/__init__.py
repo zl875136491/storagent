@@ -19,6 +19,7 @@ from src.modules.usage.v2.route import router as usage_v2_router
 from src.modules.ai.v2.route import router as ai_v2_router
 from src.modules.demo.v2.route import router as demo_v2_router
 from src.modules.audit.route import router as audit_router
+from src.modules.audit.v2.route import router as audit_v2_router
 
 # 在 main.py 中调用后, 会将所有 API 路由注册到 FastAPI 应用实例中
 def register_api(app: FastAPI):
@@ -58,4 +59,5 @@ def register_api(app: FastAPI):
   v2_router.include_router(ai_v2_router, tags=["AI 助手 v2"], prefix="/ai")
   v2_router.include_router(usage_v2_router, tags=["用量统计 v2"], prefix="/usage")
   v2_router.include_router(demo_v2_router, tags=["控制台演示 v2"], prefix="/demo")
+  v2_router.include_router(audit_v2_router, tags=["审计日志 v2"], prefix="/audit")
   app.include_router(v2_router)
