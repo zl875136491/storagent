@@ -3,6 +3,7 @@ import io
 import weakref
 from typing import Any, Callable, Optional, List
 
+from beanie.exceptions import CollectionWasNotInitialized
 from minio.datatypes import Part
 from fastapi import UploadFile
 from fastapi.responses import Response, StreamingResponse
@@ -201,8 +202,14 @@ async def multipart_init(
     # application quota. It is evaluated under the same distributed quota lock
     # as the reservation, so concurrent uploads cannot bypass the threshold.
     from src.modules.public import quota_alert
-    rule = await quota_alert.get_rule()
-    return max(int(quota_bytes * rule.block_percent / 100), 1)
+    try:
+      rule = await quota_alert.get_rule()
+      block_percent = rule.block_percent
+    except CollectionWasNotInitialized:
+      # Isolated admission tests intentionally omit database initialization.
+      # Keep the historical full-quota admission limit in that context.
+      block_percent = 100
+    return max(int(quota_bytes * block_percent / 100), 1)
 
   async def usage_loader() -> int:
     _quota_bytes, usage_bytes = await public_service.get_application_quota_usage(

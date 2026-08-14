@@ -5,7 +5,6 @@ import asyncio
 from datetime import timedelta
 
 from beanie.odm.fields import Link
-from beanie.exceptions import CollectionWasNotInitialized
 
 from src.configs.configs import settings
 from src.core.exception import CustomException, ErrorDesc
@@ -27,13 +26,7 @@ DEFAULT_TEMPLATE = (
 
 
 async def get_rule() -> QuotaAlertRule:
-  # Upload admission is also exercised by isolated unit tests that do not
-  # initialize Beanie. In that context the persisted rule is unavailable, so
-  # retain the historical 100% quota limit through an in-memory default.
-  try:
-    rule = await QuotaAlertRule.find_one()
-  except CollectionWasNotInitialized:
-    return QuotaAlertRule(message_template=DEFAULT_TEMPLATE)
+  rule = await QuotaAlertRule.find_one()
   if rule:
     return rule
   rule = QuotaAlertRule(message_template=DEFAULT_TEMPLATE)
