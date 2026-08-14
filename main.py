@@ -17,6 +17,7 @@ from src.modules.storage.operations import (
   monitor_cluster_health_task,
   shutdown_background_operations,
 )
+from src.modules.capacity.service import capacity_snapshot_task
 import asyncio
 
 app_description = """
@@ -66,6 +67,7 @@ async def lifespan(app: FastAPI):
 
   # 9. 权威区域监控 MinIO 磁盘健康，并记录原生自愈状态
   cluster_health_job = asyncio.create_task(monitor_cluster_health_task())
+  capacity_snapshot_job = asyncio.create_task(capacity_snapshot_task())
 
   yield
   
@@ -74,6 +76,7 @@ async def lifespan(app: FastAPI):
   cleanup_job.cancel()
   replication_reconcile_job.cancel()
   cluster_health_job.cancel()
+  capacity_snapshot_job.cancel()
   await shutdown_background_operations()
   try:
     await etcd_client.close()

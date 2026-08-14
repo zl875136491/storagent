@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends
-from src.core.auth import get_current_user, check_permissions
+from src.core.auth import _is_superadmin, get_current_user, check_permissions
 from src.modules.auth.model import User
 from src.modules.public import service as public_service
 from src.modules.public import schema as public_schema
@@ -121,6 +121,77 @@ async def update_application_quota(
     payload.quota_bytes,
     current_user,
   )
+
+
+@router.get(
+  path="/quota-alert-rule",
+  response_model=public_schema.QuotaAlertRuleResponse,
+  summary="获取全局配额告警规则",
+)
+async def get_quota_alert_rule(
+  current_user: User = Depends(get_current_user),
+) -> public_schema.QuotaAlertRuleResponse:
+  from src.modules.public import quota_alert
+  return quota_alert.rule_response(await quota_alert.get_rule())
+
+
+@router.put(
+  path="/quota-alert-rule",
+  response_model=public_schema.QuotaAlertRuleResponse,
+  summary="更新全局配额告警规则",
+)
+async def update_quota_alert_rule(
+  payload: public_schema.QuotaAlertRuleUpdateRequest,
+  current_user: User = Depends(get_current_user),
+) -> public_schema.QuotaAlertRuleResponse:
+  from src.modules.public import quota_alert
+  await check_permissions(current_user, ["application_manage"])
+  return await quota_alert.update_rule(payload, current_user)
+
+
+@router.post(
+  path="/application/{application_id}/expansion-requests",
+  response_model=public_schema.ExpansionRequestResponse,
+  summary="为自己的应用提交扩容申请",
+)
+async def create_expansion_request(
+  application_id: public_schema.PydanticObjectId,
+  payload: public_schema.ExpansionRequestCreate,
+  current_user: User = Depends(get_current_user),
+) -> public_schema.ExpansionRequestResponse:
+  from src.modules.public import quota_alert
+  return await quota_alert.create_expansion_request(application_id, payload, current_user)
+
+
+@router.get(
+  path="/application/expansion-requests",
+  response_model=public_schema.ExpansionRequestListResponse,
+  summary="查询应用扩容申请",
+)
+async def get_expansion_requests(
+  current_user: User = Depends(get_current_user),
+) -> public_schema.ExpansionRequestListResponse:
+  from src.modules.public import quota_alert
+  can_review = (
+    await _is_superadmin(current_user)
+    or "application_manage" in set(current_user.permissions or [])
+  )
+  return await quota_alert.list_expansion_requests(current_user, all_requests=can_review)
+
+
+@router.put(
+  path="/application/expansion-requests/{request_id}/review",
+  response_model=public_schema.ExpansionRequestResponse,
+  summary="审批应用扩容申请",
+)
+async def review_expansion_request(
+  request_id: str,
+  payload: public_schema.ExpansionRequestReview,
+  current_user: User = Depends(get_current_user),
+) -> public_schema.ExpansionRequestResponse:
+  from src.modules.public import quota_alert
+  await check_permissions(current_user, ["application_manage"])
+  return await quota_alert.review_expansion_request(request_id, payload, current_user)
 
 @router.post(
   path="/application/{application_id}/approval",

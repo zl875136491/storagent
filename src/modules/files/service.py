@@ -23,6 +23,28 @@ _QUOTA_EXCEEDED_REASON = "APP 存储超出限额，请联系管理员处理"
 _upload_part_semaphores = weakref.WeakKeyDictionary()
 
 
+async def _upload_quota_warning(
+  app_name: str,
+  *,
+  usage_bytes: int,
+  declared_size_bytes: int,
+) -> dict | None:
+  """Best-effort alerting must never make a valid upload unavailable."""
+  try:
+    from src.modules.public import crud, quota_alert
+    application = await crud.read_application_by_name(app_name)
+    if application:
+      return await quota_alert.evaluate_upload_warning(
+        application,
+        usage_bytes=usage_bytes,
+        declared_size_bytes=declared_size_bytes,
+      )
+  except Exception as error:
+    from src.utils.logger import logger
+    logger.warning("上传前配额告警检查失败 app=%s: %s", app_name, error)
+  return None
+
+
 def _upload_part_semaphore() -> asyncio.Semaphore:
   loop = asyncio.get_running_loop()
   limit = max(int(settings.APPLICATION_UPLOAD_MAX_IN_MEMORY_PARTS), 1)
@@ -171,10 +193,16 @@ async def multipart_init(
   object_key = gen_object_key()
 
   async def quota_loader(quota_client) -> int:
-    return await public_service.get_application_quota_limit(
+    quota_bytes = await public_service.get_application_quota_limit(
       app_name,
       client=quota_client,
     )
+    # The global rule may intentionally reserve headroom below the physical
+    # application quota. It is evaluated under the same distributed quota lock
+    # as the reservation, so concurrent uploads cannot bypass the threshold.
+    from src.modules.public import quota_alert
+    rule = await quota_alert.get_rule()
+    return max(int(quota_bytes * rule.block_percent / 100), 1)
 
   async def usage_loader() -> int:
     _quota_bytes, usage_bytes = await public_service.get_application_quota_usage(
@@ -183,6 +211,12 @@ async def multipart_init(
       require_all=True,
     )
     return usage_bytes
+
+  quota_bytes, usage_bytes = await public_service.get_application_quota_usage(
+    app_name,
+    force=True,
+    require_all=True,
+  )
 
   reservation = await files_quota.reserve_upload(
     app_name=app_name,
@@ -238,6 +272,11 @@ async def multipart_init(
     upload_id=upload_id,
     bucket=app_name,
     object_key=object_key,
+    quota_warning=await _upload_quota_warning(
+      app_name,
+      usage_bytes=usage_bytes,
+      declared_size_bytes=size_bytes,
+    ),
   )
 
 

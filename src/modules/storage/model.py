@@ -114,4 +114,27 @@ class StorageOperation(Document):
       IndexModel([("kind", 1), ("server", 1), ("status", 1)]),
       IndexModel(["expires_at"], expireAfterSeconds=0),
     ]
+
+
+class RegionCapacitySnapshot(Document):
+  """Daily regional capacity sample used by planning views and risk forecasts."""
+  region: str
+  shown_name: str
+  raw_capacity_bytes: int = Field(ge=0)
+  raw_used_bytes: int = Field(ge=0)
+  logical_usage_bytes: int = Field(ge=0)
+  object_count: int = Field(ge=0)
+  archive_bytes: int = Field(default=0, ge=0)
+  archived_object_count: int = Field(default=0, ge=0)
+  expected_replica_count: int = Field(default=0, ge=0)
+  actual_replica_count: int = Field(default=0, ge=0)
+  captured_at: datetime = Field(default_factory=utc_now)
+  sample_day: str
+
+  class Settings:
+    name = "region_capacity_snapshot"
+    indexes = [
+      IndexModel([("region", 1), ("sample_day", 1)], unique=True),
+      IndexModel([("captured_at", -1)]),
+    ]
   

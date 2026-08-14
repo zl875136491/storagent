@@ -20,6 +20,8 @@ from src.modules.ai.v2.route import router as ai_v2_router
 from src.modules.demo.v2.route import router as demo_v2_router
 from src.modules.audit.route import router as audit_router
 from src.modules.audit.v2.route import router as audit_v2_router
+from src.modules.diagnostics.route import router as diagnostics_router
+from src.modules.capacity.route import router as capacity_router
 
 # 在 main.py 中调用后, 会将所有 API 路由注册到 FastAPI 应用实例中
 def register_api(app: FastAPI):
@@ -44,6 +46,8 @@ def register_api(app: FastAPI):
   # This keeps APIKey plaintext out of browser storage, headers, and URLs.
   api_router.include_router(demo_router, tags=["控制台演示"], prefix="/demo")
   api_router.include_router(audit_router, tags=["审计日志"], prefix="/audit")
+  api_router.include_router(diagnostics_router, tags=["调用方自诊断"], prefix="/diagnostics")
+  api_router.include_router(capacity_router, tags=["容量规划"], prefix="/capacity")
   app.include_router(health_router, tags=["健康检查"])
   
   app.include_router(api_router)
@@ -60,4 +64,6 @@ def register_api(app: FastAPI):
   v2_router.include_router(usage_v2_router, tags=["用量统计 v2"], prefix="/usage")
   v2_router.include_router(demo_v2_router, tags=["控制台演示 v2"], prefix="/demo")
   v2_router.include_router(audit_v2_router, tags=["审计日志 v2"], prefix="/audit")
+  v2_router.include_router(diagnostics_router, tags=["调用方自诊断 v2"], prefix="/diagnostics")
+  v2_router.include_router(capacity_router, tags=["容量规划 v2"], prefix="/capacity")
   app.include_router(v2_router)

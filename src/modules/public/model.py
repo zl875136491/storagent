@@ -157,3 +157,83 @@ class AuditEvent(Document):
       IndexModel([("actor", 1), ("created_at", -1)]),
       IndexModel([("region", 1), ("created_at", -1)]),
     ]
+
+
+class QuotaAlertRule(Document):
+  """Single system-wide quota alert policy managed by application admins."""
+  low_percent: int = Field(default=70, ge=1, le=100)
+  medium_percent: int = Field(default=85, ge=1, le=100)
+  high_percent: int = Field(default=90, ge=1, le=100)
+  block_percent: int = Field(default=100, ge=1, le=100)
+  message_template: str = Field(
+    default="应用 {app_name} 当前配额使用率为 {usage_percent}%，请关注容量并按需提交扩容申请。",
+    min_length=1,
+    max_length=1000,
+  )
+  updated_at: datetime = Field(default_factory=utc_now)
+  updated_by: str = Field(default="")
+
+  class Settings:
+    name = "quota_alert_rule"
+
+
+class QuotaAlertEvent(Document):
+  """Deduplicated application quota alert delivery record."""
+  application_name: str
+  owner_username: str
+  level: Literal["low", "medium", "high", "blocked"]
+  usage_bytes: int = Field(ge=0)
+  projected_usage_bytes: int = Field(ge=0)
+  quota_bytes: int = Field(gt=0)
+  usage_percent: float = Field(ge=0)
+  message: str
+  created_at: datetime = Field(default_factory=utc_now)
+
+  class Settings:
+    name = "quota_alert_event"
+    indexes = [
+      IndexModel([("application_name", 1), ("level", 1), ("created_at", -1)]),
+      IndexModel([("created_at", -1)]),
+    ]
+
+
+class ApplicationExpansionRequest(Document):
+  """An application owner requests a quota increase from application admins."""
+  application_name: str
+  application_shown_name: str
+  applicant_username: str
+  reason: str = Field(min_length=1, max_length=2000)
+  add_size_bytes: int = Field(gt=0)
+  status: Literal["pending", "approved", "rejected"] = "pending"
+  reviewer_username: str = Field(default="")
+  review_note: str = Field(default="", max_length=1000)
+  created_at: datetime = Field(default_factory=utc_now)
+  reviewed_at: datetime | None = None
+
+  class Settings:
+    name = "application_expansion_request"
+    indexes = [
+      IndexModel([("application_name", 1), ("status", 1), ("created_at", -1)]),
+      IndexModel([("applicant_username", 1), ("created_at", -1)]),
+    ]
+
+
+class DiagnosticRun(Document):
+  """A self-diagnosis execution submitted by a caller-owned backend host."""
+  run_id: str
+  api_version: Literal["v1", "v2"]
+  app_name: str
+  source_host: str = Field(default="")
+  network_only: bool = False
+  overall_status: Literal["passed", "failed", "partial"]
+  checks: list[dict] = Field(default_factory=list)
+  raw_log: str = Field(default="", max_length=200_000)
+  created_at: datetime = Field(default_factory=utc_now)
+
+  class Settings:
+    name = "diagnostic_run"
+    indexes = [
+      IndexModel([("app_name", 1), ("created_at", -1)]),
+      IndexModel([("created_at", -1)]),
+      IndexModel([("run_id", 1)], unique=True),
+    ]

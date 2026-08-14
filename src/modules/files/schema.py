@@ -17,6 +17,9 @@ class MultipartInitResponse(BaseModel):
   upload_id: str
   bucket: str
   object_key: str
+  # Advisory only: uploads are rejected only when the global block threshold
+  # would be exceeded. Clients can surface this before sending any parts.
+  quota_warning: dict | None = None
 
 class MultipartUploadPartRequest(BaseModel):
   upload_id: str = Field(..., description="init 返回的 upload_id")

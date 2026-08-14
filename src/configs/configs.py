@@ -53,6 +53,10 @@ class Settings(BaseSettings):
   # 对外 Nginx 网关域名，不带协议、端口或路径，例如 stor.1oa.com.cn。
   # 为空时，历史 MinIO 服务仍回退到 host:server_port。
   PUBLIC_DOMAIN: str = ""
+  # Self-diagnosis scripts may be downloaded from one deployment and run on a
+  # different host. Keep their suggested gateway explicit per environment.
+  DIAGNOSTIC_SCRIPT_DEFAULT_BASE: str = "http://stor.1oa.com.cn/server/local"
+  DIAGNOSTIC_SCRIPT_GATEWAY_ORIGIN: str = "http://stor.1oa.com.cn"
   # 跨节点 locate 单节点 stat 超时（秒）
   OBJECT_LOCATE_TIMEOUT: float = 5.0
 
@@ -106,6 +110,10 @@ class Settings(BaseSettings):
   APPLICATION_QUOTA_MAX_ACTIVE_RESERVATIONS: int = 1000
   APPLICATION_UPLOAD_MAX_PART_BYTES: int = 64 * 1024 ** 2
   APPLICATION_UPLOAD_MAX_IN_MEMORY_PARTS: int = 2
+  # Quota warnings are evaluated at upload admission; duplicate OA messages
+  # for an unchanged threshold are suppressed for this interval.
+  QUOTA_ALERT_COOLDOWN_SECONDS: int = 86400
+  CAPACITY_SNAPSHOT_INTERVAL_SECONDS: int = 3600
   MINIO_HEAL_TIMEOUT_SECONDS: float = 3600.0
   CLUSTER_HEALTH_CHECK_INTERVAL_SECONDS: float = 120.0
   AUTO_HEAL_ENABLED: bool = True

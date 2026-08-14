@@ -24,6 +24,10 @@ from ..modules.public.model import (
   APIKeyUsage,
   APIUsageEvent,
   AuditEvent,
+  QuotaAlertRule,
+  QuotaAlertEvent,
+  ApplicationExpansionRequest,
+  DiagnosticRun,
 )
 
 from ..modules.storage.model import (
@@ -32,6 +36,7 @@ from ..modules.storage.model import (
   MinioBucket,
   ServerFileDetailsCache,
   StorageOperation,
+  RegionCapacitySnapshot,
 )
 
 from ..modules.graph.model import (
@@ -91,11 +96,16 @@ async def init_db():
     APIKeyUsage,
     APIUsageEvent,
     AuditEvent,
+    QuotaAlertRule,
+    QuotaAlertEvent,
+    ApplicationExpansionRequest,
+    DiagnosticRun,
     MinioEvent,
     MinioServer,
     MinioBucket,
     ServerFileDetailsCache,
     StorageOperation,
+    RegionCapacitySnapshot,
     BucketNodePosition,
     BucketEdgePosition,
     ObjectCatalog,

@@ -99,6 +99,52 @@ class ApplicationListResponse(BaseModel):
 class ApplicationQuotaUpdateRequest(BaseModel):
   quota_bytes: int = Field(..., gt=0)
 
+
+class QuotaAlertRuleResponse(BaseModel):
+  low_percent: int
+  medium_percent: int
+  high_percent: int
+  block_percent: int
+  message_template: str
+  updated_at: datetime
+  updated_by: str
+
+
+class QuotaAlertRuleUpdateRequest(BaseModel):
+  low_percent: int = Field(70, ge=1, le=100)
+  medium_percent: int = Field(85, ge=1, le=100)
+  high_percent: int = Field(90, ge=1, le=100)
+  block_percent: int = Field(100, ge=1, le=100)
+  message_template: str = Field(..., min_length=1, max_length=1000)
+
+
+class ExpansionRequestCreate(BaseModel):
+  reason: str = Field(..., min_length=1, max_length=2000)
+  add_size_bytes: int = Field(..., gt=0)
+
+
+class ExpansionRequestReview(BaseModel):
+  approved: bool
+  review_note: str = Field(default="", max_length=1000)
+
+
+class ExpansionRequestResponse(BaseModel):
+  id: str
+  application_name: str
+  application_shown_name: str
+  applicant_username: str
+  reason: str
+  add_size_bytes: int
+  status: Literal["pending", "approved", "rejected"]
+  reviewer_username: str
+  review_note: str
+  created_at: datetime
+  reviewed_at: datetime | None
+
+
+class ExpansionRequestListResponse(BaseModel):
+  data: List[ExpansionRequestResponse]
+
 class SimpleApplicationResponse(BaseModel):
   id: PydanticObjectId
   name: str
