@@ -59,9 +59,37 @@ fail() {
 }
 
 ask() {
-  # Prompts go to stderr so command substitution receives only user input.
+  # When invoked as `curl ... | sh`, stdin is the downloaded script itself.
+  # Read interactive answers from the caller's terminal so the first prompt
+  # does not consume the script stream and turn an empty answer into EOF.
+  answer=""
   printf '%s' "$1" >&2
-  IFS= read -r answer || true
+  if [ ! -r /dev/tty ]; then
+    printf '%s\n' "错误: 自诊断脚本需要交互式终端，请先下载脚本后直接运行，或使用带 TTY 的 curl | sh。" >&2
+    return 2
+  fi
+  IFS= read -r answer </dev/tty || return 2
+  printf '%s' "$answer"
+}
+
+ask_secret() {
+  # APIKey is only needed for the current process and must not be echoed.
+  answer=""
+  printf '%s' "$1" >&2
+  if [ ! -r /dev/tty ]; then
+    printf '%s\n' "错误: 自诊断脚本需要交互式终端，请先下载脚本后直接运行，或使用带 TTY 的 curl | sh。" >&2
+    return 2
+  fi
+  if command -v stty >/dev/null 2>&1; then
+    stty -echo </dev/tty 2>/dev/null || true
+    IFS= read -r answer </dev/tty
+    read_status=$?
+    stty echo </dev/tty 2>/dev/null || true
+    printf '\n' >&2
+    [ "$read_status" -eq 0 ] || return 2
+  else
+    IFS= read -r answer </dev/tty || return 2
+  fi
   printf '%s' "$answer"
 }
 
@@ -246,7 +274,7 @@ report_run() {
 
 read_mode() {
   while :; do
-    mode="$(ask "检测范围 [1] 网络与认证 [2] 完整读写（默认 2）: ")"
+    mode="$(ask "检测范围 [1] 网络与认证 [2] 完整读写（默认 2）: ")" || return 2
     case "$mode" in
       ""|2) printf '%s' 2; return ;;
       1) printf '%s' 1; return ;;
@@ -258,17 +286,19 @@ read_mode() {
 command -v curl >/dev/null 2>&1 || fail "未找到 curl，请先安装 curl。"
 command -v mktemp >/dev/null 2>&1 || fail "未找到 mktemp，无法安全创建临时文件。"
 
-BASE_INPUT="$(ask "Storagent 基础地址（回车默认 local；也可输入 local/bj/tj/ks/sz/hz 或完整地址）[${DEFAULT_BASE}]: ")"
+BASE_INPUT="$(ask "Storagent 基础地址（回车默认 local；也可输入 local/bj/tj/ks/sz/hz 或完整地址）[${DEFAULT_BASE}]: ")" || fail "无法读取基础地址。请在交互式终端中运行此脚本。"
 BASE_URL="$(normalize_base_url "$BASE_INPUT")" || fail "基础地址无效。请输入区域代号或 http(s) 完整地址。"
 validate_base_url "$BASE_URL" || fail "基础地址格式无效: $BASE_URL"
 
-APP_NAME="$(trim "$(ask "应用 APPID: ")")"
+APP_NAME_INPUT="$(ask "应用 APPID: ")" || fail "无法读取应用 APPID。请在交互式终端中运行此脚本。"
+APP_NAME="$(trim "$APP_NAME_INPUT")"
 [ -n "$APP_NAME" ] || fail "应用 APPID 不能为空。"
 
-API_KEY="$(trim "$(ask "APIKey: ")")"
+API_KEY="$(ask_secret "APIKey（输入时不显示）: ")" || fail "无法读取 APIKey。请在交互式终端中运行此脚本。"
+API_KEY="$(trim "$API_KEY")"
 [ -n "$API_KEY" ] || fail "APIKey 不能为空。"
 
-MODE="$(read_mode)"
+MODE="$(read_mode)" || fail "无法读取检测范围。请在交互式终端中运行此脚本。"
 NETWORK_ONLY=false
 [ "$MODE" = "1" ] && NETWORK_ONLY=true
 HOST="$(url_host "$BASE_URL")"

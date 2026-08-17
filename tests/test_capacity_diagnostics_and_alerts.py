@@ -38,6 +38,16 @@ def test_diagnostic_script_normalizes_region_shorthand_before_dns_and_curl():
   assert "${GATEWAY_ORIGIN}/server/${value}" in script
   assert "normalize_base_url" in script
   assert "基础地址无效" in script
+  assert "read -r answer </dev/tty" in script
+  assert "curl ... | sh" in script
+  assert 'answer=""' in script
+  assert "无法读取基础地址" in script
+  assert "无法读取 APIKey" in script
+  assert "IFS= read -r answer || true" not in script
+  assert "ask_secret()" in script
+  assert "stty -echo" in script
+  assert "APIKey（输入时不显示）" in script
+  assert "API_KEY=\"$(trim \"$(ask" not in script
 
 
 def test_alert_level_uses_ordered_thresholds():
