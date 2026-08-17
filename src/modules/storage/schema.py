@@ -236,9 +236,16 @@ class ClusterDriveHealth(BaseModel):
   endpoint: str
   path: str = ""
   state: str
+  health: Literal["healthy", "warning", "critical", "offline", "unknown"] = "unknown"
+  health_reasons: list[str] = Field(default_factory=list)
   total_bytes: int = 0
   used_bytes: int = 0
   available_bytes: int = 0
+  usage_percent: float = 0
+  used_inodes: int = 0
+  free_inodes: int = 0
+  inode_usage_percent: float = 0
+  capacity_skew: bool = False
   waiting_operations: int = 0
 
 
@@ -248,7 +255,7 @@ class ClusterHealthItem(BaseModel):
   region: str
   shown_name: str
   endpoint: str
-  status: Literal["online", "degraded", "offline"]
+  status: Literal["online", "degraded", "critical", "offline"]
   reachable: bool
   error: str = ""
   checked_at: datetime
@@ -265,18 +272,24 @@ class ClusterHealthItem(BaseModel):
   online_disks: int = 0
   offline_disks: int = 0
   healing_disks: int = 0
+  warning_disks: int = 0
+  critical_disks: int = 0
+  health_reasons: list[str] = Field(default_factory=list)
   drives: list[ClusterDriveHealth] = Field(default_factory=list)
 
 
 class ClusterHealthSummary(BaseModel):
-  status: Literal["online", "degraded", "offline"]
+  status: Literal["online", "degraded", "critical", "offline"]
   cluster_count: int = 0
   online_clusters: int = 0
   degraded_clusters: int = 0
+  critical_clusters: int = 0
   offline_clusters: int = 0
   online_disks: int = 0
   offline_disks: int = 0
   healing_disks: int = 0
+  warning_disks: int = 0
+  critical_disks: int = 0
   raw_capacity_bytes: int = 0
   raw_used_bytes: int = 0
   logical_usage_bytes: int = 0

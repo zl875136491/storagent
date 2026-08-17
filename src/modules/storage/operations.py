@@ -174,6 +174,80 @@ def _pool_totals(pools: Any) -> tuple[int, int, int]:
   return capacity, used, healing
 
 
+def _percent(numerator: int, denominator: int) -> float:
+  if denominator <= 0:
+    return 0.0
+  return round(max(min(numerator / denominator * 100, 100.0), 0.0), 2)
+
+
+def _health_thresholds() -> tuple[float, float, float, float, float]:
+  """Normalize health settings so invalid deployment values cannot hide alerts."""
+  warning = min(max(float(settings.MINIO_DRIVE_WARNING_PERCENT), 1.0), 99.0)
+  critical = min(max(float(settings.MINIO_DRIVE_CRITICAL_PERCENT), warning), 100.0)
+  inode_warning = min(max(float(settings.MINIO_DRIVE_INODE_WARNING_PERCENT), 1.0), 99.0)
+  inode_critical = min(max(float(settings.MINIO_DRIVE_INODE_CRITICAL_PERCENT), inode_warning), 100.0)
+  skew = min(max(float(settings.MINIO_DRIVE_CAPACITY_SKEW_PERCENT), 0.0), 99.0)
+  return warning, critical, inode_warning, inode_critical, skew
+
+
+def _evaluate_drive_health(drives: list[dict[str, Any]]) -> None:
+  """Add Storagent write-capacity health to MinIO's native drive state.
+
+  MinIO reports ``state=ok`` when a drive is attached and readable. That
+  state does not guarantee that another object can be written, so disk space,
+  inodes, and erasure-set capacity skew are evaluated independently.
+  """
+  warning, critical, inode_warning, inode_critical, skew_limit = _health_thresholds()
+  totals = [item["total_bytes"] for item in drives if item["total_bytes"] > 0]
+  largest_total = max(totals, default=0)
+
+  for item in drives:
+    native_state = item["state"].strip().lower()
+    reasons: list[str] = []
+    usage_percent = _percent(item["used_bytes"], item["total_bytes"])
+    inode_total = item["used_inodes"] + item["free_inodes"]
+    inode_usage_percent = _percent(item["used_inodes"], inode_total)
+    capacity_skew = bool(
+      skew_limit > 0
+      and largest_total > 0
+      and item["total_bytes"] > 0
+      and item["total_bytes"] < largest_total * (1 - skew_limit / 100)
+    )
+
+    health = "healthy"
+    if native_state not in ("ok", "online", "healthy"):
+      health = "offline"
+      reasons.append(f"MinIO 磁盘状态为 {item['state']}")
+    elif (
+      (item["total_bytes"] > 0 and item["available_bytes"] <= 0)
+      or (inode_total > 0 and item["free_inodes"] <= 0)
+    ):
+      health = "critical"
+      reasons.append("磁盘空间或 inode 已耗尽，无法保证继续写入")
+    elif usage_percent >= critical or inode_usage_percent >= inode_critical:
+      health = "critical"
+      reasons.append(
+        f"容量 {usage_percent:.1f}% / inode {inode_usage_percent:.1f}% 已达到严重阈值"
+        f"（剩余 {item['available_bytes']}B，空闲 inode {item['free_inodes']}）"
+      )
+    elif usage_percent >= warning or inode_usage_percent >= inode_warning:
+      health = "warning"
+      reasons.append(f"容量 {usage_percent:.1f}% / inode {inode_usage_percent:.1f}% 已达到预警阈值")
+
+    if capacity_skew:
+      reasons.append(f"容量显著低于同一 Erasure Set 最大盘 {largest_total}B")
+      if health == "healthy":
+        health = "warning"
+
+    item.update({
+      "health": health,
+      "health_reasons": reasons,
+      "usage_percent": usage_percent,
+      "inode_usage_percent": inode_usage_percent,
+      "capacity_skew": capacity_skew,
+    })
+
+
 def parse_cluster_admin_info(
   server: Any,
   payload: dict[str, Any],
@@ -204,8 +278,12 @@ def parse_cluster_admin_info(
         "total_bytes": _as_int(drive.get("totalspace")),
         "used_bytes": _as_int(drive.get("usedspace")),
         "available_bytes": _as_int(drive.get("availspace")),
+        "used_inodes": _as_int(drive.get("used_inodes")),
+        "free_inodes": _as_int(drive.get("free_inodes")),
         "waiting_operations": _as_int(metrics.get("totalWaiting")),
       })
+
+  _evaluate_drive_health(drives)
 
   raw_capacity, raw_used, healing_disks = _pool_totals(info.get("pools"))
   if raw_capacity <= 0:
@@ -220,10 +298,16 @@ def parse_cluster_admin_info(
     offline_disks = sum(item["state"].lower() not in ("ok", "online") for item in drives)
 
   mode = str(info.get("mode") or "").lower()
+  warning_disks = sum(item["health"] == "warning" for item in drives)
+  critical_disks = sum(item["health"] == "critical" for item in drives)
+  health_reasons = [reason for item in drives for reason in item["health_reasons"]]
+  critical = critical_disks > 0
   degraded = (
     mode != "online"
     or offline_disks > 0
     or healing_disks > 0
+    or warning_disks > 0
+    or critical_disks > 0
     or any(item["state"].lower() not in ("ok", "online") for item in drives)
   )
   region = getattr(server, "region", None)
@@ -238,7 +322,7 @@ def parse_cluster_admin_info(
     "region": str(getattr(region, "name", server.name)),
     "shown_name": str(getattr(region, "shown_name", server.name)),
     "endpoint": f"{server.host}:{server.minio_port}",
-    "status": "degraded" if degraded else "online",
+    "status": "critical" if critical else ("degraded" if degraded else "online"),
     "reachable": True,
     "error": "",
     "checked_at": checked_at,
@@ -255,6 +339,9 @@ def parse_cluster_admin_info(
     "online_disks": online_disks,
     "offline_disks": offline_disks,
     "healing_disks": healing_disks,
+    "warning_disks": warning_disks,
+    "critical_disks": critical_disks,
+    "health_reasons": health_reasons,
     "drives": drives,
   }
 
@@ -294,19 +381,23 @@ async def get_cluster_health_overview() -> dict[str, Any]:
   clusters = await asyncio.gather(*(inspect(server) for server in servers))
   online = sum(item["status"] == "online" for item in clusters)
   degraded = sum(item["status"] == "degraded" for item in clusters)
+  critical = sum(item["status"] == "critical" for item in clusters)
   offline = sum(item["status"] == "offline" for item in clusters)
   overall = "offline" if not clusters or offline == len(clusters) else (
-    "degraded" if offline or degraded else "online"
+    "critical" if critical else ("degraded" if offline or degraded else "online")
   )
   summary = {
     "status": overall,
     "cluster_count": len(clusters),
     "online_clusters": online,
     "degraded_clusters": degraded,
+    "critical_clusters": critical,
     "offline_clusters": offline,
     "online_disks": sum(_as_int(item.get("online_disks")) for item in clusters),
     "offline_disks": sum(_as_int(item.get("offline_disks")) for item in clusters),
     "healing_disks": sum(_as_int(item.get("healing_disks")) for item in clusters),
+    "warning_disks": sum(_as_int(item.get("warning_disks")) for item in clusters),
+    "critical_disks": sum(_as_int(item.get("critical_disks")) for item in clusters),
     "raw_capacity_bytes": sum(_as_int(item.get("raw_capacity_bytes")) for item in clusters),
     "raw_used_bytes": sum(_as_int(item.get("raw_used_bytes")) for item in clusters),
     "logical_usage_bytes": sum(_as_int(item.get("logical_usage_bytes")) for item in clusters),

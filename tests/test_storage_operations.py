@@ -73,6 +73,54 @@ def test_parse_cluster_admin_info_reports_capacity_and_degraded_disk():
   schema.ClusterHealthItem.model_validate(result)
 
 
+def test_parse_cluster_admin_info_marks_online_but_full_drive_critical():
+  server = SimpleNamespace(
+    id=ObjectId(),
+    name="kunshan",
+    host="10.8.136.107",
+    minio_port=9000,
+    region=SimpleNamespace(name="kunshan", shown_name="昆山"),
+  )
+  payload = {
+    "info": {
+      "mode": "online",
+      "backend": {"onlineDisks": 3, "offlineDisks": 0},
+      "servers": [{
+        "drives": [
+          {"endpoint": "/data/minio1", "path": "/data/minio1", "state": "ok", "totalspace": 15_995_754_250_240, "usedspace": 358_878_490_624, "availspace": 15_636_875_759_616, "used_inodes": 28_747, "free_inodes": 1_562_265_269},
+          {"endpoint": "/data/minio2", "path": "/data/minio2", "state": "ok", "totalspace": 15_995_754_250_240, "usedspace": 358_878_490_624, "availspace": 15_636_875_759_616, "used_inodes": 28_747, "free_inodes": 1_562_265_269},
+          {"endpoint": "/data/minio3", "path": "/data/minio3", "state": "ok", "totalspace": 15_553_527_808, "usedspace": 15_553_331_200, "availspace": 196_608, "used_inodes": 14_536, "free_inodes": 440},
+        ],
+      }],
+    },
+  }
+
+  result = operations.parse_cluster_admin_info(server, payload, elapsed_ms=3, checked_at=utc_now())
+
+  small_drive = next(item for item in result["drives"] if item["path"] == "/data/minio3")
+  assert result["status"] == "critical"
+  assert result["critical_disks"] == 1
+  assert small_drive["health"] == "critical"
+  assert small_drive["usage_percent"] == 100.0
+  assert small_drive["capacity_skew"] is True
+  assert any("严重阈值" in reason and "剩余 196608B" in reason for reason in small_drive["health_reasons"])
+  schema.ClusterHealthItem.model_validate(result)
+
+
+def test_parse_cluster_admin_info_marks_drive_threshold_warning():
+  server = SimpleNamespace(
+    id=ObjectId(), name="test", host="127.0.0.1", minio_port=9000,
+    region=SimpleNamespace(name="test", shown_name="测试"),
+  )
+  payload = {"info": {"mode": "online", "backend": {"onlineDisks": 1}, "servers": [{"drives": [{"endpoint": "/data", "state": "ok", "totalspace": 1000, "usedspace": 900, "availspace": 100, "used_inodes": 90, "free_inodes": 10}]}]}}
+
+  result = operations.parse_cluster_admin_info(server, payload, elapsed_ms=1, checked_at=utc_now())
+
+  assert result["status"] == "degraded"
+  assert result["warning_disks"] == 1
+  assert result["drives"][0]["health"] == "warning"
+
+
 def test_parse_replication_source_exposes_queue_failures_and_latency():
   arn = "arn:minio:replication::target-1:system-test"
   payload = {
