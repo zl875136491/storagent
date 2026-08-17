@@ -87,8 +87,14 @@ class Settings(BaseSettings):
   # Etcd
   ETCD_HOST: str = "localhost"
   ETCD_PORT: int = 2379
+  # Optional comma-separated endpoints for the read-only operations view.
+  ETCD_ENDPOINTS: str = ""
   ETCD_USERNAME: str = "admin"
   ETCD_PASSWORD: str = "passwd"
+  ETCD_HEALTH_TIMEOUT_SECONDS: float = 3.0
+  ETCD_HEALTH_CACHE_TTL_SECONDS: float = 30.0
+  ETCD_RAFT_LAG_WARNING: int = 100
+  ETCD_RAFT_LAG_CRITICAL: int = 1000
 
   # Control-plane synchronization
   # The authority is used only for the first topology-layout snapshot. After
