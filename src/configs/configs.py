@@ -3,6 +3,19 @@ from typing import Optional
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
+# The Etcd operations view checks the complete control-plane cluster by
+# default. Deployments can still replace this with ETCD_ENDPOINTS when their
+# topology differs, but an explicitly blank environment variable must not
+# silently reduce the view to one local endpoint.
+DEFAULT_ETCD_ENDPOINTS = (
+  "http://10.41.102.223:2379",
+  "http://10.32.129.241:2379",
+  "http://10.17.158.115:2379",
+  "http://10.8.136.107:2379",
+  "http://10.31.133.207:2379",
+)
+
 def create_file_path(file_path: str) -> bool:
   """
   创建路径
@@ -90,7 +103,7 @@ class Settings(BaseSettings):
   # Read-only operations checks the complete five-member control-plane cluster.
   # Deployments may override this with a comma-separated endpoint list; the
   # default keeps production and fresh installs from silently showing 1 / 1.
-  ETCD_ENDPOINTS: str = "http://10.41.102.223:2379,http://10.32.129.241:2379,http://10.17.158.115:2379,http://10.8.136.107:2379,http://10.31.133.207:2379"
+  ETCD_ENDPOINTS: str = ",".join(DEFAULT_ETCD_ENDPOINTS)
   ETCD_USERNAME: str = "admin"
   ETCD_PASSWORD: str = "passwd"
   ETCD_HEALTH_TIMEOUT_SECONDS: float = 3.0

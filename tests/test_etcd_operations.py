@@ -2,6 +2,7 @@
 import pytest
 
 from src.api import register_api
+from src.configs.configs import DEFAULT_ETCD_ENDPOINTS
 from src.modules.etcd import service
 
 
@@ -12,6 +13,13 @@ def test_etcd_routes_are_registered_for_both_versions():
   paths = {route.path for route in app.routes}
   assert "/api/v1/storage/operations/etcd" in paths
   assert "/api/v2/storage/operations/etcd" in paths
+
+
+def test_blank_endpoint_setting_uses_complete_default_cluster(monkeypatch):
+  monkeypatch.setattr(service.settings, "ETCD_ENDPOINTS", "")
+  endpoints = service._endpoint_list()
+  assert len(endpoints) == len(DEFAULT_ETCD_ENDPOINTS) == 5
+  assert [f"http://{host}:{port}" for _, host, port in endpoints] == list(DEFAULT_ETCD_ENDPOINTS)
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 import aetcd
 
-from src.configs.configs import settings
+from src.configs.configs import DEFAULT_ETCD_ENDPOINTS, settings
 from src.core import metrics
 from src.modules.etcd import schema
 from src.utils.logger import logger
@@ -44,11 +44,14 @@ def _as_int(value: Any) -> int:
 
 
 def _endpoint_list() -> list[tuple[str, str, int]]:
-  """Return configured endpoints, with legacy single-host fallback."""
+  """Return configured endpoints, preserving the complete default cluster."""
   raw = str(getattr(settings, "ETCD_ENDPOINTS", "") or "")
   values = [item.strip() for item in raw.split(",") if item.strip()]
   if not values:
-    values = [f"http://{settings.ETCD_HOST}:{settings.ETCD_PORT}"]
+    # Some production env files contain ETCD_ENDPOINTS= explicitly. Treat
+    # that as "use the standard cluster", not as a request to check only the
+    # legacy local endpoint; custom non-empty values still take precedence.
+    values = list(DEFAULT_ETCD_ENDPOINTS)
 
   result: list[tuple[str, str, int]] = []
   for index, value in enumerate(values, start=1):
