@@ -87,8 +87,10 @@ class Settings(BaseSettings):
   # Etcd
   ETCD_HOST: str = "localhost"
   ETCD_PORT: int = 2379
-  # Optional comma-separated endpoints for the read-only operations view.
-  ETCD_ENDPOINTS: str = ""
+  # Read-only operations checks the complete five-member control-plane cluster.
+  # Deployments may override this with a comma-separated endpoint list; the
+  # default keeps production and fresh installs from silently showing 1 / 1.
+  ETCD_ENDPOINTS: str = "http://10.41.102.223:2379,http://10.32.129.241:2379,http://10.17.158.115:2379,http://10.8.136.107:2379,http://10.31.133.207:2379"
   ETCD_USERNAME: str = "admin"
   ETCD_PASSWORD: str = "passwd"
   ETCD_HEALTH_TIMEOUT_SECONDS: float = 3.0
