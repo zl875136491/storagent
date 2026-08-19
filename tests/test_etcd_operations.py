@@ -14,6 +14,23 @@ def test_etcd_routes_are_registered_for_both_versions():
   assert "/api/v1/storage/operations/etcd" in paths
   assert "/api/v2/storage/operations/etcd" in paths
 
+  maintenance_suffixes = (
+    "/trend",
+    "/keyspace",
+    "/revision-options",
+    "/events",
+    "/tasks",
+    "/tasks/{task_id}",
+    "/compact",
+    "/defrag",
+    "/alarm-disarm",
+    "/snapshot",
+    "/restore",
+  )
+  for prefix in ("/api/v1/storage/operations/etcd", "/api/v2/storage/operations/etcd"):
+    for suffix in maintenance_suffixes:
+      assert f"{prefix}{suffix}" in paths
+
 
 def test_blank_endpoint_setting_uses_complete_default_cluster(monkeypatch):
   monkeypatch.setattr(service.settings, "ETCD_ENDPOINTS", "")

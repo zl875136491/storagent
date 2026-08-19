@@ -7,7 +7,11 @@ status endpoint; it never exposes etcd key/value data or changes membership.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
+import os
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -18,6 +22,8 @@ from src.configs.configs import DEFAULT_ETCD_ENDPOINTS, settings
 from src.core import metrics
 from src.modules.etcd import schema
 from src.utils.logger import logger
+from src.utils.helpers import utc_now
+from src.modules.storage.model import EtcdOperationEvent, EtcdOperationTask
 
 
 _cache_lock = asyncio.Lock()
@@ -48,9 +54,9 @@ def _endpoint_list() -> list[tuple[str, str, int]]:
   raw = str(getattr(settings, "ETCD_ENDPOINTS", "") or "")
   values = [item.strip() for item in raw.split(",") if item.strip()]
   if not values:
-    # Some production env files contain ETCD_ENDPOINTS= explicitly. Treat
-    # that as "use the standard cluster", not as a request to check only the
-    # legacy local endpoint; custom non-empty values still take precedence.
+    # Some deployments contain ETCD_ENDPOINTS= explicitly. Treat that as a
+    # request for the standard cluster rather than silently checking only a
+    # legacy local endpoint; non-empty custom values still take precedence.
     values = list(DEFAULT_ETCD_ENDPOINTS)
 
   result: list[tuple[str, str, int]] = []
@@ -70,6 +76,9 @@ def _status_fields(status: Any) -> dict[str, Any]:
     member_id = _value(header, "member_id", "memberId", default="")
   leader = _value(status, "leader", "leader_id", "leaderId", default=None)
   leader_id = _value(leader, "id", "member_id", "memberId", default=leader)
+  revision = _as_int(_value(header, "revision", "Revision", default=0))
+  if not revision:
+    revision = _as_int(_value(status, "revision", "Revision", default=0))
   return {
     "version": str(_value(status, "version", "server_version", default="") or ""),
     "member_id": str(member_id or ""),
@@ -78,7 +87,19 @@ def _status_fields(status: Any) -> dict[str, Any]:
     "raft_index": _as_int(_value(status, "raft_index", "raftIndex", default=0)),
     "raft_applied_index": _as_int(_value(status, "raft_applied_index", "raftAppliedIndex", default=0)),
     "db_size_bytes": _as_int(_value(status, "db_size", "dbSize", default=0)),
+    "revision": revision,
   }
+
+
+async def _store_revision(client: Any) -> int:
+  """Read the MVCC revision from a range header.
+
+  aetcd's Status object exposes raft fields but not the v3 response header;
+  the range header is the authoritative revision used by compaction choices.
+  """
+  result = await client.get_range(b"/storagent/", b"/storagent/" + b"\xff")
+  header = _value(result, "header", default=None)
+  return _as_int(_value(header, "revision", "Revision", default=0))
 
 
 async def _check_endpoint(name: str, host: str, port: int) -> schema.EtcdEndpointStatus:
@@ -86,14 +107,11 @@ async def _check_endpoint(name: str, host: str, port: int) -> schema.EtcdEndpoin
   started = time.perf_counter()
   client = None
   try:
-    client = aetcd.Client(
-      host=host,
-      port=port,
-      username=settings.ETCD_USERNAME,
-      password=settings.ETCD_PASSWORD,
-    )
+    client = _make_client(host, port)
     status = await asyncio.wait_for(client.status(), timeout=max(float(settings.ETCD_HEALTH_TIMEOUT_SECONDS), 0.5))
     fields = _status_fields(status)
+    if not fields["revision"]:
+      fields["revision"] = await _store_revision(client)
     applied_index = _value(status, "raft_applied_index", "raftAppliedIndex", default=None)
     members = []
     async for member in client.members():
@@ -231,6 +249,7 @@ async def get_status(*, force_refresh: bool = False) -> schema.EtcdClusterStatus
       leader_endpoint=leader_endpoint,
       versions=versions,
       database_size_bytes=sum(item.db_size_bytes for item in reachable),
+      revision=max((item.revision for item in reachable), default=0),
       alarms=list(dict.fromkeys(alarm for item in reachable for alarm in item.alarms)),
       members=members,
       sync=sync,
@@ -239,7 +258,281 @@ async def get_status(*, force_refresh: bool = False) -> schema.EtcdClusterStatus
     )
     _cached_snapshot = snapshot
     _cached_at = time.monotonic()
+    await _record(
+      "status",
+      "succeeded",
+      "system",
+      detail={
+        "status": snapshot.status,
+        "checked_at": snapshot.checked_at,
+        "reachable_endpoint_count": snapshot.reachable_endpoint_count,
+        "configured_endpoint_count": snapshot.configured_endpoint_count,
+        "database_size_bytes": snapshot.database_size_bytes,
+        "quorum": snapshot.quorum,
+        "alarms": snapshot.alarms,
+        "revision": snapshot.revision,
+        "leader_endpoint": snapshot.leader_endpoint,
+        "average_latency_ms": round(sum(item.latency_ms for item in reachable) / len(reachable), 2) if reachable else 0,
+        "max_raft_lag": max((item.raft_lag for item in reachable), default=0),
+      },
+    )
     return snapshot
+
+
+async def _record(kind: str, status: str, actor: str, *, endpoint: str = "", revision: int = 0, detail: dict | None = None):
+  created_at = utc_now()
+  try:
+    event = EtcdOperationEvent(
+      kind=kind,
+      status=status,
+      actor=actor,
+      endpoint=endpoint,
+      revision=revision,
+      detail=detail or {},
+      created_at=created_at,
+    )
+    await event.insert()
+  except Exception as error:
+    logger.warning("Etcd 运维事件落库失败: %s", error)
+    # Status checks and unit tests may run before Beanie collections are
+    # initialized. Keep the API response usable even when persistence is not.
+    from types import SimpleNamespace
+    return SimpleNamespace(created_at=created_at)
+  return event
+
+
+async def _client(host: str, port: int):
+  return _make_client(host, port)
+
+
+def _make_client(host: str, port: int):
+  """Create an authenticated client only when credentials are configured.
+
+  The isolated test Etcd cluster intentionally has authentication disabled;
+  passing empty credentials through aetcd can still trigger an auth request.
+  """
+  kwargs: dict[str, Any] = {"host": host, "port": port}
+  username = str(getattr(settings, "ETCD_USERNAME", "") or "")
+  password = str(getattr(settings, "ETCD_PASSWORD", "") or "")
+  if username or password:
+    kwargs.update(username=username, password=password)
+  return aetcd.Client(**kwargs)
+
+
+async def _first_endpoint():
+  endpoints = _endpoint_list()
+  if not endpoints:
+    raise RuntimeError("没有配置 Etcd 端点")
+  name, host, port = endpoints[0]
+  return name, host, port
+
+
+async def keyspace(actor: str = "system") -> schema.EtcdOperationResponse:
+  name, host, port = await _first_endpoint()
+  client = await _client(host, port)
+  created = utc_now()
+  try:
+    prefix = b"/storagent/"
+    end = prefix + b"\xff"
+    result = await client.get_range(prefix, end)
+    sizes = [len(item.key) + len(item.value) for item in result.kvs]
+    detail = {"endpoint": f"{host}:{port}", "key_count": len(result.kvs), "bytes": sum(sizes), "revision": int(getattr(result.header, "revision", 0) or 0)}
+    await _record("keyspace", "succeeded", actor, endpoint=name, revision=detail["revision"], detail=detail)
+    return schema.EtcdOperationResponse(kind="keyspace", status="succeeded", message="Key 空间检查完成", detail=detail, created_at=created)
+  finally:
+    await client.close()
+
+
+async def compact(revision: int, actor: str, physical: bool = True) -> schema.EtcdOperationResponse:
+  name, host, port = await _first_endpoint()
+  created = utc_now()
+  client = await _client(host, port)
+  try:
+    await client.compact(revision, physical=physical)
+    detail = {"revision": revision, "physical": physical}
+    await _record("compact", "succeeded", actor, endpoint=name, revision=revision, detail=detail)
+    from src.core import audit
+    audit.audit("etcd.compact", actor=actor, resource=name, detail=detail)
+    return schema.EtcdOperationResponse(kind="compact", status="succeeded", message="Etcd 压缩完成", detail=detail, created_at=created)
+  except Exception as error:
+    await _record("compact", "failed", actor, endpoint=name, revision=revision, detail={"error": str(error)})
+    raise
+  finally:
+    await client.close()
+
+
+async def defrag(actor: str) -> schema.EtcdOperationResponse:
+  created = utc_now()
+  results = []
+  for name, host, port in _endpoint_list():
+    client = await _client(host, port)
+    try:
+      await client.defragment()
+      results.append({"endpoint": name, "status": "succeeded"})
+    except Exception as error:
+      results.append({"endpoint": name, "status": "failed", "error": str(error)})
+    finally:
+      await client.close()
+  failed = [item for item in results if item["status"] == "failed"]
+  status = "failed" if len(failed) == len(results) else "succeeded"
+  detail = {"members": results}
+  await _record("defrag", status, actor, detail=detail)
+  from src.core import audit
+  audit.audit("etcd.defrag", actor=actor, resource="cluster", detail=detail, success=not failed)
+  return schema.EtcdOperationResponse(kind="defrag", status=status, message="Etcd 碎片整理完成" if not failed else "部分 Etcd 节点碎片整理失败", detail=detail, created_at=created)
+
+
+async def disarm_alarm(actor: str) -> schema.EtcdOperationResponse:
+  created = utc_now(); results = []
+  for name, host, port in _endpoint_list():
+    client = await _client(host, port)
+    try:
+      alarms = await client.disarm_alarm()
+      results.append({"endpoint": name, "cleared": len(alarms)})
+    except Exception as error:
+      results.append({"endpoint": name, "error": str(error)})
+    finally:
+      await client.close()
+  detail = {"members": results}
+  await _record("alarm_disarm", "succeeded", actor, detail=detail)
+  from src.core import audit
+  audit.audit("etcd.alarm_disarm", actor=actor, resource="cluster", detail=detail)
+  return schema.EtcdOperationResponse(kind="alarm_disarm", status="succeeded", message="Etcd 活动告警解除请求已完成", detail=detail, created_at=created)
+
+
+async def snapshot(actor: str) -> tuple[bytes, dict]:
+  """Export one consistent Etcd snapshot without exposing credentials."""
+  name, host, port = await _first_endpoint()
+  client = await _client(host, port)
+  created = utc_now()
+  buffer = io.BytesIO()
+  try:
+    await client.snapshot(buffer)
+    payload = buffer.getvalue()
+    digest = hashlib.sha256(payload).hexdigest()
+    detail = {"endpoint": name, "size_bytes": len(payload), "sha256": digest}
+    await _record("snapshot", "succeeded", actor, endpoint=name, detail=detail)
+    from src.core import audit
+    audit.audit("etcd.snapshot", actor=actor, resource=name, detail=detail)
+    return payload, {**detail, "created_at": created}
+  except Exception as error:
+    await _record("snapshot", "failed", actor, endpoint=name, detail={"error": str(error)})
+    raise
+  finally:
+    await client.close()
+
+
+async def stage_restore(payload: bytes, filename: str, actor: str) -> schema.EtcdOperationResponse:
+  """Stage and verify a snapshot for an offline restore window.
+
+  Replacing a live Etcd data directory online is unsafe. This endpoint stores
+  the verified artifact and audit record; an operator must stop Etcd and use
+  the recorded file during a maintenance window.
+  """
+  max_bytes = max(int(getattr(settings, "ETCD_SNAPSHOT_MAX_BYTES", 1024 ** 3)), 1)
+  if not payload or len(payload) > max_bytes:
+    raise ValueError("快照文件为空或超过允许大小")
+  root = str(getattr(settings, "ETCD_SNAPSHOT_DIR", "/var/lib/storagent/etcd-snapshots"))
+  os.makedirs(root, exist_ok=True)
+  digest = hashlib.sha256(payload).hexdigest()
+  safe_name = f"restore-{utc_now().strftime('%Y%m%d%H%M%S')}-{digest[:16]}.db"
+  path = os.path.join(root, safe_name)
+  with open(path, "wb") as handle:
+    handle.write(payload)
+  detail = {"filename": filename[:200], "path": path, "size_bytes": len(payload), "sha256": digest, "mode": "staged_offline_restore"}
+  event = await _record("restore", "staged", actor, detail=detail)
+  from src.core import audit
+  audit.audit("etcd.restore.stage", actor=actor, resource=safe_name, detail=detail)
+  return schema.EtcdOperationResponse(kind="restore", status="staged", message="快照已校验并登记，需在 Etcd 停机维护窗口执行恢复", detail=detail, created_at=event.created_at)
+
+
+async def trend(limit: int = 100) -> schema.EtcdTrendResponse:
+  rows = await EtcdOperationEvent.find(EtcdOperationEvent.kind == "status").sort(-EtcdOperationEvent.created_at).limit(limit).to_list()
+  return schema.EtcdTrendResponse(data=[schema.EtcdTrendPoint(**row.detail) for row in reversed(rows) if isinstance(row.detail, dict) and "status" in row.detail])
+
+
+async def events(limit: int = 50) -> schema.EtcdEventListResponse:
+  rows = await EtcdOperationEvent.find().sort(-EtcdOperationEvent.created_at).limit(limit).to_list()
+  return schema.EtcdEventListResponse(data=[schema.EtcdEventItem(
+    kind=row.kind, status=row.status, actor=row.actor, endpoint=row.endpoint,
+    revision=row.revision, detail=row.detail, created_at=row.created_at,
+  ) for row in rows])
+
+
+async def revision_options() -> schema.EtcdRevisionOptionsResponse:
+  """Read the current revision and offer conservative retention points."""
+  _, host, port = await _first_endpoint()
+  client = await _client(host, port)
+  try:
+    status = await client.status()
+    header = _value(status, "header", default=None)
+    current = _as_int(_value(header, "revision", "Revision", default=0))
+    if not current:
+      current = _as_int(_value(status, "revision", "Revision", default=0))
+    if not current:
+      current = await _store_revision(client)
+    candidates = sorted({max(current - offset, 1) for offset in (0, 100, 500, 1000, 5000) if current}, reverse=True)
+    return schema.EtcdRevisionOptionsResponse(
+      current_revision=current,
+      options=[schema.EtcdRevisionOption(revision=item, label=("当前 revision" if item == current else "保留至 revision " + str(item))) for item in candidates],
+    )
+  finally:
+    await client.close()
+
+
+def _task_response(task: EtcdOperationTask) -> schema.EtcdTaskResponse:
+  return schema.EtcdTaskResponse(
+    id=str(task.id), kind=task.kind, status=task.status, actor=task.actor, message=task.message,
+    result=task.result, error=task.error, created_at=task.created_at,
+    started_at=task.started_at, finished_at=task.finished_at,
+  )
+
+
+async def _execute_task(task_id: str, actor: str, revision: int | None) -> None:
+  task = await EtcdOperationTask.get(task_id)
+  if task is None:
+    return
+  task.status = "running"
+  task.started_at = utc_now()
+  await task.save()
+  try:
+    if task.kind == "keyspace":
+      result = await keyspace(actor)
+    elif task.kind == "compact":
+      if revision is None:
+        raise ValueError("压缩任务缺少 revision")
+      result = await compact(revision, actor)
+    elif task.kind == "defrag":
+      result = await defrag(actor)
+    else:
+      result = await disarm_alarm(actor)
+    task.status = "succeeded"
+    task.message = result.message
+    task.result = {"kind": result.kind, "status": result.status, "detail": result.detail}
+  except Exception as error:
+    task.status = "failed"
+    task.error = str(error)
+    task.message = "Etcd 运维任务执行失败"
+  task.finished_at = utc_now()
+  await task.save()
+
+
+async def create_task(kind: str, actor: str, revision: int | None = None) -> schema.EtcdTaskResponse:
+  task = EtcdOperationTask(kind=kind, actor=actor, message="任务已排队")
+  await task.insert()
+  asyncio.create_task(_execute_task(str(task.id), actor, revision))
+  return _task_response(task)
+
+
+async def get_task(task_id: str) -> schema.EtcdTaskResponse | None:
+  task = await EtcdOperationTask.get(task_id)
+  return _task_response(task) if task else None
+
+
+async def tasks(limit: int = 50) -> schema.EtcdTaskListResponse:
+  """Return recent persisted maintenance tasks for the operations history."""
+  rows = await EtcdOperationTask.find().sort(-EtcdOperationTask.created_at).limit(limit).to_list()
+  return schema.EtcdTaskListResponse(data=[_task_response(row) for row in rows])
 
 
 def clear_cache() -> None:

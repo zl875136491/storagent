@@ -37,6 +37,8 @@ from ..modules.storage.model import (
   ServerFileDetailsCache,
   StorageOperation,
   RegionCapacitySnapshot,
+  EtcdOperationEvent,
+  EtcdOperationTask,
 )
 
 from ..modules.graph.model import (
@@ -59,6 +61,8 @@ document_models = [
   MinioBucket,
   ServerFileDetailsCache,
   StorageOperation,
+  EtcdOperationEvent,
+  EtcdOperationTask,
   BucketNodePosition,
   BucketEdgePosition,
   ObjectCatalog,
@@ -106,6 +110,8 @@ async def init_db():
     ServerFileDetailsCache,
     StorageOperation,
     RegionCapacitySnapshot,
+    EtcdOperationEvent,
+    EtcdOperationTask,
     BucketNodePosition,
     BucketEdgePosition,
     ObjectCatalog,

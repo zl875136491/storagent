@@ -110,6 +110,8 @@ class Settings(BaseSettings):
   ETCD_HEALTH_CACHE_TTL_SECONDS: float = 30.0
   ETCD_RAFT_LAG_WARNING: int = 100
   ETCD_RAFT_LAG_CRITICAL: int = 1000
+  ETCD_SNAPSHOT_DIR: str = "/tmp/storagent-etcd-snapshots"
+  ETCD_SNAPSHOT_MAX_BYTES: int = 1024 ** 3
 
   # Control-plane synchronization
   # The authority is used only for the first topology-layout snapshot. After

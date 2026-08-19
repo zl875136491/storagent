@@ -138,3 +138,35 @@ class RegionCapacitySnapshot(Document):
       IndexModel([("captured_at", -1)]),
     ]
   
+
+
+class EtcdOperationEvent(Document):
+  """Audited Etcd maintenance action and its bounded result."""
+  kind: Literal["status", "snapshot", "restore", "compact", "defrag", "keyspace", "alarm_disarm"]
+  status: Literal["started", "succeeded", "failed", "staged"]
+  actor: str = "-"
+  endpoint: str = ""
+  revision: int = 0
+  detail: dict[str, Any] = Field(default_factory=dict)
+  created_at: datetime = Field(default_factory=utc_now)
+
+  class Settings:
+    name = "etcd_operation_event"
+    indexes = [IndexModel(["created_at"], unique=False)]
+
+
+class EtcdOperationTask(Document):
+  """Persistent state for an Etcd maintenance task shown in the UI."""
+  kind: Literal["keyspace", "compact", "defrag", "alarm-disarm"]
+  status: Literal["queued", "running", "succeeded", "failed"] = "queued"
+  actor: str = "-"
+  message: str = ""
+  result: dict[str, Any] = Field(default_factory=dict)
+  error: str = ""
+  created_at: datetime = Field(default_factory=utc_now)
+  started_at: datetime | None = None
+  finished_at: datetime | None = None
+
+  class Settings:
+    name = "etcd_operation_task"
+    indexes = [IndexModel(["created_at"], unique=False), IndexModel(["status", "created_at"])]

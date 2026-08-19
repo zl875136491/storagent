@@ -2,7 +2,7 @@ import aetcd
 import asyncio
 import time
 from copy import deepcopy
-from typing import Callable
+from typing import Any, Callable
 from loguru import logger
 from src.configs.configs import settings
 from fastapi import Request
@@ -28,13 +28,12 @@ async def get_etcd_client() -> aetcd.Client:
   """
   获取 Etcd 客户端
   """
-  client = aetcd.Client(
-    host=settings.ETCD_HOST,
-    port=settings.ETCD_PORT,
-    username=settings.ETCD_USERNAME,
-    password=settings.ETCD_PASSWORD
-  )
-  return client
+  options: dict[str, Any] = {"host": settings.ETCD_HOST, "port": settings.ETCD_PORT}
+  username = str(getattr(settings, "ETCD_USERNAME", "") or "")
+  password = str(getattr(settings, "ETCD_PASSWORD", "") or "")
+  if username or password:
+    options.update(username=username, password=password)
+  return aetcd.Client(**options)
 
 
 async def _handle_etcd_put(key: str, value: str):
