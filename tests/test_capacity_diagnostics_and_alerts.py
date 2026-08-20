@@ -1,5 +1,6 @@
 """Focused contract tests for quota alerts, capacity planning and diagnostics."""
 from fastapi import FastAPI
+import pytest
 
 from src.api import register_api
 from src.modules.diagnostics import service as diagnostics_service
@@ -48,6 +49,86 @@ def test_diagnostic_script_normalizes_region_shorthand_before_dns_and_curl():
   assert "stty -echo" in script
   assert "APIKey（输入时不显示）" in script
   assert "API_KEY=\"$(trim \"$(ask" not in script
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_skips_non_authority(monkeypatch):
+  from src.modules.capacity import service
+
+  async def should_not_run():
+    raise AssertionError("non-authority must not collect capacity snapshots")
+
+  monkeypatch.setattr(service.settings, "REGION", "shanghai")
+  monkeypatch.setattr(service.settings, "SYNC_AUTHORITY_REGION", "beijing")
+  monkeypatch.setattr(service.operations, "get_cluster_health_overview", should_not_run)
+  await service.collect_snapshot()
+
+
+@pytest.mark.asyncio
+async def test_get_planning_reads_etcd_on_non_authority(monkeypatch):
+  from src.modules.capacity import service
+
+  published = {
+    "generated_at": "2026-08-20T08:00:00+00:00",
+    "authority_region": "beijing",
+    "data": [{
+      "region": "beijing",
+      "shown_name": "北京",
+      "raw_capacity_bytes": 100,
+      "raw_used_bytes": 40,
+      "logical_usage_bytes": 20,
+      "object_count": 3,
+      "archive_bytes": 1,
+      "archived_object_count": 1,
+      "expected_replica_count": 4,
+      "actual_replica_count": 4,
+      "waterline_percent": 40.0,
+      "daily_growth_bytes": 0,
+      "risks": [],
+      "trend": [],
+    }],
+  }
+  pushed = {}
+
+  async def pull(key, client=None):
+    assert key == service.ETCD_KEY_CAPACITY_PLANNING
+    return published
+
+  async def should_not_push(*_args, **_kwargs):
+    pushed["called"] = True
+    raise AssertionError("non-authority must not overwrite shared planning")
+
+  monkeypatch.setattr(service.settings, "REGION", "shanghai")
+  monkeypatch.setattr(service.settings, "SYNC_AUTHORITY_REGION", "beijing")
+  monkeypatch.setattr("src.core.etcd_op.pull_from_etcd_by_key", pull)
+  monkeypatch.setattr("src.core.etcd_op.push_to_etcd", should_not_push)
+  result = await service.get_planning()
+  assert result["data"][0]["region"] == "beijing"
+  assert "called" not in pushed
+
+
+@pytest.mark.asyncio
+async def test_get_planning_publishes_from_authority(monkeypatch):
+  from src.modules.capacity import service
+
+  captured = {}
+
+  async def compute():
+    return {"generated_at": "2026-08-20T08:00:00+00:00", "data": []}
+
+  async def push(key, value, client=None):
+    captured["key"] = key
+    captured["value"] = value
+
+  monkeypatch.setattr(service.settings, "REGION", "beijing")
+  monkeypatch.setattr(service.settings, "SYNC_AUTHORITY_REGION", "beijing")
+  monkeypatch.setattr(service, "_compute_planning", compute)
+  monkeypatch.setattr("src.core.etcd_op.push_to_etcd", push)
+  result = await service.get_planning()
+  assert result["data"] == []
+  assert captured["key"] == service.ETCD_KEY_CAPACITY_PLANNING
+  assert captured["value"]["authority_region"] == "beijing"
+  assert captured["value"]["data"] == []
 
 
 def test_alert_level_uses_ordered_thresholds():

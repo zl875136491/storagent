@@ -21,6 +21,7 @@ def test_watch_ignores_runtime_lock_and_quota_keys():
   assert etcd_op._is_runtime_etcd_key("/storagent/locks/quota/application/demo")
   assert etcd_op._is_runtime_etcd_key("/storagent/quota/apps/demo")
   assert etcd_op._is_runtime_etcd_key("/storagent/quota/uploads/demo/object")
+  assert etcd_op._is_runtime_etcd_key("/storagent/capacity_planning")
   assert not etcd_op._is_runtime_etcd_key("/storagent/applications")
 
 

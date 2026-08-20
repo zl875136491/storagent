@@ -31,3 +31,9 @@ async def test_audit_query_rejects_invalid_time_range():
 
   with pytest.raises(ValueError, match="最多查询"):
     await service.list_events(start_at=now - timedelta(days=366), end_at=now)
+
+
+def test_audit_action_options_use_code_and_label():
+  option = service.action_label("api_key.create")
+  assert option == "创建 APIKey"
+  assert service.action_label("unknown.action") == "unknown.action"

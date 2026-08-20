@@ -8,6 +8,7 @@ class AuditEventItem(BaseModel):
 
   id: str
   action: str
+  action_label: str = ""
   actor: str
   resource: str
   success: bool
@@ -24,7 +25,12 @@ class AuditEventListResponse(BaseModel):
   has_more: bool
 
 
+class AuditActionOption(BaseModel):
+  code: str
+  label: str
+
+
 class AuditEventOptionsResponse(BaseModel):
-  actions: list[str]
+  actions: list[AuditActionOption]
   actors: list[str]
   regions: list[str]

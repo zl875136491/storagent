@@ -2,23 +2,57 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
 
 from src.configs.configs import settings
+from src.modules.capacity import schema
 from src.modules.files.model import ObjectCatalog
 from src.modules.storage import operations
 from src.modules.storage.model import RegionCapacitySnapshot
 from src.utils.helpers import utc_now
 from src.utils.logger import logger
 
+ETCD_KEY_CAPACITY_PLANNING = "capacity_planning"
+
 
 def _day(value) -> str:
   return value.astimezone().strftime("%Y-%m-%d") if value.tzinfo else value.strftime("%Y-%m-%d")
 
 
+def _is_authority() -> bool:
+  return settings.REGION == settings.SYNC_AUTHORITY_REGION
+
+
+def _planning_payload(planning: dict) -> dict:
+  payload = schema.CapacityPlanningResponse.model_validate(planning).model_dump(mode="json")
+  payload["authority_region"] = settings.SYNC_AUTHORITY_REGION
+  return payload
+
+
+async def _publish_planning(planning: dict) -> None:
+  from src.core import etcd_op
+
+  await etcd_op.push_to_etcd(ETCD_KEY_CAPACITY_PLANNING, _planning_payload(planning))
+
+
+async def _load_published() -> dict | None:
+  try:
+    from src.core import etcd_op
+
+    payload = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_CAPACITY_PLANNING)
+  except Exception as error:
+    logger.warning("读取 Etcd 容量规划失败: %s", error)
+    return None
+  if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+    return None
+  return {
+    "generated_at": payload.get("generated_at") or utc_now(),
+    "data": payload.get("data") or [],
+  }
+
+
 async def collect_snapshot() -> None:
   """Persist one per-region sample. Only the authority performs shared collection."""
-  if settings.REGION != settings.SYNC_AUTHORITY_REGION:
+  if not _is_authority():
     return
   overview, replication = await asyncio.gather(
     operations.get_cluster_health_overview(),
@@ -67,6 +101,10 @@ async def collect_snapshot() -> None:
       await existing.save()
     else:
       await row.insert()
+  try:
+    await _publish_planning(await _compute_planning())
+  except Exception as error:
+    logger.warning("容量规划发布到 Etcd 失败: %s", error)
 
 
 async def capacity_snapshot_task() -> None:
@@ -96,7 +134,7 @@ def _days_to(capacity: int, used: int, daily_growth: float, target: float) -> in
   return 0 if remaining <= 0 else int(remaining / daily_growth)
 
 
-async def get_planning() -> dict:
+async def _compute_planning() -> dict:
   rows = await RegionCapacitySnapshot.find_all().sort("+region", "+captured_at").to_list()
   grouped: dict[str, list[RegionCapacitySnapshot]] = {}
   for row in rows:
@@ -128,3 +166,18 @@ async def get_planning() -> dict:
       "trend": [{"captured_at": item.captured_at, "raw_capacity_bytes": item.raw_capacity_bytes, "raw_used_bytes": item.raw_used_bytes, "logical_usage_bytes": item.logical_usage_bytes, "object_count": item.object_count, "archive_bytes": item.archive_bytes} for item in samples],
     })
   return {"generated_at": utc_now(), "data": data}
+
+
+async def get_planning() -> dict:
+  """Serve the shared planning view. Authority computes; every region reads Etcd."""
+  if _is_authority():
+    planning = await _compute_planning()
+    try:
+      await _publish_planning(planning)
+    except Exception as error:
+      logger.warning("容量规划发布到 Etcd 失败: %s", error)
+    return planning
+  published = await _load_published()
+  if published:
+    return published
+  return {"generated_at": utc_now(), "data": []}
