@@ -225,6 +225,25 @@ async def test_create_application_same_shown_name_is_claimed_once(monkeypatch):
   assert next(iter(entries.values()))["shown_name"] == "shared application"
 
 
+@pytest.mark.asyncio
+async def test_create_application_writes_normalized_domains(monkeypatch):
+  state = _EtcdState()
+  _patch_application_creation(monkeypatch, state)
+  alice = SimpleNamespace(username="alice", name="Alice")
+
+  await public_service.create_application(
+    "demo-app",
+    "demo application",
+    "created with origins",
+    alice,
+    domains=["https://app.example.com/", "https://app.example.com"],
+  )
+
+  entries = _application_entries(state)
+  assert entries["demo-app"]["domains"] == ["https://app.example.com"]
+
+
+
 class _ExistingApplication:
   def __init__(self, *, author, approver=None, enabled=True):
     self.name = "authority-app"
@@ -239,6 +258,7 @@ class _ExistingApplication:
     self.author = author
     self.approver = approver
     self.updated_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    self.domains = []
     self.saved = 0
 
   async def save(self):
@@ -400,6 +420,7 @@ async def test_stale_application_publish_preserves_authoritative_owner_and_quota
     "provisioning_status": "pending",
     "quota_bytes": 200 * 1024 ** 3,
     "origin_region": "beijing",
+    "domains": ["https://etcd.example.com"],
   })
   state.revision = 1
   state.items[key] = {
@@ -418,6 +439,7 @@ async def test_stale_application_publish_preserves_authoritative_owner_and_quota
   stale.id = "local-app-id"
   stale.provisioning_status = "ready"
   stale.quota_bytes = 100 * 1024 ** 3
+  stale.domains = ["https://local.example.com"]
 
   async def get_client():
     return _FakeEtcd(state)
@@ -440,3 +462,117 @@ async def test_stale_application_publish_preserves_authoritative_owner_and_quota
   assert published["provisioning_status"] == "ready"
   assert published["author_username"] == "bob"
   assert published["quota_bytes"] == 200 * 1024 ** 3
+  assert published["domains"] == ["https://etcd.example.com"]
+
+
+def _patch_domain_writes(monkeypatch, state, app):
+  async def get_client():
+    return _FakeEtcd(state)
+
+  async def read_app(_application_id):
+    return app
+
+  async def project(_name, entry):
+    app.domains = list(entry.get("domains") or [])
+    return app, True
+
+  async def response(application, **_kwargs):
+    return {"name": application.name, "domains": list(application.domains)}
+
+  async def is_superadmin(_user):
+    return True
+
+  monkeypatch.setattr(etcd_op, "get_etcd_client", get_client)
+  monkeypatch.setattr(public_service.public_crud, "read_application_by_id", read_app)
+  monkeypatch.setattr(
+    public_service.sync_module,
+    "upsert_application_from_etcd",
+    project,
+  )
+  monkeypatch.setattr(public_service, "_application_response", response)
+  monkeypatch.setattr("src.core.auth._is_superadmin", is_superadmin)
+  monkeypatch.setattr("src.core.audit.audit", lambda *_args, **_kwargs: None)
+
+
+@pytest.mark.asyncio
+async def test_add_application_domain_upserts_missing_etcd_application(monkeypatch):
+  from src.core.cors_origins import allowlist
+
+  previous = set(allowlist._dynamic)
+  state = _EtcdState()
+  alice = SimpleNamespace(
+    id="u1",
+    username="alice",
+    name="Alice",
+    permissions=[],
+    roles=[],
+  )
+  app = _ExistingApplication(author=alice, enabled=False)
+  app.id = "id-authority-app"
+  _patch_domain_writes(monkeypatch, state, app)
+
+  try:
+    added = await public_service.add_application_domain(
+      app.id,
+      "https://legacy.example.com/",
+      alice,
+    )
+    assert added["domains"] == ["https://legacy.example.com"]
+    entry = _application_entries(state)[app.name]
+    assert entry["domains"] == ["https://legacy.example.com"]
+    assert entry["author_username"] == "alice"
+    assert entry["shown_name"] == "Authority application"
+    assert entry["quota_bytes"] == 100 * 1024 ** 3
+    assert "https://legacy.example.com" in allowlist
+  finally:
+    allowlist.replace_dynamic(previous)
+
+
+@pytest.mark.asyncio
+async def test_add_application_domain_overwrites_existing_etcd_domains(monkeypatch):
+  from src.core.cors_origins import allowlist
+
+  previous = set(allowlist._dynamic)
+  state = _EtcdState()
+  key = f"{etcd_op.ETCD_PREFIX}{sync_module.ETCD_KEY_APPLICATIONS}".encode()
+  authoritative = _authoritative_entry(approver_username="")
+  authoritative.update({
+    "domains": ["https://a.example.com"],
+    "quota_bytes": 200 * 1024 ** 3,
+    "origin_region": "beijing",
+  })
+  state.revision = 1
+  state.items[key] = {
+    "value": json.dumps({"authority-app": authoritative}).encode(),
+    "create_revision": 1,
+    "mod_revision": 1,
+  }
+
+  alice = SimpleNamespace(
+    id="u1",
+    username="alice",
+    name="Alice",
+    permissions=[],
+    roles=[],
+  )
+  app = _ExistingApplication(author=alice, enabled=False)
+  app.id = "id-authority-app"
+  app.domains = ["https://stale.example.com"]
+  _patch_domain_writes(monkeypatch, state, app)
+
+  try:
+    added = await public_service.add_application_domain(
+      app.id,
+      "https://b.example.com/",
+      alice,
+    )
+    assert added["domains"] == ["https://a.example.com", "https://b.example.com"]
+    entry = _application_entries(state)[app.name]
+    assert entry["domains"] == ["https://a.example.com", "https://b.example.com"]
+    assert entry["quota_bytes"] == 200 * 1024 ** 3
+    assert entry["author_username"] == "bob"
+    assert "https://a.example.com" in allowlist
+    assert "https://b.example.com" in allowlist
+    assert "https://stale.example.com" not in allowlist
+  finally:
+    allowlist.replace_dynamic(previous)

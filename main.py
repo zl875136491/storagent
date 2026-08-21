@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from starlette.middleware.cors import CORSMiddleware
-from urllib.parse import urlparse
 
 from src.api import register_api
 from src.core.database import init_db, close_db
@@ -10,6 +9,7 @@ from src.utils.logger import setup_logging
 from src.core.initialization import init_project, init_service
 from src.core.etcd_op import get_etcd_client, reconcile_etcd_task, watch_etcd_task
 from src.core.sync import reconcile_replication_policies_task
+from src.core.cors_origins import allowlist, load_allowlist_from_mongo
 from src.core.exception import register_exception
 from src.core.middleware import RequestContextMiddleware, UploadBodyLimitMiddleware
 from src.modules.auth.crud import cleanup_expired_tokens_task
@@ -49,6 +49,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
       from src.utils.logger import logger
       logger.warning(f"init_service 失败（服务仍可启动）: {e}")
+
+  try:
+    await load_allowlist_from_mongo()
+  except Exception as e:
+    from src.utils.logger import logger
+    logger.warning(f"加载应用来源白名单失败: {e}")
   
   # 5. Etcd 监听
   etcd_client = await get_etcd_client()
@@ -108,15 +114,9 @@ def create_app() -> FastAPI:
   app.add_middleware(RequestContextMiddleware)
 
   if settings.BACKEND_CORS_ORIGINS:
-    cors_origins = [str(origin).rstrip("/") for origin in settings.BACKEND_CORS_ORIGINS]
-    front = settings.FRONT_URL.rstrip("/")
-    parsed_front = urlparse(front)
-    if parsed_front.scheme in ("http", "https") and parsed_front.netloc:
-      if front not in cors_origins:
-        cors_origins.append(front)
     app.add_middleware(
       CORSMiddleware,
-      allow_origins=cors_origins,
+      allow_origins=allowlist,
       allow_credentials=True,
       # 收窄为实际用到的方法/请求头（最小权限），而不是笼统的 "*"。
       # 这不会改变浏览器是否发起预检的判断（凡是非"简单请求"仍会预检），

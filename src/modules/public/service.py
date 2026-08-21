@@ -31,6 +31,13 @@ from src.modules.public.model import (
   DEFAULT_APPLICATION_QUOTA_BYTES,
 )
 from src.core import sync as sync_module
+from src.core.cors_origins import (
+  MAX_DOMAINS_PER_APP,
+  coerce_origin_list,
+  normalize_origin,
+  normalize_origin_list,
+  refresh_from_application_entries,
+)
 from src.configs.configs import settings
 
 async def get_endpoints() -> dict[str, List[str]]:
@@ -215,7 +222,8 @@ async def create_application(
   name: str,
   shown_name: str,
   description: str,
-  current_user: User) -> dict:
+  current_user: User,
+  domains: list[str] | None = None) -> dict:
   """
   创建应用
   """
@@ -226,6 +234,10 @@ async def create_application(
   #   raise CustomException(ErrorDesc.RES_NOT_FOUND, "Region.id")
   # Claim the cross-region business identity before materializing the local
   # Mongo projection. CAS retries make APPID and shown_name globally unique.
+  try:
+    normalized_domains = normalize_origin_list(domains or [])
+  except ValueError as error:
+    raise CustomException(ErrorDesc.INVALID_PARAMS, str(error)) from error
   entry = {
     "shown_name": shown_name,
     "description": description,
@@ -240,6 +252,7 @@ async def create_application(
     "enabled_at": None,
     "updated_at": utc_now().isoformat(),
     "origin_region": settings.REGION,
+    "domains": normalized_domains,
   }
   try:
     from src.core import etcd_op
@@ -260,6 +273,7 @@ async def create_application(
       sync_module.ETCD_KEY_APPLICATIONS,
       create_mutator,
     )
+    refresh_from_application_entries(applications)
     authoritative = applications[name]
   except CustomException:
     raise
@@ -304,6 +318,246 @@ async def create_application(
   from src.core import audit
   audit.audit("application.create", actor=current_user.username, resource=name)
   return await _application_response(app)
+
+
+async def _require_can_manage_application(
+  application: Application,
+  current_user: User,
+) -> None:
+  from src.core.auth import _is_superadmin
+
+  if await _is_superadmin(current_user):
+    return
+  if "application_manage" in set(getattr(current_user, "permissions", None) or []):
+    return
+  author = application.author
+  if getattr(author, "id", None) is not None and str(author.id) == str(current_user.id):
+    return
+  if getattr(author, "username", None) == current_user.username:
+    return
+  raise CustomException(
+    ErrorDesc.INSUFFICIENT_PERMISSIONS,
+    "无权管理该应用的来源或删除该应用",
+  )
+
+
+async def _load_application_domains(application: Application) -> list[str]:
+  """Etcd domains win when present; Mongo-only apps fall back to the local list."""
+  from src.core import etcd_op
+
+  try:
+    applications = await etcd_op.pull_from_etcd_by_key(
+      sync_module.ETCD_KEY_APPLICATIONS,
+    )
+  except CustomException:
+    raise
+  except Exception as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      f"读取应用跨节点配置失败: {error}",
+    ) from error
+  entry = applications.get(application.name)
+  if isinstance(entry, dict):
+    return coerce_origin_list(entry.get("domains") or [])
+  return coerce_origin_list(getattr(application, "domains", None) or [])
+
+
+async def _write_authoritative_application_domains(
+  app_name: str,
+  domains: list[str],
+  *,
+  base_entry: dict | None = None,
+) -> dict:
+  from src.core import etcd_op
+
+  updated_at = utc_now().isoformat()
+  normalized = list(domains)
+
+  def mutator(applications: dict) -> dict:
+    current = applications.get(app_name)
+    if not isinstance(current, dict):
+      if not isinstance(base_entry, dict):
+        raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
+      current = dict(base_entry)
+      applications[app_name] = current
+    current["domains"] = normalized
+    current["updated_at"] = updated_at
+    return applications
+
+  applications = await etcd_op.merge_update_etcd_key(
+    sync_module.ETCD_KEY_APPLICATIONS,
+    mutator,
+  )
+  refresh_from_application_entries(applications)
+  return dict(applications[app_name])
+
+
+async def _project_authoritative_application(
+  app_name: str,
+  authoritative: dict,
+  current: Application,
+) -> Application:
+  try:
+    projected, _created = await sync_module.upsert_application_from_etcd(
+      app_name,
+      authoritative,
+    )
+    return projected
+  except Exception as error:
+    logger.warning(f"应用本地投影延迟 app={app_name}: {error}")
+    current.domains = coerce_origin_list(authoritative.get("domains") or [])
+    return current
+
+
+async def add_application_domain(
+  application_id: ObjectId,
+  domain: str,
+  current_user: User,
+) -> dict:
+  application = await public_crud.read_application_by_id(application_id)
+  if not application:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
+  await _require_can_manage_application(application, current_user)
+  try:
+    origin = normalize_origin(domain)
+  except ValueError as error:
+    raise CustomException(ErrorDesc.INVALID_PARAMS, str(error)) from error
+
+  current_domains = await _load_application_domains(application)
+  if origin in current_domains:
+    raise CustomException(ErrorDesc.RES_DATA_NOT_CHANGED, "该来源已存在")
+  if len(current_domains) >= MAX_DOMAINS_PER_APP:
+    raise CustomException(
+      ErrorDesc.INVALID_PARAMS,
+      f"每个应用最多 {MAX_DOMAINS_PER_APP} 个来源",
+    )
+  current_domains.append(origin)
+  try:
+    authoritative = await _write_authoritative_application_domains(
+      application.name,
+      current_domains,
+      base_entry=sync_module.application_to_etcd_entry(application),
+    )
+  except CustomException:
+    raise
+  except Exception as error:
+    from src.core import audit, metrics as metrics_mod
+    metrics_mod.incr("sync_failures_total")
+    audit.audit(
+      "application.domain.add",
+      actor=current_user.username,
+      resource=application.name,
+      detail=str(error),
+      success=False,
+    )
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      f"来源同步到 Etcd 失败: {error}",
+    ) from error
+
+  application = await _project_authoritative_application(
+    application.name,
+    authoritative,
+    application,
+  )
+  from src.core import audit
+  audit.audit(
+    "application.domain.add",
+    actor=current_user.username,
+    resource=application.name,
+    detail=origin,
+  )
+  return await _application_response(application)
+
+
+async def delete_application_domain(
+  application_id: ObjectId,
+  domain: str,
+  current_user: User,
+) -> dict:
+  application = await public_crud.read_application_by_id(application_id)
+  if not application:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
+  await _require_can_manage_application(application, current_user)
+  try:
+    origin = normalize_origin(domain)
+  except ValueError as error:
+    raise CustomException(ErrorDesc.INVALID_PARAMS, str(error)) from error
+
+  current_domains = await _load_application_domains(application)
+  if origin not in current_domains:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "来源不存在")
+  remaining = [item for item in current_domains if item != origin]
+  try:
+    authoritative = await _write_authoritative_application_domains(
+      application.name,
+      remaining,
+      base_entry=sync_module.application_to_etcd_entry(application),
+    )
+  except CustomException:
+    raise
+  except Exception as error:
+    from src.core import audit, metrics as metrics_mod
+    metrics_mod.incr("sync_failures_total")
+    audit.audit(
+      "application.domain.delete",
+      actor=current_user.username,
+      resource=application.name,
+      detail=str(error),
+      success=False,
+    )
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      f"来源同步到 Etcd 失败: {error}",
+    ) from error
+
+  application = await _project_authoritative_application(
+    application.name,
+    authoritative,
+    application,
+  )
+  from src.core import audit
+  audit.audit(
+    "application.domain.delete",
+    actor=current_user.username,
+    resource=application.name,
+    detail=origin,
+  )
+  return await _application_response(application)
+
+
+async def delete_application(
+  application_id: ObjectId,
+  current_user: User,
+) -> dict:
+  application = await public_crud.read_application_by_id(application_id)
+  if not application:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
+  await _require_can_manage_application(application, current_user)
+  app_name = application.name
+  try:
+    await sync_module.unpublish_application(app_name)
+  except Exception as error:
+    from src.core import audit, metrics as metrics_mod
+    metrics_mod.incr("sync_failures_total")
+    audit.audit(
+      "application.delete",
+      actor=current_user.username,
+      resource=app_name,
+      detail=str(error),
+      success=False,
+    )
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      f"应用删除同步到 Etcd 失败: {error}",
+    ) from error
+
+  deleted = await public_crud.delete_application_by_id(application_id)
+  if not deleted:
+    logger.warning(f"应用已从 Etcd 移除，本地投影缺失 app={app_name}")
+  from src.core import audit
+  audit.audit("application.delete", actor=current_user.username, resource=app_name)
+  return {"message": "应用已删除"}
 
 async def get_application_list() -> dict[str, List[Application]]:
   """
@@ -476,6 +730,7 @@ async def _application_response(
     "quota_usage_bytes": usage,
     "quota_usage_ratio": usage / quota,
     "quota_usage_updated_at": application.quota_usage_updated_at,
+    "domains": list(getattr(application, "domains", None) or []),
     "author": {
       "id": author.id,
       "username": author.username,

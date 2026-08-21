@@ -82,6 +82,7 @@ def test_unpublish_helpers_exist():
   from src.core import sync as sync_module
   assert callable(sync_module.unpublish_region)
   assert callable(sync_module.unpublish_server)
+  assert callable(sync_module.unpublish_application)
 
 
 def test_ai_config_sync_helpers_exist():

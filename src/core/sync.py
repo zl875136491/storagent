@@ -530,6 +530,7 @@ def application_to_etcd_entry(app) -> dict:
     "enabled_at": app.enabled_at.isoformat() if app.enabled_at else None,
     "updated_at": app.updated_at.isoformat() if app.updated_at else None,
     "origin_region": settings.REGION,
+    "domains": list(getattr(app, "domains", None) or []),
   }
 
 
@@ -668,6 +669,8 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
     quota_bytes = DEFAULT_APPLICATION_QUOTA_BYTES
   if quota_bytes <= 0:
     quota_bytes = DEFAULT_APPLICATION_QUOTA_BYTES
+  from src.core.cors_origins import coerce_origin_list
+  incoming_domains = coerce_origin_list(data.get("domains") or [])
 
   if not app_obj:
     candidate = Application(
@@ -682,6 +685,7 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
       provisioning_error=data.get("provisioning_error", ""),
       provisioning_updated_at=provisioning_updated_at,
       quota_bytes=quota_bytes,
+      domains=incoming_domains,
     )
     try:
       await candidate.save()
@@ -730,6 +734,9 @@ async def upsert_application_from_etcd(app_name: str, data: dict):
     changed = True
   if getattr(app_obj, "quota_bytes", DEFAULT_APPLICATION_QUOTA_BYTES) != quota_bytes:
     app_obj.quota_bytes = quota_bytes
+    changed = True
+  if list(getattr(app_obj, "domains", None) or []) != incoming_domains:
+    app_obj.domains = incoming_domains
     changed = True
   if changed:
     app_obj.updated_at = utc_now()
@@ -789,11 +796,28 @@ async def upsert_api_key_from_etcd(key: str, data: dict):
 
 
 async def sync_applications_to_mongo(applications_data: dict):
+  from src.modules.public.model import Application
+  from src.core.cors_origins import coerce_origin_list, refresh_from_application_entries
+
+  known: set[str] = set()
   for app_name, app_data in applications_data.items():
+    if not isinstance(app_data, dict):
+      continue
+    app_data = dict(app_data)
+    app_data["domains"] = coerce_origin_list(app_data.get("domains") or [])
+    known.add(app_name)
     try:
       await upsert_application_from_etcd(app_name, app_data)
     except Exception as e:
       logger.warning(f"同步 Application {app_name} 失败: {e}")
+  try:
+    for app_obj in await Application.find_all().to_list():
+      if app_obj.name not in known:
+        await app_obj.delete()
+        logger.info(f"Etcd sync: 移除已删除 Application {app_obj.name}")
+  except Exception as e:
+    logger.warning(f"收敛已删除 Application 失败: {e}")
+  refresh_from_application_entries(applications_data)
 
 
 async def sync_api_keys_to_mongo(api_keys_data: dict):
@@ -1662,11 +1686,25 @@ async def publish_application(app) -> None:
       "author_username",
       "author_name",
       "origin_region",
+      "domains",
     ):
       current.setdefault(field, entry[field])
     return data
 
   await etcd_op.merge_update_etcd_key(ETCD_KEY_APPLICATIONS, mutator)
+
+
+async def unpublish_application(app_name: str) -> dict:
+  from src.core import etcd_op
+  from src.core.cors_origins import refresh_from_application_entries
+
+  def mutator(data: dict) -> dict:
+    data.pop(app_name, None)
+    return data
+
+  applications = await etcd_op.merge_update_etcd_key(ETCD_KEY_APPLICATIONS, mutator)
+  refresh_from_application_entries(applications)
+  return applications
 
 
 async def publish_api_key(api_key_obj) -> None:

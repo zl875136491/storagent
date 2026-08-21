@@ -32,3 +32,5 @@ def test_cors_allows_the_demo_api_key_reference_header():
   cors = next(item for item in app.user_middleware if item.cls is CORSMiddleware)
 
   assert "x-demo-api-key-id" in cors.kwargs["allow_headers"]
+  from src.core.cors_origins import allowlist
+  assert cors.kwargs["allow_origins"] is allowlist

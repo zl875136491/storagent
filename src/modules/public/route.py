@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Body
 from src.core.auth import _is_superadmin, get_current_user, check_permissions
 from src.modules.auth.model import User
 from src.modules.public import service as public_service
@@ -89,7 +89,8 @@ async def create_application(
     name=name,
     shown_name=shown_name,
     description=description,
-    current_user=current_user
+    current_user=current_user,
+    domains=payload.domains,
   )
 
 @router.get(
@@ -103,6 +104,52 @@ async def get_application_list(
   获取应用列表（需登录）
   """
   return await public_service.get_application_list()
+
+
+@router.post(
+  path="/application/{application_id}/domains",
+  response_model=public_schema.ApplicationResponse,
+  summary="添加应用浏览器来源",
+)
+async def add_application_domain(
+  application_id: public_schema.PydanticObjectId,
+  payload: public_schema.ApplicationDomainRequest,
+  current_user: User = Depends(get_current_user),
+) -> public_schema.ApplicationResponse:
+  return await public_service.add_application_domain(
+    application_id,
+    payload.domain,
+    current_user,
+  )
+
+
+@router.delete(
+  path="/application/{application_id}/domains",
+  response_model=public_schema.ApplicationResponse,
+  summary="删除应用浏览器来源",
+)
+async def delete_application_domain(
+  application_id: public_schema.PydanticObjectId,
+  payload: public_schema.ApplicationDomainRequest = Body(...),
+  current_user: User = Depends(get_current_user),
+) -> public_schema.ApplicationResponse:
+  return await public_service.delete_application_domain(
+    application_id,
+    payload.domain,
+    current_user,
+  )
+
+
+@router.delete(
+  path="/application/{application_id}",
+  response_model=public_schema.SimpleMessageResponse,
+  summary="删除应用",
+)
+async def delete_application(
+  application_id: public_schema.PydanticObjectId,
+  current_user: User = Depends(get_current_user),
+) -> public_schema.SimpleMessageResponse:
+  return await public_service.delete_application(application_id, current_user)
 
 
 @router.put(

@@ -177,7 +177,8 @@ async def create_application(
   name: str,
   shown_name: str,
   description: str,
-  author: User) -> Application:
+  author: User,
+  domains: list[str] | None = None) -> Application:
   """
   创建应用
 
@@ -186,6 +187,7 @@ async def create_application(
     shown_name: 应用显示名称
     description: 应用描述
     author: 作者
+    domains: 浏览器来源白名单
 
   Returns:
     Application: 应用
@@ -195,7 +197,8 @@ async def create_application(
     name=name,
     shown_name=shown_name,
     description=description,
-    author=author
+    author=author,
+    domains=list(domains or []),
   )
   await application.save()
   return application
@@ -217,6 +220,17 @@ async def read_application_by_id(application_id: str | ObjectId) -> Application 
     Application | None: 应用
   """
   return await Application.find_one(Application.id == application_id, fetch_links=True)
+
+
+async def delete_application_by_id(application_id: str | ObjectId) -> bool:
+  """
+  删除本地应用投影。跨节点权威数据由 Etcd applications map 收敛。
+  """
+  application = await read_application_by_id(application_id)
+  if not application:
+    return False
+  await application.delete()
+  return True
 
 async def create_api_key(
   application: Application,

@@ -68,6 +68,7 @@ class ApplicationCreateRequest(BaseModel):
   name: str
   shown_name: str
   description: str
+  domains: list[str] = Field(default_factory=list)
 
 class SimpleUserResponse(BaseModel):
   id: PydanticObjectId
@@ -90,7 +91,12 @@ class ApplicationResponse(BaseModel):
   quota_usage_bytes: int = Field(default=0, ge=0)
   quota_usage_ratio: float = Field(default=0.0, ge=0)
   quota_usage_updated_at: datetime | None = None
+  domains: list[str] = Field(default_factory=list)
   author: SimpleUserResponse
+
+
+class ApplicationDomainRequest(BaseModel):
+  domain: str = Field(..., min_length=1, max_length=256)
 
 class ApplicationListResponse(BaseModel):
   data: List[ApplicationResponse]
