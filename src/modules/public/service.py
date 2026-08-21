@@ -1355,6 +1355,39 @@ async def create_api_key(
   api_key_obj.key = key
   return api_key_obj
 
+async def _resolve_linked_application(application) -> Application | None:
+  """Return a fetched Application, even when Beanie left an unresolved Link."""
+  if application is None:
+    return None
+  if hasattr(application, "name"):
+    return application
+  if hasattr(application, "fetch"):
+    try:
+      resolved = await application.fetch()
+    except Exception:
+      resolved = None
+    if resolved is not None and hasattr(resolved, "name"):
+      return resolved
+  application_id = sync_module._linked_document_id(application)
+  if not application_id:
+    return None
+  return await public_crud.read_application_by_id(application_id)
+
+
+def _api_key_application_summary(application, fallback_id: str | None) -> dict:
+  if application is not None and hasattr(application, "name"):
+    return {
+      "id": application.id,
+      "name": application.name,
+      "shown_name": application.shown_name or application.name,
+    }
+  return {
+    "id": fallback_id,
+    "name": "",
+    "shown_name": "应用已删除",
+  }
+
+
 async def get_api_key_list(
   current_user: User) -> List[APIKey]:
   """
@@ -1380,14 +1413,14 @@ async def get_api_key_list(
   data = []
   for api_key_obj in api_key_objs:
     hint = api_key_obj.key_hint or "************"
+    application = await _resolve_linked_application(api_key_obj.application)
+    fallback_id = sync_module._linked_document_id(api_key_obj.application)
+    if application is None and fallback_id is None:
+      continue
     data.append({
       "id": api_key_obj.id,
       "key": hint,
-      "application": {
-        "id": api_key_obj.application.id,
-        "name": api_key_obj.application.name,
-        "shown_name": api_key_obj.application.shown_name
-      },
+      "application": _api_key_application_summary(application, fallback_id),
       "expired_at": api_key_obj.expired_at,
       "deleted": bool(api_key_obj.deleted),
       "destory_by_admin": bool(getattr(api_key_obj, "destory_by_admin", False)),
@@ -1405,8 +1438,11 @@ async def revoke_api_key(
   api_key_obj = await public_crud.read_api_key_by_id(api_key_id)
   if not api_key_obj:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "API密钥不存在")
-  application_obj = await public_crud.read_application_by_id(api_key_obj.application.id)
-  is_owner = bool(application_obj and application_obj.author.id == current_user.id)
+  application_obj = await _resolve_linked_application(api_key_obj.application)
+  is_owner = bool(
+    application_obj
+    and sync_module._linked_document_id(application_obj.author) == str(current_user.id)
+  )
   admin_role = await user_crud.get_admin_role()
   is_admin = bool(
     admin_role

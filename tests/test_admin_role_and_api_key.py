@@ -177,3 +177,83 @@ async def test_owner_revoke_does_not_mark_destory_by_admin(monkeypatch):
 
   await public_service.revoke_api_key("k1", actor)
   assert captured["destory_by_admin"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_api_key_list_resolves_unfetched_application_link(monkeypatch):
+  class UnfetchedLink:
+    def __init__(self):
+      self.ref = SimpleNamespace(id="app1")
+
+    async def fetch(self):
+      return SimpleNamespace(id="app1", name="demo", shown_name="Demo")
+
+  key = SimpleNamespace(
+    id="k1",
+    key_hint="sk_****abcd",
+    application=UnfetchedLink(),
+    expired_at="2026-01-01T00:00:00+00:00",
+    deleted=False,
+    destory_by_admin=False,
+  )
+  actor = SimpleNamespace(id="admin", roles=[SimpleNamespace(id="admin-id")])
+
+  async def get_admin_role():
+    return SimpleNamespace(id="admin-id")
+
+  async def read_all(*, include_admin_destroyed=False):
+    del include_admin_destroyed
+    return [key]
+
+  monkeypatch.setattr("src.modules.auth.crud.get_admin_role", get_admin_role)
+  monkeypatch.setattr(public_service.public_crud, "read_all_api_keys", read_all)
+
+  result = await public_service.get_api_key_list(actor)
+  assert result["data"][0]["application"] == {
+    "id": "app1",
+    "name": "demo",
+    "shown_name": "Demo",
+  }
+
+
+@pytest.mark.asyncio
+async def test_get_api_key_list_survives_deleted_application_link(monkeypatch):
+  class MissingLink:
+    def __init__(self):
+      self.ref = SimpleNamespace(id="dead-app")
+
+    async def fetch(self):
+      return None
+
+  key = SimpleNamespace(
+    id="k1",
+    key_hint="sk_****abcd",
+    application=MissingLink(),
+    expired_at="2026-01-01T00:00:00+00:00",
+    deleted=False,
+    destory_by_admin=False,
+  )
+  actor = SimpleNamespace(id="admin", roles=[SimpleNamespace(id="admin-id")])
+
+  async def get_admin_role():
+    return SimpleNamespace(id="admin-id")
+
+  async def read_all(*, include_admin_destroyed=False):
+    del include_admin_destroyed
+    return [key]
+
+  async def read_application(_application_id):
+    return None
+
+  monkeypatch.setattr("src.modules.auth.crud.get_admin_role", get_admin_role)
+  monkeypatch.setattr(public_service.public_crud, "read_all_api_keys", read_all)
+  monkeypatch.setattr(
+    public_service.public_crud,
+    "read_application_by_id",
+    read_application,
+  )
+
+  result = await public_service.get_api_key_list(actor)
+  assert result["data"][0]["application"]["id"] == "dead-app"
+  assert result["data"][0]["application"]["shown_name"] == "应用已删除"
+
