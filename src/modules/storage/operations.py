@@ -147,6 +147,7 @@ def _operation_dict(operation: StorageOperation | None) -> dict[str, Any] | None
     "status": operation.status,
     "server": operation.server,
     "bucket": operation.bucket,
+    "target": operation.target,
     "actor": operation.actor,
     "message": operation.message,
     "result": operation.result,
@@ -951,29 +952,192 @@ async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
   }
 
 
-async def reconcile_bucket_replication(bucket: str, actor: str) -> dict[str, Any]:
+async def get_orphan_bucket_overview() -> dict[str, Any]:
+  """Compare physical MinIO buckets with the application catalog."""
+  server_names = sorted(set(await storage_crud.read_minio_server_names()))
+  applications = await public_crud.read_application_list()
+  app_by_name = {str(app.name): app for app in applications}
+  system_buckets = {settings.OBJECT_ARCHIVE_BUCKET.strip()}
+  system_buckets.discard("")
+  semaphore = asyncio.Semaphore(5)
+
+  async def inspect(server: str):
+    async with semaphore:
+      return server, await minio_op.list_server_buckets(
+        server,
+        timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+      )
+
+  inspections = await asyncio.gather(*(inspect(server) for server in server_names))
+  bucket_servers: dict[str, set[str]] = {}
+  errors: dict[str, str] = {}
+  for server, (success, buckets, error, _elapsed_ms) in inspections:
+    if not success:
+      errors[server] = error
+      continue
+    for bucket_name in buckets:
+      bucket_servers.setdefault(bucket_name, set()).add(server)
+
+  rows: list[dict[str, Any]] = []
+  for bucket_name, present_on in bucket_servers.items():
+    app = app_by_name.get(bucket_name)
+    if bucket_name in system_buckets:
+      kind = "system"
+      app_name = ""
+      shown_name = "过期对象归档"
+    elif app is None:
+      kind = "orphan"
+      app_name = ""
+      shown_name = ""
+    elif not getattr(app, "enabled", False):
+      kind = "disabled_application"
+      app_name = str(app.name)
+      shown_name = str(getattr(app, "shown_name", "") or "")
+    else:
+      continue
+    rows.append({
+      "name": bucket_name,
+      "kind": kind,
+      "app_name": app_name,
+      "app_shown_name": shown_name,
+      "servers": sorted(present_on),
+      "missing_servers": sorted(set(server_names) - present_on),
+    })
+
+  kind_order = {"orphan": 0, "disabled_application": 1, "system": 2}
+  rows.sort(key=lambda item: (kind_order[item["kind"]], item["name"]))
+  return {
+    "generated_at": utc_now(),
+    "servers": server_names,
+    "summary": {
+      "orphan_count": sum(item["kind"] == "orphan" for item in rows),
+      "disabled_application_count": sum(item["kind"] == "disabled_application" for item in rows),
+      "system_bucket_count": sum(item["kind"] == "system" for item in rows),
+      "unavailable_server_count": len(errors),
+    },
+    "buckets": rows,
+    "errors": errors,
+  }
+
+
+def _replication_operation_response(operation: StorageOperation) -> dict[str, Any]:
+  detail = dict(operation.result or {})
+  detail.update({
+    "operation_id": str(operation.id),
+    "operation_status": operation.status,
+  })
+  return {
+    "message": operation.message,
+    "bucket": operation.bucket,
+    "source_server": detail.get("source_server") or (
+      operation.server if operation.kind == "replication_resync" else None
+    ),
+    "target_server": detail.get("target_server") or operation.target or None,
+    "detail": detail,
+  }
+
+
+async def _reuse_active_operation(
+  kind: str,
+  server: str,
+  bucket: str,
+  target: str,
+  *,
+  max_age_seconds: float,
+) -> StorageOperation | None:
+  active = await storage_crud.read_active_storage_operation(
+    kind,
+    server,
+    bucket=bucket,
+    target=target,
+  )
+  if active is None:
+    return None
+  if (utc_now() - _aware(active.created_at)).total_seconds() <= max_age_seconds:
+    return active
+  active.status = "failed"
+  active.message = "后端重启或任务超时，状态已回收"
+  active.finished_at = utc_now()
+  await active.save()
+  return None
+
+
+async def _run_replication_reconcile_operation(operation: StorageOperation) -> None:
   from src.core import sync as sync_module
 
-  bucket_name = _validate_bucket(bucket)
-  server_names = await storage_crud.read_minio_server_names()
   try:
-    async with sync_module.application_replication_lock(bucket_name):
-      policy = await sync_module.setup_bucket_replication(bucket_name, server_names)
-  except Exception as e:
+    async with _distributed_operation_lock(f"replication-reconcile/{operation.bucket}"):
+      operation.status = "running"
+      operation.started_at = utc_now()
+      operation.message = "正在校准存储桶复制规则"
+      await operation.save()
+      server_names = await storage_crud.read_minio_server_names()
+      async with sync_module.application_replication_lock(operation.bucket):
+        policy = await sync_module.setup_bucket_replication(operation.bucket, server_names)
+  except StorageOperationLockBusy as error:
+    operation.status = "failed"
+    operation.finished_at = utc_now()
+    operation.message = str(error)
+    await operation.save()
+    return
+  except asyncio.CancelledError:
+    operation.status = "failed"
+    operation.finished_at = utc_now()
+    operation.message = "后端停止，复制规则校准任务已回收"
+    await operation.save()
+    raise
+  except Exception as error:
+    operation.status = "failed"
+    operation.finished_at = utc_now()
+    operation.message = str(error)
+    await operation.save()
+    metrics_mod.incr("replication_reconcile_failures_total")
     audit.audit(
       "replication.reconcile",
-      actor=actor,
-      resource=bucket_name,
-      detail=str(e),
+      actor=operation.actor,
+      resource=operation.bucket,
+      detail=str(error),
       success=False,
     )
-    raise
-  audit.audit("replication.reconcile", actor=actor, resource=bucket_name, detail=policy)
-  return {
-    "message": "复制规则校准完成",
-    "bucket": bucket_name,
-    "detail": policy,
-  }
+    return
+
+  operation.status = "succeeded"
+  operation.finished_at = utc_now()
+  operation.message = "复制规则校准完成"
+  operation.result = {**operation.result, "policy": policy}
+  await operation.save()
+  metrics_mod.incr("replication_reconcile_runs_total")
+  audit.audit(
+    "replication.reconcile",
+    actor=operation.actor,
+    resource=operation.bucket,
+    detail=policy,
+  )
+
+
+async def reconcile_bucket_replication(bucket: str, actor: str) -> dict[str, Any]:
+  bucket_name = _validate_bucket(bucket)
+  operation = await _reuse_active_operation(
+    "replication_reconcile",
+    "all",
+    bucket_name,
+    "",
+    max_age_seconds=max(float(settings.MINIO_OPERATION_TIMEOUT_SECONDS) * 30, 300.0),
+  )
+  if operation is not None:
+    return _replication_operation_response(operation)
+
+  operation = await storage_crud.create_storage_operation(
+    kind="replication_reconcile",
+    server="all",
+    bucket=bucket_name,
+    actor=actor,
+  )
+  operation.message = "复制规则校准任务已进入队列"
+  operation.result = {"scope": "full_mesh"}
+  await operation.save()
+  _spawn(_run_replication_reconcile_operation(operation))
+  return _replication_operation_response(operation)
 
 
 async def _read_running_resync(
@@ -1008,6 +1172,89 @@ def _running_resync_response(
     "target_server": target,
     "detail": {**detail, "already_running": True},
   }
+
+
+async def _run_replication_resync_operation(operation: StorageOperation) -> None:
+  source = operation.server
+  target = operation.target
+  remote_arn = str(operation.result.get("remote_arn") or "")
+  older_than = operation.result.get("older_than") or None
+  detail: dict[str, Any] = {}
+  elapsed_ms = 0.0
+  try:
+    async with _distributed_operation_lock(
+      f"replication-resync/{operation.bucket}/{source}/{target}"
+    ):
+      operation.status = "running"
+      operation.started_at = utc_now()
+      operation.message = "正在向 MinIO 提交对象补传"
+      await operation.save()
+      running = await _read_running_resync(source, operation.bucket, remote_arn)
+      if running:
+        detail = {**running, "already_running": True}
+      else:
+        success, detail, error, elapsed_ms = await minio_op.start_bucket_replication_resync(
+          source,
+          operation.bucket,
+          remote_arn,
+          older_than=older_than,
+          timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+        )
+        if not success:
+          # A concurrent request can become visible just after the first
+          # status read. Treat the native task as the authoritative result.
+          running = await _read_running_resync(source, operation.bucket, remote_arn)
+          if running:
+            detail = {**running, "already_running": True}
+          else:
+            raise RuntimeError(error)
+  except StorageOperationLockBusy as error:
+    operation.status = "failed"
+    operation.finished_at = utc_now()
+    operation.message = str(error)
+    await operation.save()
+    return
+  except asyncio.CancelledError:
+    operation.status = "failed"
+    operation.finished_at = utc_now()
+    operation.message = "后端停止，对象补传启动任务已回收"
+    await operation.save()
+    raise
+  except Exception as error:
+    operation.status = "failed"
+    operation.finished_at = utc_now()
+    operation.message = str(error)
+    await operation.save()
+    metrics_mod.incr("replication_resync_failures_total")
+    audit.audit(
+      "replication.resync",
+      actor=operation.actor,
+      resource=f"{operation.bucket}:{source}->{target}",
+      detail=str(error),
+      success=False,
+    )
+    return
+
+  operation.status = "succeeded"
+  operation.finished_at = utc_now()
+  operation.message = (
+    "已检测到 MinIO 正在执行对象补传"
+    if detail.get("already_running")
+    else "对象补传任务已提交 MinIO"
+  )
+  operation.result = {
+    **operation.result,
+    "native": detail,
+    "elapsed_ms": elapsed_ms,
+  }
+  await operation.save()
+  metrics_mod.incr("replication_resync_runs_total")
+  audit.audit(
+    "replication.resync",
+    actor=operation.actor,
+    resource=f"{operation.bucket}:{source}->{target}",
+    detail=operation.result,
+  )
 
 
 async def start_replication_resync(
@@ -1060,41 +1307,33 @@ async def start_replication_resync(
     )
     return _running_resync_response(bucket_name, source, target, running)
 
-  success, detail, error, _ = await minio_op.start_bucket_replication_resync(
+  operation = await _reuse_active_operation(
+    "replication_resync",
     source,
     bucket_name,
-    remote_arn,
-    older_than=older_than,
-    timeout=settings.MINIO_OPERATION_TIMEOUT_SECONDS,
+    target,
+    max_age_seconds=max(float(settings.MINIO_OPERATION_TIMEOUT_SECONDS) * 30, 300.0),
   )
-  if not success:
-    # MinIO rejects a second start while the first request is racing to become
-    # visible. Re-read authoritative status and treat that case as idempotent.
-    running = await _read_running_resync(source, bucket_name, remote_arn)
-    if running:
-      audit.audit(
-        "replication.resync",
-        actor=actor,
-        resource=f"{bucket_name}:{source}->{target}",
-        detail={**running, "already_running": True},
-      )
-      return _running_resync_response(bucket_name, source, target, running)
-  audit.audit(
-    "replication.resync",
+  if operation is not None:
+    return _replication_operation_response(operation)
+
+  operation = await storage_crud.create_storage_operation(
+    kind="replication_resync",
+    server=source,
+    bucket=bucket_name,
+    target=target,
     actor=actor,
-    resource=f"{bucket_name}:{source}->{target}",
-    detail=detail if success else error,
-    success=success,
   )
-  if not success:
-    raise CustomException(ErrorDesc.MINIO_REPLICATE_FAILED, error)
-  return {
-    "message": "对象补传任务已启动",
-    "bucket": bucket_name,
+  operation.message = "对象补传启动任务已进入队列"
+  operation.result = {
     "source_server": source,
     "target_server": target,
-    "detail": detail,
+    "remote_arn": remote_arn,
+    "older_than": older_than or "",
   }
+  await operation.save()
+  _spawn(_run_replication_resync_operation(operation))
+  return _replication_operation_response(operation)
 
 
 async def get_cluster_heal_status(server_name: str) -> dict[str, Any]:

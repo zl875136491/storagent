@@ -263,11 +263,13 @@ async def create_storage_operation(
   server: str,
   actor: str,
   bucket: str = "",
+  target: str = "",
 ) -> StorageOperation:
   operation = StorageOperation(
     kind=kind,
     server=server,
     bucket=bucket,
+    target=target,
     actor=actor,
   )
   await operation.insert()
@@ -277,22 +279,38 @@ async def create_storage_operation(
 async def read_active_storage_operation(
   kind: str,
   server: str,
+  *,
+  bucket: str | None = None,
+  target: str | None = None,
 ) -> StorageOperation | None:
-  return await StorageOperation.find_one(
+  filters = [
     StorageOperation.kind == kind,
     StorageOperation.server == server,
     In(StorageOperation.status, ["queued", "running"]),
-  )
+  ]
+  if bucket is not None:
+    filters.append(StorageOperation.bucket == bucket)
+  if target is not None:
+    filters.append(StorageOperation.target == target)
+  return await StorageOperation.find_one(*filters)
 
 
 async def read_latest_storage_operation(
   kind: str,
   server: str,
+  *,
+  bucket: str | None = None,
+  target: str | None = None,
 ) -> StorageOperation | None:
-  items = await StorageOperation.find(
+  filters = [
     StorageOperation.kind == kind,
     StorageOperation.server == server,
-  ).sort("-created_at").limit(1).to_list()
+  ]
+  if bucket is not None:
+    filters.append(StorageOperation.bucket == bucket)
+  if target is not None:
+    filters.append(StorageOperation.target == target)
+  items = await StorageOperation.find(*filters).sort("-created_at").limit(1).to_list()
   return items[0] if items else None
 
 

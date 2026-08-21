@@ -43,6 +43,7 @@ class ObjectCatalog(Document):
   purge_after: datetime | None = None
   archive_id: str = ""
   archive_checksum: str = ""
+  archive_error: str = ""
   deletion_generation: int = Field(default=0, ge=0)
   last_operation_id: str = ""
 

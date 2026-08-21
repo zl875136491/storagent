@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -738,13 +739,29 @@ async def test_start_resync_returns_existing_running_task(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_start_resync_handles_concurrent_start_as_idempotent(monkeypatch):
+async def test_start_resync_queues_persistent_task(monkeypatch):
   arn = "arn:minio:replication::shenzhen:one-v2"
   servers = [
     SimpleNamespace(name="beijing", host="10.32.129.241", minio_port=9000),
     SimpleNamespace(name="shenzhen", host="10.41.102.223", minio_port=9000),
   ]
-  status_calls = 0
+
+  class Operation:
+    id = "resync-task"
+    kind = "replication_resync"
+    status = "queued"
+    server = "beijing"
+    bucket = "one-v2"
+    target = "shenzhen"
+    actor = "admin"
+    message = ""
+    result = {}
+
+    async def save(self):
+      return None
+
+  operation = Operation()
+  spawned = []
 
   async def read_servers():
     return servers
@@ -755,19 +772,28 @@ async def test_start_resync_handles_concurrent_start_as_idempotent(monkeypatch):
     }, "", 1.0
 
   async def read_status(*_args, **_kwargs):
-    nonlocal status_calls
-    status_calls += 1
-    targets = [] if status_calls == 1 else [{"arn": arn, "resyncStatus": "Ongoing"}]
-    return True, {"resyncInfo": {"target": targets}}, "", 1.0
+    return True, {"resyncInfo": {"target": []}}, "", 1.0
 
-  async def start(*_args, **_kwargs):
-    return False, {}, "Resync is already in progress", 1.0
+  async def read_active(*_args, **_kwargs):
+    return None
+
+  async def create(**kwargs):
+    assert kwargs["kind"] == "replication_resync"
+    assert kwargs["server"] == "beijing"
+    assert kwargs["bucket"] == "one-v2"
+    assert kwargs["target"] == "shenzhen"
+    return operation
+
+  def spawn(coro):
+    spawned.append(coro)
+    coro.close()
 
   monkeypatch.setattr(operations.storage_crud, "read_minio_server_list", read_servers)
+  monkeypatch.setattr(operations.storage_crud, "read_active_storage_operation", read_active)
+  monkeypatch.setattr(operations.storage_crud, "create_storage_operation", create)
   monkeypatch.setattr(operations.minio_op, "get_bucket_replication_metrics", read_metrics)
   monkeypatch.setattr(operations.minio_op, "get_bucket_replication_resync_status", read_status)
-  monkeypatch.setattr(operations.minio_op, "start_bucket_replication_resync", start)
-  monkeypatch.setattr(operations.audit, "audit", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(operations, "_spawn", spawn)
 
   result = await operations.start_replication_resync(
     "one-v2",
@@ -777,6 +803,91 @@ async def test_start_resync_handles_concurrent_start_as_idempotent(monkeypatch):
     "admin",
   )
 
+  assert len(spawned) == 1
+  assert result["message"] == "对象补传启动任务已进入队列"
+  assert result["detail"]["operation_id"] == "resync-task"
+  assert result["detail"]["operation_status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_resync_runner_handles_concurrent_start_as_idempotent(monkeypatch):
+  arn = "arn:minio:replication::shenzhen:one-v2"
+  status_calls = 0
+
+  class Operation:
+    id = "resync-task"
+    kind = "replication_resync"
+    status = "queued"
+    server = "beijing"
+    bucket = "one-v2"
+    target = "shenzhen"
+    actor = "admin"
+    message = ""
+    result = {
+      "source_server": "beijing",
+      "target_server": "shenzhen",
+      "remote_arn": arn,
+      "older_than": "",
+    }
+
+    async def save(self):
+      return None
+
+  @asynccontextmanager
+  async def unlocked(_name):
+    yield
+
+  async def read_status(*_args, **_kwargs):
+    nonlocal status_calls
+    status_calls += 1
+    targets = [] if status_calls == 1 else [{"arn": arn, "resyncStatus": "Ongoing"}]
+    return True, {"resyncInfo": {"target": targets}}, "", 1.0
+
+  async def start(*_args, **_kwargs):
+    return False, {}, "Resync is already in progress", 1.0
+
+  monkeypatch.setattr(operations, "_distributed_operation_lock", unlocked)
+  monkeypatch.setattr(operations.minio_op, "get_bucket_replication_resync_status", read_status)
+  monkeypatch.setattr(operations.minio_op, "start_bucket_replication_resync", start)
+  monkeypatch.setattr(operations.metrics_mod, "incr", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(operations.audit, "audit", lambda *_args, **_kwargs: None)
+
+  operation = Operation()
+  await operations._run_replication_resync_operation(operation)
+
   assert status_calls == 2
-  assert result["message"] == "对象补传任务正在运行"
-  assert result["detail"]["already_running"] is True
+  assert operation.status == "succeeded"
+  assert operation.result["native"]["already_running"] is True
+
+
+@pytest.mark.asyncio
+async def test_orphan_bucket_overview_classifies_non_application_buckets(monkeypatch):
+  async def server_names():
+    return ["beijing", "shenzhen"]
+
+  async def applications():
+    return [
+      SimpleNamespace(name="enabled-app", enabled=True, shown_name="启用应用"),
+      SimpleNamespace(name="disabled-app", enabled=False, shown_name="停用应用"),
+    ]
+
+  async def list_buckets(server, **_kwargs):
+    values = {
+      "beijing": ["enabled-app", "disabled-app", "orphan-a", "storagent-expired-archive"],
+      "shenzhen": ["enabled-app", "orphan-a"],
+    }
+    return True, values[server], "", 1.0
+
+  monkeypatch.setattr(operations.storage_crud, "read_minio_server_names", server_names)
+  monkeypatch.setattr(operations.public_crud, "read_application_list", applications)
+  monkeypatch.setattr(operations.minio_op, "list_server_buckets", list_buckets)
+  monkeypatch.setattr(operations.settings, "OBJECT_ARCHIVE_BUCKET", "storagent-expired-archive")
+
+  result = await operations.get_orphan_bucket_overview()
+
+  rows = {item["name"]: item for item in result["buckets"]}
+  assert set(rows) == {"disabled-app", "orphan-a", "storagent-expired-archive"}
+  assert rows["orphan-a"]["kind"] == "orphan"
+  assert rows["disabled-app"]["kind"] == "disabled_application"
+  assert rows["disabled-app"]["missing_servers"] == ["shenzhen"]
+  assert rows["storagent-expired-archive"]["kind"] == "system"

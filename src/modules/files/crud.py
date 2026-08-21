@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta
 from typing import Iterable
 
-from beanie.operators import GT, In
+from beanie.operators import GT, In, LTE
+from pymongo import ReturnDocument
 
 from src.core.exception import CustomException, ErrorDesc
 from src.modules.files.model import ObjectCatalog
@@ -44,6 +46,9 @@ async def upsert_completed_object(
   item.restore_until = None
   item.archive_after = None
   item.purge_after = None
+  item.archive_id = ""
+  item.archive_checksum = ""
+  item.archive_error = ""
   item.deletion_generation += 1
   item.updated_at = now
   await item.save()
@@ -116,3 +121,47 @@ async def transition_object_state(
   if item is None:
     return None
   return await save_object(item, **changes)
+
+
+async def list_expired_objects_for_archive(
+  now: datetime,
+  *,
+  limit: int,
+) -> list[ObjectCatalog]:
+  """Find catalog rows that are past their recovery period and due to retry."""
+  return await ObjectCatalog.find(
+    In(ObjectCatalog.state, ["soft_deleted", "archive_pending", "archive_failed"]),
+    LTE(ObjectCatalog.restore_until, now),
+    LTE(ObjectCatalog.archive_after, now),
+  ).sort(
+    +ObjectCatalog.archive_after, +ObjectCatalog.object_id,
+  ).limit(max(int(limit), 1)).to_list()
+
+
+async def claim_expired_object_for_archive(
+  app_name: str,
+  object_id: str,
+  *,
+  now: datetime,
+  retry_after: timedelta,
+) -> ObjectCatalog | None:
+  """Atomically lease one eligible row so concurrent workers cannot archive it twice."""
+  raw = await ObjectCatalog.get_motor_collection().find_one_and_update(
+    {
+      "app_name": app_name,
+      "object_id": object_id,
+      "state": {"$in": ["soft_deleted", "archive_pending", "archive_failed"]},
+      "restore_until": {"$ne": None, "$lte": now},
+      "archive_after": {"$ne": None, "$lte": now},
+    },
+    {
+      "$set": {
+        "state": "archive_pending",
+        "archive_after": now + retry_after,
+        "updated_at": now,
+        "archive_error": "",
+      },
+    },
+    return_document=ReturnDocument.AFTER,
+  )
+  return ObjectCatalog.model_validate(raw) if raw else None

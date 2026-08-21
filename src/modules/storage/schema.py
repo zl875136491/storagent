@@ -224,6 +224,33 @@ class ReplicationResyncRequest(BaseModel):
   older_than: str | None = Field(None, max_length=64, description="可选 mc 时长，如 7d12h")
 
 
+OrphanBucketKind = Literal["orphan", "disabled_application", "system"]
+
+
+class OrphanBucketItem(BaseModel):
+  name: str
+  kind: OrphanBucketKind
+  app_name: str = ""
+  app_shown_name: str = ""
+  servers: list[str] = Field(default_factory=list)
+  missing_servers: list[str] = Field(default_factory=list)
+
+
+class OrphanBucketOperationsSummary(BaseModel):
+  orphan_count: int = 0
+  disabled_application_count: int = 0
+  system_bucket_count: int = 0
+  unavailable_server_count: int = 0
+
+
+class OrphanBucketOperationsResponse(BaseModel):
+  generated_at: datetime
+  servers: list[str] = Field(default_factory=list)
+  summary: OrphanBucketOperationsSummary
+  buckets: list[OrphanBucketItem] = Field(default_factory=list)
+  errors: dict[str, str] = Field(default_factory=dict)
+
+
 class ReplicationOperationResponse(BaseModel):
   message: str
   bucket: str
@@ -306,10 +333,11 @@ class ClusterHealthResponse(BaseModel):
 
 class StorageOperationItem(BaseModel):
   id: str
-  kind: Literal["cluster_heal"]
+  kind: Literal["cluster_heal", "replication_reconcile", "replication_resync"]
   status: Literal["queued", "running", "succeeded", "failed"]
   server: str
   bucket: str = ""
+  target: str = ""
   actor: str
   message: str
   result: dict[str, Any] = Field(default_factory=dict)

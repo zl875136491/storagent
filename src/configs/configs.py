@@ -127,6 +127,13 @@ class Settings(BaseSettings):
   # 管理员应急下载链接；运行时还会限制在 30-900 秒内。
   ONE_TIME_DOWNLOAD_TTL_SECONDS: int = 300
   MINIO_OPERATION_TIMEOUT_SECONDS: float = 20.0
+  # Soft-deleted objects remain recoverable until restore_until. Once that
+  # deadline is reached they are copied to this internal bucket, then removed
+  # from the application bucket by the local archive worker.
+  OBJECT_ARCHIVE_BUCKET: str = "storagent-expired-archive"
+  OBJECT_ARCHIVE_INTERVAL_SECONDS: float = 300.0
+  OBJECT_ARCHIVE_BATCH_SIZE: int = 50
+  OBJECT_ARCHIVE_RETRY_SECONDS: float = 300.0
   APPLICATION_QUOTA_USAGE_CACHE_SECONDS: float = 60.0
   APPLICATION_QUOTA_USAGE_MAX_CONCURRENCY: int = 4
   APPLICATION_QUOTA_RESERVATION_TTL_SECONDS: int = 86400

@@ -12,6 +12,7 @@ from src.core.sync import reconcile_replication_policies_task
 from src.core.cors_origins import allowlist, load_allowlist_from_mongo
 from src.core.exception import register_exception
 from src.core.middleware import RequestContextMiddleware, UploadBodyLimitMiddleware
+from src.modules.files.archive import archive_expired_objects_task
 from src.modules.auth.crud import cleanup_expired_tokens_task
 from src.modules.storage.operations import (
   monitor_cluster_health_task,
@@ -65,6 +66,7 @@ async def lifespan(app: FastAPI):
 
   # 7. 过期 token 清理后台任务
   cleanup_job = asyncio.create_task(cleanup_expired_tokens_task())
+  archive_job = asyncio.create_task(archive_expired_objects_task())
 
   # 8. 权威区域周期验收并补齐启用应用的全连接复制策略
   replication_reconcile_job = asyncio.create_task(
@@ -80,6 +82,7 @@ async def lifespan(app: FastAPI):
   watch_job.cancel()
   reconcile_job.cancel()
   cleanup_job.cancel()
+  archive_job.cancel()
   replication_reconcile_job.cancel()
   cluster_health_job.cancel()
   capacity_snapshot_job.cancel()

@@ -128,6 +128,7 @@ async def delete(request, app_name, object_id):
   if item.state != "active":
     raise CustomException(ErrorDesc.STATUS_ERR, "对象当前状态不允许删除")
   now = utc_now()
+  restore_until = now + timedelta(days=30)
   # The App lock serializes quota accounting. The conditional catalog change
   # means only its winner can release the logical bytes.
   async with quota.application_quota_lock(app_name) as quota_client:
@@ -135,9 +136,13 @@ async def delete(request, app_name, object_id):
       app_name, object_id, from_states=("active",), changes={
         "state": "soft_deleted",
         "deleted_at": now,
-        "restore_until": now + timedelta(days=30),
-        "archive_after": now + timedelta(days=7),
-        "purge_after": now + timedelta(days=30),
+        "restore_until": restore_until,
+        # Do not move the source object while it can still be restored.
+        "archive_after": restore_until,
+        "purge_after": None,
+        "archive_id": "",
+        "archive_checksum": "",
+        "archive_error": "",
         "deletion_generation": item.deletion_generation + 1,
         "last_operation_id": request_id(request),
       },
@@ -156,6 +161,7 @@ async def delete(request, app_name, object_id):
         app_name, object_id, from_states=("soft_deleted",), changes={
           "state": "active", "deleted_at": None, "restore_until": None,
           "archive_after": None, "purge_after": None,
+          "archive_id": "", "archive_checksum": "", "archive_error": "",
         },
       )
       raise
@@ -190,6 +196,7 @@ async def restore(request, app_name, object_id):
       changes={
         "state": "active", "deleted_at": None, "restore_until": None,
         "archive_after": None, "purge_after": None,
+        "archive_id": "", "archive_checksum": "", "archive_error": "",
         "last_operation_id": request_id(request),
       },
     )

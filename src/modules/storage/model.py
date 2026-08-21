@@ -95,10 +95,11 @@ class ServerFileDetailsCache(Document):
 
 class StorageOperation(Document):
   """Persistent state for long-running MinIO maintenance operations."""
-  kind: Literal["cluster_heal"]
+  kind: Literal["cluster_heal", "replication_reconcile", "replication_resync"]
   status: Literal["queued", "running", "succeeded", "failed"] = "queued"
   server: str
   bucket: str = ""
+  target: str = ""
   actor: str = "-"
   message: str = ""
   result: dict[str, Any] = Field(default_factory=dict)
@@ -111,7 +112,7 @@ class StorageOperation(Document):
     name = "storage_operation"
     indexes = [
       IndexModel([("created_at", -1)]),
-      IndexModel([("kind", 1), ("server", 1), ("status", 1)]),
+      IndexModel([("kind", 1), ("bucket", 1), ("server", 1), ("target", 1), ("status", 1)]),
       IndexModel(["expires_at"], expireAfterSeconds=0),
     ]
 

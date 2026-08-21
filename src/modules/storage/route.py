@@ -300,6 +300,18 @@ async def get_replication_operations(
   return await storage_operations.get_replication_overview(bucket)
 
 
+@router.get(
+  path="/operations/orphan-buckets",
+  response_model=storage_schema.OrphanBucketOperationsResponse,
+  summary="盘点非应用存储桶",
+)
+async def get_orphan_bucket_operations(
+  current_user: User = Depends(get_current_user),
+):
+  await check_permissions(current_user, ["storage_operations_manage"])
+  return await storage_operations.get_orphan_bucket_overview()
+
+
 @router.post(
   path="/operations/replication/{bucket_name}/reconcile",
   response_model=storage_schema.ReplicationOperationResponse,

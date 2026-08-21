@@ -62,6 +62,7 @@ async def run_mc_json(
   *,
   timeout: float = 20.0,
   record: bool = True,
+  allow_empty: bool = False,
 ) -> tuple[bool, list[dict[str, Any]], str, float]:
   """Run an mc command without a shell and parse its JSON-lines output."""
   cmd = ["mc", *args]
@@ -119,6 +120,8 @@ async def run_mc_json(
   if process.returncode != 0 or has_error:
     return False, items, _mc_error_message(items, stderr or stdout), elapsed_ms
   if not items:
+    if allow_empty:
+      return True, [], "", elapsed_ms
     return False, [], "MinIO 命令未返回 JSON 数据", elapsed_ms
   return True, items, "", elapsed_ms
 
@@ -578,31 +581,33 @@ async def get_site_replication_status(master):
       return json.loads(output)
   return None
 
-async def get_server_buckets(server_name: str) -> List[str]:
-  """
-  获取存储桶列表
-  
-  Args:
-    server_name: 服务器名称
+async def list_server_buckets(
+  server_name: str,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, list[str], str, float]:
+  """List top-level buckets through mc and retain an actionable error."""
+  success, items, error, elapsed_ms = await run_mc_json(
+    ["ls", server_name],
+    timeout=timeout,
+    record=False,
+    allow_empty=True,
+  )
+  if not success:
+    return False, [], error, elapsed_ms
+  buckets: set[str] = set()
+  for item in items:
+    key = str(item.get("key") or item.get("name") or "").strip()
+    if not key:
+      continue
+    buckets.add(key.rstrip("/").rsplit("/", 1)[0])
+  return True, sorted(buckets), "", elapsed_ms
 
-  Returns:
-    List[str]: 存储桶列表
-  """
-  data = []
-  cmd = f"mc ls {server_name} --json"
-  success, output = await _run_cmd(cmd)
-  if success:
-    lines = [line.strip() for line in output.split('\n') if line.strip()]
-    for line in lines:
-      try:
-        bucket_item = json.loads(line)
-        if "key" in bucket_item:
-          data.append(bucket_item["key"].rsplit("/", 1)[0])
-        else:
-          continue
-      except json.JSONDecodeError:
-        continue
-  return data
+
+async def get_server_buckets(server_name: str) -> List[str]:
+  """Get the bucket names while preserving the legacy list-only API."""
+  success, buckets, _error, _elapsed_ms = await list_server_buckets(server_name)
+  return buckets if success else []
 
 async def enable_bucket_versioning(server_name: str, bucket_name: str):
   """
