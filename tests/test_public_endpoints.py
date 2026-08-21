@@ -26,12 +26,29 @@ async def test_endpoints_builds_gateway_url_from_server_domain(monkeypatch):
     "src.modules.storage.service.get_minio_server_list",
     new=AsyncMock(return_value={"data": [server]}),
   ):
-    result = await get_endpoints()
+    result = await get_endpoints(include_minio=True)
 
   endpoint = result["data"][0]
   assert endpoint["domain"] == "stor.1oa.com.cn"
   assert endpoint["endpoint"] == "http://stor.1oa.com.cn/server/bj"
   assert endpoint["minio_endpoint"] == "http://10.32.129.241:9000"
+
+
+async def test_endpoints_hides_minio_endpoint_by_default(monkeypatch):
+  """匿名/普通用户不返回 minio_endpoint，仅管理员（include_minio=True）可见。"""
+  monkeypatch.setattr("src.modules.public.service.settings.PUBLIC_SCHEME", "http")
+  monkeypatch.setattr("src.modules.public.service.settings.PUBLIC_DOMAIN", "")
+  server = _server(region="beijing", domain="stor.1oa.com.cn")
+
+  with patch(
+    "src.modules.storage.service.get_minio_server_list",
+    new=AsyncMock(return_value={"data": [server]}),
+  ):
+    result = await get_endpoints()
+
+  endpoint = result["data"][0]
+  assert "minio_endpoint" not in endpoint
+  assert endpoint["endpoint"] == "http://stor.1oa.com.cn/server/bj"
 
 
 async def test_endpoints_uses_public_domain_for_legacy_record(monkeypatch):

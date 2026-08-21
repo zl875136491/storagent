@@ -1,6 +1,7 @@
 """管理面路由依赖：写操作需鉴权依赖声明。"""
 import inspect
 
+from src.core import auth as auth_core
 from src.modules.storage import route as storage_route
 from src.modules.public import route as public_route
 from src.modules.auth import route as auth_route
@@ -50,7 +51,11 @@ def test_public_region_and_app_list_require_user():
 
 
 def test_public_endpoints_remain_unauthenticated_for_bootstrap():
-  assert "current_user" not in _endpoint_params(public_route.get_endpoints)
+  # get_endpoints 采用可选认证（auto_error=False）：匿名仍可达以支持启动探测，
+  # 仅当携带有效管理员 token 时才返回 minio_endpoint。
+  params = _endpoint_params(public_route.get_endpoints)
+  dep = params["current_user"].default
+  assert getattr(dep, "dependency", None) is auth_core.get_current_user_optional
   assert "current_user" not in _endpoint_params(public_route.test_endpoints)
 
 

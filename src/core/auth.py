@@ -15,6 +15,8 @@ from src.configs.consts import ROLE_SUPERADMIN, preset_permissions
 
 # OAuth2 密码流（用于从请求中提取 token）
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+# 可选认证：无 token 或 token 无效时返回 None 而非 401，用于公共接口按身份差异化返回
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
 def password_check(password: str) -> bool:
   """
@@ -202,6 +204,21 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
     raise credentials_exception
   
   return user
+
+async def get_current_user_optional(
+  token: Optional[str] = Depends(oauth2_scheme_optional),
+) -> Optional[User]:
+  """
+  可选的当前用户解析：未携带 token 或 token 无效/过期时返回 None，不抛异常。
+
+  用于公共接口在“匿名访客”与“已登录用户”之间做差异化响应（如字段脱敏）。
+  """
+  if not token:
+    return None
+  try:
+    return await get_current_user(token)
+  except CustomException:
+    return None
 
 def _role_id(role):
   role_id = getattr(role, "id", None)

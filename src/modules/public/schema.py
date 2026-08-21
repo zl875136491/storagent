@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Any, List, Literal
+from typing import Any, List, Literal, Optional
 from bson import ObjectId
 from pydantic_core import CoreSchema, core_schema
 from pydantic import GetCoreSchemaHandler, BaseModel, Field
@@ -187,7 +187,10 @@ class Endpoint(BaseModel):
   master: bool
   domain: str = Field(default="", description="对外 Nginx 网关域名")
   endpoint: str
-  minio_endpoint: str
+  minio_endpoint: Optional[str] = Field(
+    default=None,
+    description="MinIO 内网直连地址，仅管理员可见；匿名与普通用户不返回该字段",
+  )
 
 class EndpointsResponse(BaseModel):
   data: List[Endpoint]

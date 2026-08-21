@@ -40,12 +40,15 @@ from src.core.cors_origins import (
 )
 from src.configs.configs import settings
 
-async def get_endpoints() -> dict[str, List[str]]:
+async def get_endpoints(include_minio: bool = False) -> dict[str, List[str]]:
   """
   获取对外网关端点列表。
 
   `host` 是 MinIO 内网管理地址；浏览器和 App 后端应以 `domain` 为核心，
   经宿主 Nginx 的 /server/{region} 路由访问 Storagent。
+
+  `minio_endpoint` 为内网直连地址，仅对管理员（include_minio=True）返回，
+  匿名与普通登录用户不返回该字段，避免内网拓扑随公共接口外泄。
   """
   from src.modules.storage import service as storage_service
   minio_server_objs = await storage_service.get_minio_server_list()
@@ -78,7 +81,7 @@ async def get_endpoints() -> dict[str, List[str]]:
     # Test doubles and pre-link records may not expose Region.id; the public
     # endpoint contract keeps the field nullable until the region is hydrated.
     region_id = getattr(minio_server_obj.region, "id", None)
-    data.append({
+    item = {
       "region_id": region_id,
       "server_id": minio_server_obj.id,
       "name": minio_server_obj.region.name,
@@ -86,8 +89,10 @@ async def get_endpoints() -> dict[str, List[str]]:
       "master": minio_server_obj.master,
       "domain": public_domain(minio_server_obj),
       "endpoint": public_endpoint(minio_server_obj),
-      "minio_endpoint": f"{settings.PUBLIC_SCHEME}://{minio_server_obj.host}:{minio_server_obj.minio_port}",
-    })
+    }
+    if include_minio:
+      item["minio_endpoint"] = f"{settings.PUBLIC_SCHEME}://{minio_server_obj.host}:{minio_server_obj.minio_port}"
+    data.append(item)
   return dict[str, List[dict]](data=data)
 
 async def test_endpoints() -> bytes:

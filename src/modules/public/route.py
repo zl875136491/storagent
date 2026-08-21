@@ -1,5 +1,7 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, Body
-from src.core.auth import _is_superadmin, get_current_user, check_permissions
+from src.core.auth import _is_superadmin, get_current_user, get_current_user_optional, check_permissions
 from src.modules.auth.model import User
 from src.modules.public import service as public_service
 from src.modules.public import schema as public_schema
@@ -12,11 +14,17 @@ router = APIRouter()
   path="/endpoints",
   response_model=public_schema.EndpointsResponse,
   summary="获取端点列表")
-async def get_endpoints() -> public_schema.EndpointsResponse:
+async def get_endpoints(
+  current_user: Optional[User] = Depends(get_current_user_optional),
+) -> public_schema.EndpointsResponse:
   """
-  获取端点列表
+  获取端点列表。
+
+  该接口保持匿名可达（前端探测后端依赖它）；MinIO 内网直连地址
+  仅对管理员返回，匿名与普通登录用户不返回 minio_endpoint 字段。
   """
-  return await public_service.get_endpoints()
+  include_minio = current_user is not None and await _is_superadmin(current_user)
+  return await public_service.get_endpoints(include_minio=include_minio)
 
 @router.get(
   path="/endpoints/test",
