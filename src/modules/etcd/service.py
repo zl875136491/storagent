@@ -520,7 +520,14 @@ async def _execute_task(task_id: str, actor: str, revision: int | None) -> None:
 async def create_task(kind: str, actor: str, revision: int | None = None) -> schema.EtcdTaskResponse:
   task = EtcdOperationTask(kind=kind, actor=actor, message="任务已排队")
   await task.insert()
-  asyncio.create_task(_execute_task(str(task.id), actor, revision))
+  try:
+    from src.core.celery_client import dispatch_task
+    task_id = dispatch_task("storagent.etcd.execute", str(task.id), actor, revision)
+    if task_id is None:
+      asyncio.create_task(_execute_task(str(task.id), actor, revision))
+  except Exception as error:
+    logger.warning("Celery Etcd 任务派发失败，回退到本地执行: {}", error)
+    asyncio.create_task(_execute_task(str(task.id), actor, revision))
   return _task_response(task)
 
 

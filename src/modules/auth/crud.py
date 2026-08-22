@@ -363,6 +363,17 @@ async def cleanup_expired_tokens_task():
       logger.warning(f"token 清理失败: {e}")
     await asyncio.sleep(3600)
 
+
+async def cleanup_expired_tokens_once() -> dict[str, int]:
+  """Run one bounded cleanup pass for Celery Beat."""
+  count = await cleanup_expired_tokens()
+  challenge_count = await cleanup_expired_auth_challenges()
+  if count:
+    logger.info(f"清理了 {count} 条过期 token")
+  if challenge_count:
+    logger.info(f"清理了 {challenge_count} 条过期 OA 认证挑战")
+  return {"tokens": count, "challenges": challenge_count}
+
 async def get_all_permissions(roles: List[Role]) -> List[str]:
   """
   获取所有角色权限

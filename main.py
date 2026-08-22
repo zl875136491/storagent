@@ -7,18 +7,13 @@ from src.core.database import init_db, close_db
 from src.configs.configs import settings
 from src.utils.logger import setup_logging
 from src.core.initialization import init_project, init_service
-from src.core.etcd_op import get_etcd_client, reconcile_etcd_task, watch_etcd_task
-from src.core.sync import reconcile_replication_policies_task
+from src.core.etcd_op import get_etcd_client, watch_etcd_task
 from src.core.cors_origins import allowlist, load_allowlist_from_mongo
 from src.core.exception import register_exception
 from src.core.middleware import RequestContextMiddleware, UploadBodyLimitMiddleware
-from src.modules.files.archive import archive_expired_objects_task
-from src.modules.auth.crud import cleanup_expired_tokens_task
 from src.modules.storage.operations import (
-  monitor_cluster_health_task,
   shutdown_background_operations,
 )
-from src.modules.capacity.service import capacity_snapshot_task
 import asyncio
 
 app_description = """
@@ -61,31 +56,11 @@ async def lifespan(app: FastAPI):
   etcd_client = await get_etcd_client()
   watch_job = asyncio.create_task(watch_etcd_task(etcd_client))
 
-  # 6. 周期全量校准，修复 Watch 断线或启动窗口漏事件
-  reconcile_job = asyncio.create_task(reconcile_etcd_task())
-
-  # 7. 过期 token 清理后台任务
-  cleanup_job = asyncio.create_task(cleanup_expired_tokens_task())
-  archive_job = asyncio.create_task(archive_expired_objects_task())
-
-  # 8. 权威区域周期验收并补齐启用应用的全连接复制策略
-  replication_reconcile_job = asyncio.create_task(
-    reconcile_replication_policies_task()
-  )
-
-  # 9. 权威区域监控 MinIO 磁盘健康，并记录原生自愈状态
-  cluster_health_job = asyncio.create_task(monitor_cluster_health_task())
-  capacity_snapshot_job = asyncio.create_task(capacity_snapshot_task())
+  # 周期维护、长耗时运维和 Etcd 全量校准由 Celery Beat/Worker 承担。
 
   yield
   
   watch_job.cancel()
-  reconcile_job.cancel()
-  cleanup_job.cancel()
-  archive_job.cancel()
-  replication_reconcile_job.cancel()
-  cluster_health_job.cancel()
-  capacity_snapshot_job.cancel()
   await shutdown_background_operations()
   try:
     await etcd_client.close()

@@ -46,6 +46,9 @@ async def _persist(
     logger.warning(f"审计落库失败: {e}")
 
 
+persist_audit_event = _persist
+
+
 def audit(
   action: str,
   *,
@@ -73,8 +76,19 @@ def audit(
     metrics_mod.incr("audit_failures_total")
 
   try:
-    loop = asyncio.get_running_loop()
-    loop.create_task(_persist(action, actor_s, resource_s, success, detail_s))
+    from src.core.celery_client import dispatch_task
+    task_id = dispatch_task("storagent.audit.persist", action, actor_s, resource_s, success, detail_s)
+    if task_id is None:
+      loop = asyncio.get_running_loop()
+      loop.create_task(_persist(action, actor_s, resource_s, success, detail_s))
   except RuntimeError:
     # 无事件循环（如纯同步单测）时仅写日志
     pass
+  except Exception as error:
+    # Celery 暂时不可用时审计仍保留原有本地异步落库能力。
+    logger.warning("Celery 审计任务派发失败，回退到本地执行: {}", error)
+    try:
+      loop = asyncio.get_running_loop()
+      loop.create_task(_persist(action, actor_s, resource_s, success, detail_s))
+    except RuntimeError:
+      pass

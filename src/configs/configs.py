@@ -81,6 +81,16 @@ class Settings(BaseSettings):
   MONGO_DB_NAME: str = "storagent"
   MONGO_DB_AUTH_SOURCE: str = "admin"
 
+  # Celery uses MongoDB for both broker transport and result metadata.
+  CELERY_ENABLED: bool = False
+  CELERY_BROKER_URL: str = ""
+  CELERY_RESULT_BACKEND: str = ""
+  CELERY_MONGODB_DATABASE: str = "storagent_celery"
+  CELERY_MONGODB_MESSAGES_COLLECTION: str = "celery.messages"
+  CELERY_MONGODB_ROUTING_COLLECTION: str = "celery.routing"
+  CELERY_MONGODB_QUEUES_COLLECTION: str = "celery.queues"
+  CELERY_MONGODB_RESULT_COLLECTION: str = "celery_taskmeta"
+
   # Minio
   MINIO_HOST: str = "localhost"
   MINIO_PORT: int = 9000

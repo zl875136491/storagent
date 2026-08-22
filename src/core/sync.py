@@ -1534,7 +1534,7 @@ async def ensure_bucket_quotas(
     raise RuntimeError(f"存储桶配额设置失败: {detail}")
 
 
-async def reconcile_replication_policies_task():
+async def reconcile_replication_policies_task(single_pass: bool = False):
   """Authority-region loop that repairs missing rules for enabled apps."""
   if settings.REGION != settings.SYNC_AUTHORITY_REGION:
     logger.info("非权威区域不执行复制策略校准")
@@ -1619,6 +1619,8 @@ async def reconcile_replication_policies_task():
       raise
     except Exception as e:
       logger.warning(f"复制策略周期校准失败: {e}")
+    if single_pass:
+      return
     await asyncio.sleep(interval)
 
 

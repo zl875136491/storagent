@@ -1136,7 +1136,7 @@ async def reconcile_bucket_replication(bucket: str, actor: str) -> dict[str, Any
   operation.message = "复制规则校准任务已进入队列"
   operation.result = {"scope": "full_mesh"}
   await operation.save()
-  _spawn(_run_replication_reconcile_operation(operation))
+  _enqueue_storage_operation(str(operation.id), lambda: _run_replication_reconcile_operation(operation))
   return _replication_operation_response(operation)
 
 
@@ -1332,7 +1332,7 @@ async def start_replication_resync(
     "older_than": older_than or "",
   }
   await operation.save()
-  _spawn(_run_replication_resync_operation(operation))
+  _enqueue_storage_operation(str(operation.id), lambda: _run_replication_resync_operation(operation))
   return _replication_operation_response(operation)
 
 
@@ -1387,6 +1387,33 @@ def _spawn(coro: Any) -> None:
   task = asyncio.create_task(coro)
   _background_tasks.add(task)
   task.add_done_callback(_background_tasks.discard)
+
+
+def _enqueue_storage_operation(operation_id: str, fallback_factory) -> None:
+  """Send an operation to Celery, retaining a local fallback for outages."""
+  try:
+    from src.core.celery_client import dispatch_task
+    task_id = dispatch_task("storagent.storage.execute_operation", operation_id)
+    if task_id is None:
+      _spawn(fallback_factory())
+  except Exception as error:
+    logger.warning("Celery 任务派发失败，回退到本地执行 operation={}: {}", operation_id, error)
+    _spawn(fallback_factory())
+
+
+async def execute_storage_operation(operation_id: str) -> None:
+  """Worker entry point for one persisted storage operation."""
+  operation = await StorageOperation.get(operation_id)
+  if operation is None:
+    return
+  if operation.kind == "replication_reconcile":
+    await _run_replication_reconcile_operation(operation)
+  elif operation.kind == "replication_resync":
+    await _run_replication_resync_operation(operation)
+  elif operation.kind == "cluster_heal":
+    await _run_heal_operation(operation)
+  else:
+    raise ValueError(f"不支持的存储运维任务类型: {operation.kind}")
 
 
 def _heal_result(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1482,7 +1509,7 @@ async def start_cluster_heal(server_name: str, actor: str) -> dict[str, Any]:
   )
   operation.message = "自愈巡检任务已进入队列"
   await operation.save()
-  _spawn(_run_heal_operation(operation))
+  _enqueue_storage_operation(str(operation.id), lambda: _run_heal_operation(operation))
   return _operation_dict(operation) or {}
 
 
@@ -1491,7 +1518,7 @@ async def list_storage_operations(limit: int = 20) -> dict[str, Any]:
   return {"data": [_operation_dict(item) for item in operations]}
 
 
-async def monitor_cluster_health_task() -> None:
+async def monitor_cluster_health_task(single_pass: bool = False) -> None:
   """Authority-only loop that records native MinIO healing when drives need it."""
   if settings.REGION != settings.SYNC_AUTHORITY_REGION:
     logger.info("非权威区域不执行 MinIO 自动自愈监控")
@@ -1524,6 +1551,8 @@ async def monitor_cluster_health_task() -> None:
     except Exception as e:
       metrics_mod.incr("cluster_health_monitor_failures_total")
       logger.warning(f"MinIO 自动自愈监控失败: {e}")
+    if single_pass:
+      return
     await asyncio.sleep(interval)
 
 

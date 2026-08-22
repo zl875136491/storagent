@@ -142,12 +142,10 @@ async def watch_etcd_task(client: aetcd.Client):
         logger.warning(f"Etcd 客户端重建失败: {ce}")
 
 
-async def reconcile_etcd_task():
-  """Periodically heal Mongo state if a Watch event was missed or failed."""
-  interval = max(float(settings.SYNC_RECONCILE_INTERVAL_SECONDS), 5.0)
-  while True:
-    client = None
-    try:
+async def reconcile_etcd_once() -> dict[str, str]:
+  """Run one bounded Etcd-to-Mongo reconciliation pass."""
+  client = None
+  try:
       client = await get_etcd_client()
       await sync_module.publish_roles(client=client)
       await sync_module.publish_local_users(client=client)
@@ -157,20 +155,32 @@ async def reconcile_etcd_task():
       from src.core import metrics as metrics_mod
       metrics_mod.incr("sync_reconcile_runs_total")
       metrics_mod.set_gauge("sync_last_success_timestamp_seconds", time.time())
-    except asyncio.CancelledError:
-      logger.info("Etcd 周期全量校准已停止")
-      raise
-    except Exception as e:
+      return {"status": "succeeded"}
+  except Exception as e:
       from src.core import metrics as metrics_mod
       metrics_mod.incr("sync_reconcile_failures_total")
       metrics_mod.set_gauge("sync_last_failure_timestamp_seconds", time.time())
       logger.warning(f"Etcd 周期全量校准失败: {e}")
-    finally:
-      if client is not None:
-        try:
-          await client.close()
-        except Exception:
-          pass
+      raise
+  finally:
+    if client is not None:
+      try:
+        await client.close()
+      except Exception:
+        pass
+
+
+async def reconcile_etcd_task():
+  """Legacy in-process loop; retained for deployments without Celery."""
+  interval = max(float(settings.SYNC_RECONCILE_INTERVAL_SECONDS), 5.0)
+  while True:
+    try:
+      await reconcile_etcd_once()
+    except asyncio.CancelledError:
+      logger.info("Etcd 周期全量校准已停止")
+      raise
+    except Exception:
+      pass
     await asyncio.sleep(interval)
 
 
