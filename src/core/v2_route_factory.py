@@ -37,9 +37,14 @@ def clone_router(
       if isinstance(result, Response):
         return result
       # Preserve the v1 response model's custom encoders (notably Mongo
-      # ObjectId values) before enclosing the result in the v2 envelope.
+      # ObjectId values) before enclosing the result in the v2 envelope. v1
+      # services commonly return Beanie Documents, so validation must support
+      # attribute-based input just like FastAPI's response validation does.
       data = (
-        __adapter.dump_python(__adapter.validate_python(result), mode="json")
+        __adapter.dump_python(
+          __adapter.validate_python(result, from_attributes=True),
+          mode="json",
+        )
         if __adapter is not None
         else jsonable_encoder(result)
       )
