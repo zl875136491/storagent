@@ -224,31 +224,65 @@ class ReplicationResyncRequest(BaseModel):
   older_than: str | None = Field(None, max_length=64, description="可选 mc 时长，如 7d12h")
 
 
-OrphanBucketKind = Literal["orphan", "disabled_application", "system"]
+UnmanagedBucketKind = Literal["unmanaged", "disabled_application", "system"]
+UnmanagedBucketDisposition = Literal[
+  "unreviewed",
+  "retained",
+  "deleting",
+  "delete_failed",
+  "not_applicable",
+]
 
 
-class OrphanBucketItem(BaseModel):
+class UnmanagedBucketItem(BaseModel):
   name: str
-  kind: OrphanBucketKind
+  kind: UnmanagedBucketKind
   app_name: str = ""
   app_shown_name: str = ""
   servers: list[str] = Field(default_factory=list)
   missing_servers: list[str] = Field(default_factory=list)
+  unreachable_servers: list[str] = Field(default_factory=list)
+  coverage_status: Literal["complete", "partial", "unreachable"] = "complete"
+  disposition: UnmanagedBucketDisposition = "not_applicable"
+  disposition_reason: str = ""
+  disposition_updated_at: datetime | None = None
 
 
-class OrphanBucketOperationsSummary(BaseModel):
-  orphan_count: int = 0
+class UnmanagedBucketOperationsSummary(BaseModel):
+  unmanaged_count: int = 0
   disabled_application_count: int = 0
   system_bucket_count: int = 0
   unavailable_server_count: int = 0
 
 
-class OrphanBucketOperationsResponse(BaseModel):
+class UnmanagedBucketOperationsResponse(BaseModel):
   generated_at: datetime
   servers: list[str] = Field(default_factory=list)
-  summary: OrphanBucketOperationsSummary
-  buckets: list[OrphanBucketItem] = Field(default_factory=list)
+  summary: UnmanagedBucketOperationsSummary
+  buckets: list[UnmanagedBucketItem] = Field(default_factory=list)
   errors: dict[str, str] = Field(default_factory=dict)
+
+
+class UnmanagedBucketRetainRequest(BaseModel):
+  reason: str = Field(default="", max_length=500)
+
+
+class UnmanagedBucketDeleteRequest(BaseModel):
+  confirmation: str = Field(..., min_length=3, max_length=63)
+
+
+class UnmanagedBucketActionResponse(BaseModel):
+  message: str
+  bucket: str
+  disposition: UnmanagedBucketDisposition
+  operation: dict[str, Any] | None = None
+
+
+# The old endpoint remains temporarily available for prior console builds.
+OrphanBucketKind = UnmanagedBucketKind
+OrphanBucketItem = UnmanagedBucketItem
+OrphanBucketOperationsSummary = UnmanagedBucketOperationsSummary
+OrphanBucketOperationsResponse = UnmanagedBucketOperationsResponse
 
 
 class ReplicationOperationResponse(BaseModel):
@@ -333,7 +367,12 @@ class ClusterHealthResponse(BaseModel):
 
 class StorageOperationItem(BaseModel):
   id: str
-  kind: Literal["cluster_heal", "replication_reconcile", "replication_resync"]
+  kind: Literal[
+    "cluster_heal",
+    "replication_reconcile",
+    "replication_resync",
+    "unmanaged_bucket_delete",
+  ]
   status: Literal["queued", "running", "succeeded", "failed"]
   server: str
   bucket: str = ""

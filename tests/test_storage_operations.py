@@ -861,7 +861,9 @@ async def test_resync_runner_handles_concurrent_start_as_idempotent(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_orphan_bucket_overview_classifies_non_application_buckets(monkeypatch):
+async def test_unmanaged_bucket_overview_classifies_non_application_buckets(monkeypatch):
+  retained_at = utc_now()
+
   async def server_names():
     return ["beijing", "shenzhen"]
 
@@ -878,16 +880,126 @@ async def test_orphan_bucket_overview_classifies_non_application_buckets(monkeyp
     }
     return True, values[server], "", 1.0
 
+  async def dispositions():
+    return [SimpleNamespace(
+      bucket="orphan-a",
+      status="retained",
+      reason="第三方迁移保留",
+      updated_at=retained_at,
+    )]
+
+  async def latest(*_args, **_kwargs):
+    return SimpleNamespace(
+      status="failed",
+      message="上一次空桶复核发现对象",
+      created_at=retained_at - timedelta(minutes=2),
+      finished_at=retained_at - timedelta(minutes=1),
+    )
+
   monkeypatch.setattr(operations.storage_crud, "read_minio_server_names", server_names)
   monkeypatch.setattr(operations.public_crud, "read_application_list", applications)
   monkeypatch.setattr(operations.minio_op, "list_server_buckets", list_buckets)
+  monkeypatch.setattr(operations.storage_crud, "list_unmanaged_bucket_dispositions", dispositions)
+  monkeypatch.setattr(operations.storage_crud, "read_latest_storage_operation", latest)
   monkeypatch.setattr(operations.settings, "OBJECT_ARCHIVE_BUCKET", "storagent-expired-archive")
 
-  result = await operations.get_orphan_bucket_overview()
+  result = await operations.get_unmanaged_bucket_overview()
 
   rows = {item["name"]: item for item in result["buckets"]}
   assert set(rows) == {"disabled-app", "orphan-a", "storagent-expired-archive"}
-  assert rows["orphan-a"]["kind"] == "orphan"
+  assert result["summary"]["unmanaged_count"] == 1
+  assert rows["orphan-a"]["kind"] == "unmanaged"
+  assert rows["orphan-a"]["disposition"] == "retained"
   assert rows["disabled-app"]["kind"] == "disabled_application"
   assert rows["disabled-app"]["missing_servers"] == ["shenzhen"]
   assert rows["storagent-expired-archive"]["kind"] == "system"
+  schema.UnmanagedBucketOperationsResponse.model_validate(result)
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_bucket_delete_requires_confirmation_and_queues_task(monkeypatch):
+  async def overview():
+    return {
+      "buckets": [{
+        "name": "manual-bucket",
+        "kind": "unmanaged",
+        "servers": ["beijing", "shenzhen"],
+        "coverage_status": "complete",
+        "missing_servers": [],
+        "unreachable_servers": [],
+      }],
+    }
+
+  async def no_active(*_args, **_kwargs):
+    return None
+
+  class Operation:
+    id = "unmanaged-delete-task"
+    kind = "unmanaged_bucket_delete"
+    status = "queued"
+    server = "all"
+    bucket = "manual-bucket"
+    target = ""
+    actor = "admin"
+    message = ""
+    result = {}
+    created_at = utc_now()
+    started_at = None
+    finished_at = None
+
+    async def save(self):
+      return None
+
+  operation = Operation()
+  queued = []
+
+  async def create(**kwargs):
+    assert kwargs == {
+      "kind": "unmanaged_bucket_delete",
+      "server": "all",
+      "bucket": "manual-bucket",
+      "target": "",
+      "actor": "admin",
+    }
+    return operation
+
+  def enqueue(operation_id, factory):
+    queued.append(operation_id)
+    coro = factory()
+    coro.close()
+
+  monkeypatch.setattr(operations, "get_unmanaged_bucket_overview", overview)
+  monkeypatch.setattr(operations.storage_crud, "read_active_storage_operation", no_active)
+  monkeypatch.setattr(operations.storage_crud, "create_storage_operation", create)
+  monkeypatch.setattr(operations, "_enqueue_storage_operation", enqueue)
+
+  with pytest.raises(Exception, match="完全一致"):
+    await operations.delete_unmanaged_bucket("manual-bucket", "other", "admin")
+
+  result = await operations.delete_unmanaged_bucket("manual-bucket", "manual-bucket", "admin")
+
+  assert queued == ["unmanaged-delete-task"]
+  assert operation.result == {"servers": ["beijing", "shenzhen"]}
+  assert result["status"] == "queued"
+  assert result["bucket"] == "manual-bucket"
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_bucket_delete_rejects_retained_bucket(monkeypatch):
+  async def overview():
+    return {
+      "buckets": [{
+        "name": "manual-bucket",
+        "kind": "unmanaged",
+        "servers": ["beijing", "shenzhen"],
+        "coverage_status": "complete",
+        "missing_servers": [],
+        "unreachable_servers": [],
+        "disposition": "retained",
+      }],
+    }
+
+  monkeypatch.setattr(operations, "get_unmanaged_bucket_overview", overview)
+
+  with pytest.raises(Exception, match="受控保留"):
+    await operations.delete_unmanaged_bucket("manual-bucket", "manual-bucket", "admin")

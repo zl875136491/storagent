@@ -20,6 +20,9 @@ def test_storage_write_routes_require_user():
     storage_route.delete_bucket_replicate,
     storage_route.reconcile_bucket_replication,
     storage_route.start_bucket_replication_resync,
+    storage_route.retain_unmanaged_bucket,
+    storage_route.release_unmanaged_bucket_retention,
+    storage_route.delete_unmanaged_bucket,
     storage_route.start_cluster_heal,
     storage_route.create_one_time_object_download,
   ):
@@ -33,6 +36,7 @@ def test_storage_read_routes_require_user():
     storage_route.get_buckets,
     storage_route.get_bucket_replicate_infos,
     storage_route.get_replication_operations,
+    storage_route.get_unmanaged_bucket_operations,
     storage_route.get_cluster_health_operations,
     storage_route.get_cluster_heal_status,
     storage_route.get_storage_operations,

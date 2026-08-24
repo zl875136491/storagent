@@ -5,6 +5,7 @@ from src.modules.storage.model import (
   MinioServer,
   ServerFileDetailsCache,
   StorageOperation,
+  UnmanagedBucketDisposition,
 )
 from src.modules.public.model import Region
 from src.modules.public.model import Application
@@ -12,7 +13,7 @@ from src.modules.storage.model import MinioBucket
 from src.core.exception import CustomException, ErrorDesc
 from src.core.crypto import encrypt_secret, minio_server_plain_credentials
 from loguru import logger
-from src.utils.helpers import try_to_obj_id
+from src.utils.helpers import try_to_obj_id, utc_now
 from src.configs.configs import settings
 from dataclasses import dataclass
 from datetime import datetime
@@ -316,6 +317,56 @@ async def read_latest_storage_operation(
 
 async def list_storage_operations(limit: int = 20) -> list[StorageOperation]:
   return await StorageOperation.find_all().sort("-created_at").limit(limit).to_list()
+
+
+async def read_unmanaged_bucket_disposition(
+  bucket: str,
+) -> UnmanagedBucketDisposition | None:
+  return await UnmanagedBucketDisposition.find_one(
+    UnmanagedBucketDisposition.bucket == bucket,
+  )
+
+
+async def list_unmanaged_bucket_dispositions() -> list[UnmanagedBucketDisposition]:
+  return await UnmanagedBucketDisposition.find_all().to_list()
+
+
+async def upsert_unmanaged_bucket_disposition(
+  bucket: str,
+  *,
+  status: str,
+  reason: str,
+  actor: str,
+  servers: list[str],
+) -> UnmanagedBucketDisposition:
+  item = await read_unmanaged_bucket_disposition(bucket)
+  now = utc_now()
+  if item is None:
+    item = UnmanagedBucketDisposition(
+      bucket=bucket,
+      status=status,
+      reason=reason,
+      actor=actor,
+      servers=sorted(set(servers)),
+      created_at=now,
+      updated_at=now,
+    )
+    await item.insert()
+    return item
+  item.status = status
+  item.reason = reason
+  item.actor = actor
+  item.servers = sorted(set(servers))
+  item.updated_at = now
+  await item.save()
+  return item
+
+
+async def delete_unmanaged_bucket_disposition(bucket: str) -> bool:
+  result = await UnmanagedBucketDisposition.get_motor_collection().delete_one({
+    "bucket": bucket,
+  })
+  return bool(result.deleted_count)
 
 async def create_minio_bucket(
   region: Region,

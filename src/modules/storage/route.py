@@ -301,15 +301,86 @@ async def get_replication_operations(
 
 
 @router.get(
-  path="/operations/orphan-buckets",
-  response_model=storage_schema.OrphanBucketOperationsResponse,
-  summary="盘点非应用存储桶",
+  path="/operations/unmanaged-buckets",
+  response_model=storage_schema.UnmanagedBucketOperationsResponse,
+  summary="盘点未纳管存储桶",
 )
-async def get_orphan_bucket_operations(
+async def get_unmanaged_bucket_operations(
   current_user: User = Depends(get_current_user),
 ):
   await check_permissions(current_user, ["storage_operations_manage"])
-  return await storage_operations.get_orphan_bucket_overview()
+  return await storage_operations.get_unmanaged_bucket_overview()
+
+
+@router.get(
+  path="/operations/orphan-buckets",
+  response_model=storage_schema.UnmanagedBucketOperationsResponse,
+  include_in_schema=False,
+)
+async def get_orphan_bucket_operations_compat(
+  current_user: User = Depends(get_current_user),
+):
+  """Compatibility endpoint for older console bundles."""
+  await check_permissions(current_user, ["storage_operations_manage"])
+  return await storage_operations.get_unmanaged_bucket_overview()
+
+
+@router.post(
+  path="/operations/unmanaged-buckets/{bucket_name}/retain",
+  response_model=storage_schema.UnmanagedBucketActionResponse,
+  summary="登记未纳管存储桶保留",
+)
+async def retain_unmanaged_bucket(
+  bucket_name: str,
+  payload: storage_schema.UnmanagedBucketRetainRequest,
+  current_user: User = Depends(get_current_user),
+):
+  await check_permissions(current_user, ["storage_operations_manage"])
+  return await storage_operations.retain_unmanaged_bucket(
+    bucket_name,
+    payload.reason,
+    current_user.username,
+  )
+
+
+@router.delete(
+  path="/operations/unmanaged-buckets/{bucket_name}/retain",
+  response_model=storage_schema.UnmanagedBucketActionResponse,
+  summary="取消未纳管存储桶保留",
+)
+async def release_unmanaged_bucket_retention(
+  bucket_name: str,
+  current_user: User = Depends(get_current_user),
+):
+  await check_permissions(current_user, ["storage_operations_manage"])
+  return await storage_operations.release_unmanaged_bucket_retention(
+    bucket_name,
+    current_user.username,
+  )
+
+
+@router.post(
+  path="/operations/unmanaged-buckets/{bucket_name}/delete",
+  response_model=storage_schema.UnmanagedBucketActionResponse,
+  summary="清理未纳管空存储桶",
+)
+async def delete_unmanaged_bucket(
+  bucket_name: str,
+  payload: storage_schema.UnmanagedBucketDeleteRequest,
+  current_user: User = Depends(get_current_user),
+):
+  await check_permissions(current_user, ["storage_operations_manage"])
+  operation = await storage_operations.delete_unmanaged_bucket(
+    bucket_name,
+    payload.confirmation,
+    current_user.username,
+  )
+  return {
+    "message": operation.get("message", "清理任务已进入队列"),
+    "bucket": bucket_name.strip(),
+    "disposition": "deleting" if operation.get("status") in {"queued", "running"} else "delete_failed",
+    "operation": operation,
+  }
 
 
 @router.post(

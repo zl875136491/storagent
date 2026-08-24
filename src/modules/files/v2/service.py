@@ -128,7 +128,7 @@ async def delete(request, app_name, object_id):
   if item.state != "active":
     raise CustomException(ErrorDesc.STATUS_ERR, "对象当前状态不允许删除")
   now = utc_now()
-  restore_until = now + timedelta(days=30)
+  restore_until = now + timedelta(days=max(int(settings.OBJECT_RECOVERY_PERIOD_DAYS), 1))
   # The App lock serializes quota accounting. The conditional catalog change
   # means only its winner can release the logical bytes.
   async with quota.application_quota_lock(app_name) as quota_client:

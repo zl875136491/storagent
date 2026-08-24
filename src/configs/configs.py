@@ -140,6 +140,7 @@ class Settings(BaseSettings):
   # Soft-deleted objects remain recoverable until restore_until. Once that
   # deadline is reached they are copied to this internal bucket, then removed
   # from the application bucket by the local archive worker.
+  OBJECT_RECOVERY_PERIOD_DAYS: int = 30
   OBJECT_ARCHIVE_BUCKET: str = "storagent-expired-archive"
   OBJECT_ARCHIVE_INTERVAL_SECONDS: float = 300.0
   OBJECT_ARCHIVE_BATCH_SIZE: int = 50
@@ -217,6 +218,10 @@ class Settings(BaseSettings):
       return
 
     errors: list[str] = []
+    if self.OBJECT_RECOVERY_PERIOD_DAYS < 1:
+      errors.append("OBJECT_RECOVERY_PERIOD_DAYS 必须大于 0")
+    if not self.OBJECT_ARCHIVE_BUCKET.strip():
+      errors.append("OBJECT_ARCHIVE_BUCKET 不能为空")
     if self.REGION.strip().lower() in ("", "undefined"):
       errors.append("REGION 未设置（不能为 undefined）")
 

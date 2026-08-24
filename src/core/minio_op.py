@@ -604,6 +604,54 @@ async def list_server_buckets(
   return True, sorted(buckets), "", elapsed_ms
 
 
+async def get_bucket_object_summary(
+  server_name: str,
+  bucket_name: str,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, dict[str, int], str, float]:
+  """Count all object versions before a guarded empty-bucket cleanup."""
+  success, items, error, elapsed_ms = await run_mc_json(
+    ["ls", "--recursive", "--versions", f"{server_name}/{bucket_name}"],
+    timeout=timeout,
+    record=False,
+    allow_empty=True,
+  )
+  if not success:
+    return False, {}, error, elapsed_ms
+  object_count = 0
+  version_count = 0
+  total_bytes = 0
+  for item in items:
+    key = str(item.get("key") or item.get("name") or "").strip()
+    if not key:
+      continue
+    object_count += 1
+    if item.get("versionId") or item.get("versionID"):
+      version_count += 1
+    total_bytes += _parse_mc_size_bytes(item.get("size")) or 0
+  return True, {
+    "object_count": object_count,
+    "version_count": version_count,
+    "total_bytes": total_bytes,
+  }, "", elapsed_ms
+
+
+async def remove_empty_bucket(
+  server_name: str,
+  bucket_name: str,
+  *,
+  timeout: float = 20.0,
+) -> tuple[bool, str, float]:
+  """Remove a bucket only when MinIO confirms it is empty."""
+  success, _items, error, elapsed_ms = await run_mc_json(
+    ["rb", f"{server_name}/{bucket_name}"],
+    timeout=timeout,
+    allow_empty=True,
+  )
+  return success, error, elapsed_ms
+
+
 async def get_server_buckets(server_name: str) -> List[str]:
   """Get the bucket names while preserving the legacy list-only API."""
   success, buckets, _error, _elapsed_ms = await list_server_buckets(server_name)

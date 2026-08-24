@@ -95,7 +95,12 @@ class ServerFileDetailsCache(Document):
 
 class StorageOperation(Document):
   """Persistent state for long-running MinIO maintenance operations."""
-  kind: Literal["cluster_heal", "replication_reconcile", "replication_resync"]
+  kind: Literal[
+    "cluster_heal",
+    "replication_reconcile",
+    "replication_resync",
+    "unmanaged_bucket_delete",
+  ]
   status: Literal["queued", "running", "succeeded", "failed"] = "queued"
   server: str
   bucket: str = ""
@@ -114,6 +119,24 @@ class StorageOperation(Document):
       IndexModel([("created_at", -1)]),
       IndexModel([("kind", 1), ("bucket", 1), ("server", 1), ("target", 1), ("status", 1)]),
       IndexModel(["expires_at"], expireAfterSeconds=0),
+    ]
+
+
+class UnmanagedBucketDisposition(Document):
+  """A deliberate operations decision for a bucket without application ownership."""
+  bucket: str
+  status: Literal["retained", "deleted"] = "retained"
+  reason: str = ""
+  actor: str = "-"
+  servers: list[str] = Field(default_factory=list)
+  created_at: datetime = Field(default_factory=utc_now)
+  updated_at: datetime = Field(default_factory=utc_now)
+
+  class Settings:
+    name = "unmanaged_bucket_disposition"
+    indexes = [
+      IndexModel(["bucket"], unique=True),
+      IndexModel([("updated_at", -1)]),
     ]
 
 
