@@ -92,6 +92,15 @@ class Settings(BaseSettings):
   CELERY_MONGODB_ROUTING_COLLECTION: str = "celery.routing"
   CELERY_MONGODB_QUEUES_COLLECTION: str = "celery.queues"
   CELERY_MONGODB_RESULT_COLLECTION: str = "celery_taskmeta"
+  # Worker-side observability records are written alongside Celery results.
+  # Keeping the database explicit supports deployments whose result backend is
+  # separated from the broker database.
+  CELERY_MONGODB_RESULT_DATABASE: str = ""
+  CELERY_TASK_HISTORY_COLLECTION: str = "celery_task_history"
+  CELERY_WORKER_HEARTBEAT_COLLECTION: str = "celery_worker_heartbeats"
+  CELERY_RUNTIME_TIMEOUT_SECONDS: float = 1.5
+  CELERY_WORKER_STALE_AFTER_SECONDS: int = 90
+  AUTH_CLEANUP_INTERVAL_SECONDS: int = 3600
 
   # Minio
   MINIO_HOST: str = "localhost"

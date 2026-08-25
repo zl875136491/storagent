@@ -23,6 +23,7 @@ from src.modules.audit.v2.route import router as audit_v2_router
 from src.modules.diagnostics.route import router as diagnostics_router
 from src.modules.capacity.route import router as capacity_router
 from src.modules.etcd.route import router as etcd_router
+from src.modules.celery.route import router as celery_router
 
 # 在 main.py 中调用后, 会将所有 API 路由注册到 FastAPI 应用实例中
 def register_api(app: FastAPI):
@@ -50,6 +51,7 @@ def register_api(app: FastAPI):
   api_router.include_router(diagnostics_router, tags=["调用方自诊断"], prefix="/diagnostics")
   api_router.include_router(capacity_router, tags=["容量规划"], prefix="/capacity")
   api_router.include_router(etcd_router, tags=["Etcd 运维"], prefix="/storage")
+  api_router.include_router(celery_router, tags=["Celery 运维"], prefix="/celery")
   app.include_router(health_router, tags=["健康检查"])
   
   app.include_router(api_router)
@@ -69,4 +71,5 @@ def register_api(app: FastAPI):
   v2_router.include_router(diagnostics_router, tags=["调用方自诊断 v2"], prefix="/diagnostics")
   v2_router.include_router(capacity_router, tags=["容量规划 v2"], prefix="/capacity")
   v2_router.include_router(etcd_router, tags=["Etcd 运维 v2"], prefix="/storage")
+  v2_router.include_router(celery_router, tags=["Celery 运维 v2"], prefix="/celery")
   app.include_router(v2_router)

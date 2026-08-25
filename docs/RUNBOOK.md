@@ -108,6 +108,11 @@
 - 登录：同 IP 约 10 次/分钟；刷新 30 次/分钟；locate 60 次/分钟（超出 → `429041`）。
 - 审计：日志 `[AUDIT]` + Mongo `audit_event` 集合；指标 `audit_events_total`。
 
+## 6.1 Celery 背景任务
+
+- Celery worker、默认队列、任务生命周期记录与跨 Region 分发风险见 [`CELERY_OPERATIONS.md`](CELERY_OPERATIONS.md)。
+- 当前实现没有 Region task routing；部署时必须确认 MongoDB broker 是否按 Region 隔离。若多个 Region 共享 broker，不能假定手工运维任务会由创建它的 Region 执行。
+
 ## 7. 联系与升级
 
 变更密钥、扩容同区多实例、或引入共享会话存储前，先更新本 Runbook 与 `README` 部署要求。

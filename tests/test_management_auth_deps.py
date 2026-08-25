@@ -6,6 +6,7 @@ from src.modules.storage import route as storage_route
 from src.modules.public import route as public_route
 from src.modules.auth import route as auth_route
 from src.modules.graph import route as graph_route
+from src.modules.celery import route as celery_route
 
 
 def _endpoint_params(fn):
@@ -71,3 +72,8 @@ def test_auth_admin_user_role_routes_require_user():
 def test_graph_write_routes_require_user():
   assert "current_user" in _endpoint_params(graph_route.update_bucket_node_position)
   assert "current_user" in _endpoint_params(graph_route.update_bucket_edge_position)
+
+
+def test_celery_read_routes_require_user():
+  assert "current_user" in _endpoint_params(celery_route.get_celery_overview)
+  assert "current_user" in _endpoint_params(celery_route.get_celery_history)
