@@ -1,4 +1,5 @@
 from src import APP_ROOT
+import re
 from typing import Optional
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,6 +16,7 @@ DEFAULT_ETCD_ENDPOINTS = (
   "http://10.8.136.107:2379",
   "http://10.31.133.207:2379",
 )
+_MINIO_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 
 def create_file_path(file_path: str) -> bool:
   """
@@ -142,6 +144,10 @@ class Settings(BaseSettings):
   # from the application bucket by the local archive worker.
   OBJECT_RECOVERY_PERIOD_DAYS: int = 30
   OBJECT_ARCHIVE_BUCKET: str = "storagent-expired-archive"
+  # Archive objects are retained independently from the application recovery
+  # window. The archive bucket lifecycle removes both current and non-current
+  # versions after this period.
+  OBJECT_ARCHIVE_RETENTION_DAYS: int = 365
   OBJECT_ARCHIVE_INTERVAL_SECONDS: float = 300.0
   OBJECT_ARCHIVE_BATCH_SIZE: int = 50
   OBJECT_ARCHIVE_RETRY_SECONDS: float = 300.0
@@ -155,6 +161,10 @@ class Settings(BaseSettings):
   # for an unchanged threshold are suppressed for this interval.
   QUOTA_ALERT_COOLDOWN_SECONDS: int = 86400
   CAPACITY_SNAPSHOT_INTERVAL_SECONDS: int = 3600
+  # Caller diagnostics must consume persisted aggregates, never trigger a
+  # foreground MinIO scan. A stale aggregate is reported as not ready.
+  CAPACITY_SNAPSHOT_MAX_AGE_SECONDS: int = 10800
+  DIAGNOSTIC_QUOTA_AGGREGATE_MAX_AGE_SECONDS: int = 7200
   MINIO_HEAL_TIMEOUT_SECONDS: float = 3600.0
   CLUSTER_HEALTH_CHECK_INTERVAL_SECONDS: float = 120.0
   # Infrastructure thresholds are independent from application quota rules.
@@ -222,6 +232,13 @@ class Settings(BaseSettings):
       errors.append("OBJECT_RECOVERY_PERIOD_DAYS 必须大于 0")
     if not self.OBJECT_ARCHIVE_BUCKET.strip():
       errors.append("OBJECT_ARCHIVE_BUCKET 不能为空")
+    archive_bucket = self.OBJECT_ARCHIVE_BUCKET.strip()
+    if archive_bucket != archive_bucket.lower():
+      errors.append("OBJECT_ARCHIVE_BUCKET 必须使用小写的 MinIO 存储桶名称")
+    if not _MINIO_BUCKET_RE.fullmatch(archive_bucket) or ".." in archive_bucket:
+      errors.append("OBJECT_ARCHIVE_BUCKET 必须是合法的 MinIO 存储桶名称")
+    if self.OBJECT_ARCHIVE_RETENTION_DAYS < self.OBJECT_RECOVERY_PERIOD_DAYS:
+      errors.append("OBJECT_ARCHIVE_RETENTION_DAYS 不能小于 OBJECT_RECOVERY_PERIOD_DAYS")
     if self.REGION.strip().lower() in ("", "undefined"):
       errors.append("REGION 未设置（不能为 undefined）")
 

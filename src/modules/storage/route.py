@@ -1,7 +1,7 @@
 import secrets
 from urllib.parse import parse_qs
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from fastapi.responses import HTMLResponse
 
 from src.core.auth import get_current_user, check_permissions
@@ -362,6 +362,7 @@ async def release_unmanaged_bucket_retention(
 @router.post(
   path="/operations/unmanaged-buckets/{bucket_name}/delete",
   response_model=storage_schema.UnmanagedBucketActionResponse,
+  status_code=status.HTTP_202_ACCEPTED,
   summary="清理未纳管空存储桶",
 )
 async def delete_unmanaged_bucket(
@@ -379,6 +380,9 @@ async def delete_unmanaged_bucket(
     "message": operation.get("message", "清理任务已进入队列"),
     "bucket": bucket_name.strip(),
     "disposition": "deleting" if operation.get("status") in {"queued", "running"} else "delete_failed",
+    "accepted": operation.get("status") in {"queued", "running"},
+    "operation_id": operation.get("id"),
+    "operation_status": operation.get("status"),
     "operation": operation,
   }
 
@@ -386,6 +390,7 @@ async def delete_unmanaged_bucket(
 @router.post(
   path="/operations/replication/{bucket_name}/reconcile",
   response_model=storage_schema.ReplicationOperationResponse,
+  status_code=status.HTTP_202_ACCEPTED,
   summary="校准存储桶复制规则",
 )
 async def reconcile_bucket_replication(
@@ -402,6 +407,7 @@ async def reconcile_bucket_replication(
 @router.post(
   path="/operations/replication/{bucket_name}/resync",
   response_model=storage_schema.ReplicationOperationResponse,
+  status_code=status.HTTP_202_ACCEPTED,
   summary="启动复制链路对象补传",
 )
 async def start_bucket_replication_resync(
@@ -471,3 +477,16 @@ async def get_storage_operations(
 ):
   await check_permissions(current_user, ["storage_operations_manage"])
   return await storage_operations.list_storage_operations(limit)
+
+
+@router.get(
+  path="/operations/jobs/{operation_id}",
+  response_model=storage_schema.StorageOperationItem,
+  summary="获取单个存储运维任务",
+)
+async def get_storage_operation(
+  operation_id: str,
+  current_user: User = Depends(get_current_user),
+):
+  await check_permissions(current_user, ["storage_operations_manage"])
+  return await storage_operations.get_storage_operation(operation_id)

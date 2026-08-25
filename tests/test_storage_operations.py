@@ -6,7 +6,7 @@ import pytest
 from bson import ObjectId
 
 from src.core import minio_op
-from src.modules.storage import crud, operations, schema, service
+from src.modules.storage import crud, operations, route, schema, service
 from src.utils.helpers import utc_now
 
 
@@ -867,11 +867,11 @@ async def test_unmanaged_bucket_overview_classifies_non_application_buckets(monk
   async def server_names():
     return ["beijing", "shenzhen"]
 
-  async def applications():
-    return [
-      SimpleNamespace(name="enabled-app", enabled=True, shown_name="启用应用"),
-      SimpleNamespace(name="disabled-app", enabled=False, shown_name="停用应用"),
-    ]
+  async def authoritative_apps():
+    return {
+      "enabled-app": {"enabled": True, "shown_name": "启用应用"},
+      "disabled-app": {"enabled": False, "shown_name": "停用应用"},
+    }
 
   async def list_buckets(server, **_kwargs):
     values = {
@@ -897,7 +897,7 @@ async def test_unmanaged_bucket_overview_classifies_non_application_buckets(monk
     )
 
   monkeypatch.setattr(operations.storage_crud, "read_minio_server_names", server_names)
-  monkeypatch.setattr(operations.public_crud, "read_application_list", applications)
+  monkeypatch.setattr(operations, "_read_authoritative_application_entries", authoritative_apps)
   monkeypatch.setattr(operations.minio_op, "list_server_buckets", list_buckets)
   monkeypatch.setattr(operations.storage_crud, "list_unmanaged_bucket_dispositions", dispositions)
   monkeypatch.setattr(operations.storage_crud, "read_latest_storage_operation", latest)
@@ -917,6 +917,35 @@ async def test_unmanaged_bucket_overview_classifies_non_application_buckets(monk
 
 
 @pytest.mark.asyncio
+async def test_unmanaged_bucket_overview_keeps_authoritative_app_bucket_managed_when_projection_is_missing(monkeypatch):
+  async def server_names():
+    return ["beijing"]
+
+  async def authoritative_apps():
+    return {"enabled-app": {"enabled": True, "shown_name": "权威应用"}}
+
+  async def list_buckets(*_args, **_kwargs):
+    return True, ["enabled-app", "manual-bucket"], "", 1.0
+
+  async def dispositions():
+    return []
+
+  monkeypatch.setattr(operations.storage_crud, "read_minio_server_names", server_names)
+  monkeypatch.setattr(operations, "_read_authoritative_application_entries", authoritative_apps)
+  monkeypatch.setattr(operations.minio_op, "list_server_buckets", list_buckets)
+  monkeypatch.setattr(operations.storage_crud, "list_unmanaged_bucket_dispositions", dispositions)
+  async def no_latest(*_args, **_kwargs):
+    return None
+
+  monkeypatch.setattr(operations.storage_crud, "read_latest_storage_operation", no_latest)
+
+  result = await operations.get_unmanaged_bucket_overview()
+
+  assert [item["name"] for item in result["buckets"]] == ["manual-bucket"]
+  assert result["buckets"][0]["kind"] == "unmanaged"
+
+
+@pytest.mark.asyncio
 async def test_unmanaged_bucket_delete_requires_confirmation_and_queues_task(monkeypatch):
   async def overview():
     return {
@@ -931,6 +960,9 @@ async def test_unmanaged_bucket_delete_requires_confirmation_and_queues_task(mon
     }
 
   async def no_active(*_args, **_kwargs):
+    return None
+
+  async def no_previous(*_args, **_kwargs):
     return None
 
   class Operation:
@@ -970,6 +1002,7 @@ async def test_unmanaged_bucket_delete_requires_confirmation_and_queues_task(mon
 
   monkeypatch.setattr(operations, "get_unmanaged_bucket_overview", overview)
   monkeypatch.setattr(operations.storage_crud, "read_active_storage_operation", no_active)
+  monkeypatch.setattr(operations.storage_crud, "read_latest_storage_operation", no_previous)
   monkeypatch.setattr(operations.storage_crud, "create_storage_operation", create)
   monkeypatch.setattr(operations, "_enqueue_storage_operation", enqueue)
 
@@ -979,7 +1012,11 @@ async def test_unmanaged_bucket_delete_requires_confirmation_and_queues_task(mon
   result = await operations.delete_unmanaged_bucket("manual-bucket", "manual-bucket", "admin")
 
   assert queued == ["unmanaged-delete-task"]
-  assert operation.result == {"servers": ["beijing", "shenzhen"]}
+  assert operation.result == {
+    "servers": ["beijing", "shenzhen"],
+    "target_servers": ["beijing", "shenzhen"],
+    "removed_servers": [],
+  }
   assert result["status"] == "queued"
   assert result["bucket"] == "manual-bucket"
 
@@ -1003,3 +1040,104 @@ async def test_unmanaged_bucket_delete_rejects_retained_bucket(monkeypatch):
 
   with pytest.raises(Exception, match="受控保留"):
     await operations.delete_unmanaged_bucket("manual-bucket", "manual-bucket", "admin")
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_bucket_partial_cleanup_retries_only_remaining_servers(monkeypatch):
+  @asynccontextmanager
+  async def unlocked(_name):
+    yield
+
+  class Operation:
+    id = "retry-delete-task"
+    kind = "unmanaged_bucket_delete"
+    status = "queued"
+    server = "all"
+    bucket = "manual-bucket"
+    target = ""
+    actor = "admin"
+    message = ""
+    result = {
+      "servers": ["beijing", "shenzhen"],
+      "target_servers": ["shenzhen"],
+      "removed_servers": ["beijing"],
+    }
+    created_at = utc_now()
+    started_at = None
+    finished_at = None
+
+    async def save(self):
+      return None
+
+  async def overview():
+    return {
+      "buckets": [{
+        "name": "manual-bucket",
+        "kind": "unmanaged",
+        "servers": ["shenzhen"],
+        "coverage_status": "partial",
+        "missing_servers": ["beijing"],
+        "unreachable_servers": [],
+      }],
+    }
+
+  async def summary(server, bucket, **_kwargs):
+    assert (server, bucket) == ("shenzhen", "manual-bucket")
+    return True, {"object_count": 0, "total_bytes": 0}, "", 1.0
+
+  removed = []
+
+  async def remove(server, bucket, **_kwargs):
+    removed.append((server, bucket))
+    return True, "", 1.0
+
+  recorded = {}
+
+  async def disposition(*_args, **kwargs):
+    recorded.update(kwargs)
+
+  monkeypatch.setattr(operations, "_distributed_operation_lock", unlocked)
+  monkeypatch.setattr(operations, "get_unmanaged_bucket_overview", overview)
+  monkeypatch.setattr(operations.minio_op, "get_bucket_object_summary", summary)
+  monkeypatch.setattr(operations.minio_op, "remove_empty_bucket", remove)
+  monkeypatch.setattr(operations.storage_crud, "upsert_unmanaged_bucket_disposition", disposition)
+  monkeypatch.setattr(operations.metrics_mod, "incr", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(operations.audit, "audit", lambda *_args, **_kwargs: None)
+
+  operation = Operation()
+  await operations._run_unmanaged_bucket_delete_operation(operation)
+
+  assert removed == [("shenzhen", "manual-bucket")]
+  assert operation.status == "succeeded"
+  assert operation.result["removed_servers"] == ["beijing", "shenzhen"]
+  assert recorded["servers"] == ["beijing", "shenzhen"]
+
+
+def test_replication_task_acceptance_contract_is_explicit():
+  operation = SimpleNamespace(
+    id="operation-1",
+    kind="replication_reconcile",
+    status="queued",
+    bucket="manual-bucket",
+    server="all",
+    target="",
+    message="复制规则校准任务已进入队列",
+    result={},
+  )
+
+  response = operations._replication_operation_response(operation)
+
+  reconcile_route = next(
+    item for item in route.router.routes
+    if item.path == "/operations/replication/{bucket_name}/reconcile"
+  )
+  resync_route = next(
+    item for item in route.router.routes
+    if item.path == "/operations/replication/{bucket_name}/resync"
+  )
+  assert reconcile_route.status_code == 202
+  assert resync_route.status_code == 202
+  assert response["accepted"] is True
+  assert response["operation_id"] == "operation-1"
+  assert response["operation_status"] == "queued"
+  schema.ReplicationOperationResponse.model_validate(response)

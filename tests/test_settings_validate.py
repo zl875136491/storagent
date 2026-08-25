@@ -33,6 +33,22 @@ def test_validate_rejects_bad_prod_config(monkeypatch):
   assert raised
 
 
+def test_validate_rejects_uppercase_archive_bucket(monkeypatch):
+  monkeypatch.delitem(sys.modules, "pytest", raising=False)
+  settings = Settings(
+    REGION="nuc-docker-a",
+    DEBUG=True,
+    OBJECT_ARCHIVE_BUCKET="Storagent-Expired-Archive",
+  )
+
+  try:
+    settings.validate_runtime()
+  except RuntimeError as error:
+    assert "OBJECT_ARCHIVE_BUCKET 必须使用小写" in str(error)
+  else:
+    raise AssertionError("uppercase archive bucket must fail validation")
+
+
 def test_docs_and_reload_defaults():
   from src.configs.configs import settings
   assert hasattr(settings, "ENABLE_DOCS")

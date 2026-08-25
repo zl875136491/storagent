@@ -75,80 +75,115 @@ async def test_diagnostic_probe_uses_api_key_bound_application_context():
 @pytest.mark.asyncio
 async def test_quota_capacity_probe_returns_api_key_scoped_aggregate_preflight(monkeypatch):
   from src.modules.public import service as public_service
-  from src.modules.storage import operations
+  from src.modules.capacity import service as capacity_service
 
-  calls = []
+  calls: list[str] = []
 
-  async def quota_usage(app_name, *, force, require_all):
-    calls.append((app_name, force, require_all))
-    return 100 * 1024 ** 3, 25 * 1024 ** 3
-
-  async def cluster_overview():
+  async def quota_usage(app_name):
+    calls.append(app_name)
     return {
-      "summary": {
-        "status": "online",
-        "cluster_count": 2,
-        "online_clusters": 2,
-        "raw_capacity_bytes": 1024 * 1024 ** 3,
-        "raw_used_bytes": 512 * 1024 ** 3,
-      },
+      "limit_bytes": 100 * 1024 ** 3,
+      "used_bytes": 25 * 1024 ** 3,
+      "fresh": True,
+      "updated_at": None,
+      "aggregate_error": "",
     }
 
-  monkeypatch.setattr(public_service, "get_application_quota_usage", quota_usage)
-  monkeypatch.setattr(operations, "get_cluster_health_overview", cluster_overview)
+  async def capacity_aggregate(_region):
+    return {
+      "region": "beijing",
+      "status": "online",
+      "reachable": True,
+      "fresh": True,
+      "captured_at": None,
+      "raw_capacity_bytes": 1024 * 1024 ** 3,
+      "raw_used_bytes": 512 * 1024 ** 3,
+      "expected_replica_count": 1,
+      "actual_replica_count": 1,
+      "health_reasons": [],
+    }
+
+  monkeypatch.setattr(public_service, "get_application_quota_usage_aggregate", quota_usage)
+  monkeypatch.setattr(capacity_service, "get_diagnostic_capacity_aggregate", capacity_aggregate)
 
   result = await diagnostics_service.quota_capacity_probe({"app_name": "parts"})
 
-  assert calls == [("parts", False, True)]
-  assert result == {
-    "ready": True,
-    "summary": "应用配额可用 75.0 GiB（25.0% 已用）；集群物理可用 512.0 GiB（50.0% 已用）",
-    "quota": {
-      "limit_bytes": 100 * 1024 ** 3,
-      "used_bytes": 25 * 1024 ** 3,
-      "available_bytes": 75 * 1024 ** 3,
-      "usage_percent": 25.0,
-    },
-    "cluster": {
-      "status": "online",
-      "cluster_count": 2,
-      "online_cluster_count": 2,
-      "raw_capacity_bytes": 1024 * 1024 ** 3,
-      "raw_used_bytes": 512 * 1024 ** 3,
-      "raw_available_bytes": 512 * 1024 ** 3,
-      "raw_usage_percent": 50.0,
-    },
-    "warnings": [],
-    "blocking_reasons": [],
+  assert calls == ["parts"]
+  assert result["ready"] is True
+  assert result["summary"] == "应用配额可用 75.0 GiB（25.0% 已用）；当前区域容量可用 512.0 GiB（50.0% 已用）"
+  assert result["quota"] == {
+    "limit_bytes": 100 * 1024 ** 3,
+    "used_bytes": 25 * 1024 ** 3,
+    "available_bytes": 75 * 1024 ** 3,
+    "usage_percent": 25.0,
+    "updated_at": None,
+    "fresh": True,
   }
+  assert result["cluster"]["region"] == "beijing"
+  assert result["cluster"]["available_bytes"] == 512 * 1024 ** 3
+  assert result["cluster"]["expected_replica_count"] == 1
+  assert result["blocking_reasons"] == []
 
 
 @pytest.mark.asyncio
 async def test_quota_capacity_probe_blocks_exhausted_quota_and_unavailable_capacity(monkeypatch):
   from src.modules.public import service as public_service
-  from src.modules.storage import operations
+  from src.modules.capacity import service as capacity_service
 
   async def quota_usage(*_args, **_kwargs):
-    return 100, 100
+    return {"limit_bytes": 100, "used_bytes": 100, "fresh": True}
 
-  async def cluster_overview():
+  async def capacity_aggregate(*_args, **_kwargs):
     return {
-      "summary": {
-        "status": "offline",
-        "cluster_count": 1,
-        "online_clusters": 0,
-        "raw_capacity_bytes": 0,
-        "raw_used_bytes": 0,
-      },
+      "region": "beijing", "status": "offline", "reachable": False,
+      "fresh": True, "raw_capacity_bytes": 0, "raw_used_bytes": 0,
+      "expected_replica_count": 1, "actual_replica_count": 0,
     }
 
-  monkeypatch.setattr(public_service, "get_application_quota_usage", quota_usage)
-  monkeypatch.setattr(operations, "get_cluster_health_overview", cluster_overview)
+  monkeypatch.setattr(public_service, "get_application_quota_usage_aggregate", quota_usage)
+  monkeypatch.setattr(capacity_service, "get_diagnostic_capacity_aggregate", capacity_aggregate)
 
   result = await diagnostics_service.quota_capacity_probe({"app_name": "parts"})
 
   assert result["ready"] is False
-  assert result["blocking_reasons"] == ["应用可用配额不足", "没有可用的存储集群"]
+  assert result["blocking_reasons"] == [
+    "应用可用配额不足",
+    "当前区域存储状态不是完全在线",
+    "当前区域复制冗余低于预期",
+  ]
+
+
+@pytest.mark.asyncio
+async def test_quota_capacity_probe_blocks_stale_or_degraded_aggregate_without_minio(monkeypatch):
+  from src.modules.public import service as public_service
+  from src.modules.capacity import service as capacity_service
+  from src.modules.storage import operations
+
+  async def quota_usage(*_args, **_kwargs):
+    return {"limit_bytes": 100, "used_bytes": 20, "fresh": False}
+
+  async def capacity_aggregate(*_args, **_kwargs):
+    return {
+      "region": "beijing", "status": "degraded", "reachable": True,
+      "fresh": False, "raw_capacity_bytes": 1000, "raw_used_bytes": 100,
+      "expected_replica_count": 2, "actual_replica_count": 1,
+    }
+
+  async def should_not_query_minio(*_args, **_kwargs):
+    raise AssertionError("caller capacity preflight must not query MinIO")
+
+  monkeypatch.setattr(public_service, "get_application_quota_usage_aggregate", quota_usage)
+  monkeypatch.setattr(capacity_service, "get_diagnostic_capacity_aggregate", capacity_aggregate)
+  monkeypatch.setattr(operations, "get_cluster_health_overview", should_not_query_minio)
+
+  result = await diagnostics_service.quota_capacity_probe({"app_name": "parts"})
+
+  assert result["ready"] is False
+  assert result["blocking_reasons"] == [
+    "应用配额聚合数据已过期或不可用",
+    "当前区域容量快照已过期或不可用",
+    "当前区域复制冗余低于预期",
+  ]
 
 
 @pytest.mark.asyncio

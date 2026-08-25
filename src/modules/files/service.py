@@ -10,6 +10,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from src.configs.configs import settings
 from src.core.exception import CustomException, ErrorDesc
+from src.core.minio_errors import classify_minio_error, is_bucket_quota_exceeded
 from src.core.minio_op import get_minio_client
 from src.modules.storage import crud as storage_crud
 from src.modules.files import schema as files_schema
@@ -70,16 +71,7 @@ async def _run_thread_to_completion(call: Callable[[], Any]):
 
 
 def _is_bucket_quota_exceeded(error: Exception) -> bool:
-  values = [
-    str(error),
-    str(getattr(error, "code", "")),
-    str(getattr(error, "message", "")),
-  ]
-  normalized = " ".join(values).lower()
-  return (
-    "xminioadminbucketquotaexceeded" in normalized
-    or "bucket quota exceeded" in normalized
-  )
+  return is_bucket_quota_exceeded(error)
 
 
 def _is_no_such_upload(error: BaseException) -> bool:
@@ -103,12 +95,7 @@ def _is_no_such_object(error: BaseException) -> bool:
 
 
 def _raise_minio_write_error(error: Exception) -> None:
-  if _is_bucket_quota_exceeded(error):
-    raise CustomException(
-      ErrorDesc.APP_STORAGE_QUOTA_EXCEEDED,
-      _QUOTA_EXCEEDED_REASON,
-    )
-  raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(error))
+  raise classify_minio_error(error, "multipart_write", quota_exceeded=True)
 
 def _normalize_etag(etag: str) -> str:
   e = etag.strip()
@@ -167,10 +154,7 @@ async def _recover_completed_result(
   except Exception as error:
     if _is_no_such_object(error):
       return None
-    raise CustomException(
-      ErrorDesc.MINIO_ACCESS_FAILED,
-      f"无法确认完成中的对象状态: {error}",
-    ) from error
+    raise classify_minio_error(error, "multipart_complete_recovery") from error
   if int(getattr(metadata, "size", -1)) != declared_size_bytes:
     raise CustomException(
       ErrorDesc.STATUS_ERR,
@@ -457,7 +441,7 @@ async def multipart_complete(
             )
             raise CustomException(
               ErrorDesc.MINIO_ACCESS_FAILED,
-              "上传会话已不在 MinIO 中，请重新初始化上传",
+              {"operation": "multipart_complete", "category": "operation", "reason": "upload_session_missing"},
             ) from error
         if saved_result is None:
           await files_quota.restore_active_session(
@@ -540,7 +524,7 @@ async def multipart_abort(body: files_schema.MultipartAbortRequest,
           raise
         if not _is_no_such_upload(error):
           await files_quota.restore_aborted_session(quota_client, reservation)
-          raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(error))
+          raise classify_minio_error(error, "multipart_abort") from error
       await files_quota.record_aborted_session(quota_client, reservation)
     await files_quota.finalize_aborted_session(quota_client, reservation)
 
@@ -580,8 +564,8 @@ async def multipart_list_parts(
 
   try:
     result = await asyncio.to_thread(_list)
-  except Exception as e:
-    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
+  except Exception as error:
+    raise classify_minio_error(error, "multipart_list_parts") from error
 
   listed = [
     files_schema.MultipartPartListed(
@@ -663,10 +647,10 @@ async def download_chunk(
 
     try:
       data, resp_headers, status = await asyncio.to_thread(_read)
-    except Exception as e:
-      if files_locate._is_object_not_found(e):
+    except Exception as error:
+      if files_locate._is_object_not_found(error):
         await files_locate.raise_if_not_found_local(b, key, offset, length)
-      raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, str(e))
+      raise classify_minio_error(error, "download_chunk") from error
 
     out_headers = {}
     if "content-range" in resp_headers:

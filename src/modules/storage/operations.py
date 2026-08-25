@@ -953,10 +953,17 @@ async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
 
 
 async def get_unmanaged_bucket_overview() -> dict[str, Any]:
-  """Compare physical MinIO buckets with application ownership metadata."""
+  """Compare physical buckets with the authoritative application registry."""
   server_names = sorted(set(await storage_crud.read_minio_server_names()))
-  applications = await public_crud.read_application_list()
-  app_by_name = {str(app.name): app for app in applications}
+  try:
+    authoritative_apps = await _read_authoritative_application_entries()
+    ownership_available = True
+    ownership_error = ""
+  except Exception as error:
+    authoritative_apps = {}
+    ownership_available = False
+    ownership_error = "应用权威归属暂不可读取，禁止对未知存储桶执行清理"
+    logger.warning("未纳管桶归属校验无法读取 Etcd: {}", error)
   system_buckets = {settings.OBJECT_ARCHIVE_BUCKET.strip()}
   system_buckets.discard("")
   semaphore = asyncio.Semaphore(5)
@@ -985,21 +992,36 @@ async def get_unmanaged_bucket_overview() -> dict[str, Any]:
   unavailable_servers = set(errors)
   rows: list[dict[str, Any]] = []
   for bucket_name, present_on in bucket_servers.items():
-    app = app_by_name.get(bucket_name)
     if bucket_name in system_buckets:
       kind = "system"
       app_name = ""
       shown_name = "过期对象归档"
-    elif app is None:
-      kind = "unmanaged"
+      ownership_source = "system"
+      ownership_reason = "系统保留归档桶"
+    elif not ownership_available:
+      kind = "needs_review"
       app_name = ""
       shown_name = ""
-    elif not getattr(app, "enabled", False):
-      kind = "disabled_application"
-      app_name = str(app.name)
-      shown_name = str(getattr(app, "shown_name", "") or "")
+      ownership_source = "unavailable"
+      ownership_reason = ownership_error
     else:
-      continue
+      app = authoritative_apps.get(bucket_name)
+      if not isinstance(app, dict):
+        kind = "unmanaged"
+        app_name = ""
+        shown_name = ""
+        ownership_source = "authoritative"
+        ownership_reason = "未在应用权威配置中登记"
+      elif not bool(app.get("enabled")):
+        kind = "disabled_application"
+        app_name = bucket_name
+        shown_name = str(app.get("shown_name") or "")
+        ownership_source = "authoritative"
+        ownership_reason = "关联应用已停用"
+      else:
+        # Enabled applications are managed even when this node's Mongo
+        # projection has not converged yet.
+        continue
     missing_servers = sorted(set(server_names) - present_on - unavailable_servers)
     unreachable_servers = sorted(set(server_names) & unavailable_servers)
     coverage_status = (
@@ -1010,6 +1032,7 @@ async def get_unmanaged_bucket_overview() -> dict[str, Any]:
     disposition = "not_applicable"
     disposition_reason = ""
     disposition_updated_at = None
+    cleanup_remaining_servers: list[str] = []
     if kind == "unmanaged":
       latest = await storage_crud.read_latest_storage_operation(
         "unmanaged_bucket_delete",
@@ -1035,8 +1058,17 @@ async def get_unmanaged_bucket_overview() -> dict[str, Any]:
         disposition = "delete_failed"
         disposition_reason = latest.message
         disposition_updated_at = latest.finished_at or latest.created_at
+        removed_servers = {
+          str(item) for item in (getattr(latest, "result", {}) or {}).get("removed_servers") or []
+          if item
+        }
+        if removed_servers:
+          cleanup_remaining_servers = sorted(set(present_on))
       else:
         disposition = "unreviewed"
+    elif kind == "needs_review":
+      disposition = "needs_review"
+      disposition_reason = ownership_reason
     rows.append({
       "name": bucket_name,
       "kind": kind,
@@ -1049,9 +1081,12 @@ async def get_unmanaged_bucket_overview() -> dict[str, Any]:
       "disposition": disposition,
       "disposition_reason": disposition_reason,
       "disposition_updated_at": disposition_updated_at,
+      "ownership_source": ownership_source,
+      "ownership_reason": ownership_reason,
+      "cleanup_remaining_servers": cleanup_remaining_servers,
     })
 
-  kind_order = {"unmanaged": 0, "disabled_application": 1, "system": 2}
+  kind_order = {"unmanaged": 0, "needs_review": 1, "disabled_application": 2, "system": 3}
   rows.sort(key=lambda item: (kind_order[item["kind"]], item["name"]))
   return {
     "generated_at": utc_now(),
@@ -1060,10 +1095,25 @@ async def get_unmanaged_bucket_overview() -> dict[str, Any]:
       "unmanaged_count": sum(item["kind"] == "unmanaged" for item in rows),
       "disabled_application_count": sum(item["kind"] == "disabled_application" for item in rows),
       "system_bucket_count": sum(item["kind"] == "system" for item in rows),
+      "needs_review_count": sum(item["kind"] == "needs_review" for item in rows),
       "unavailable_server_count": len(errors),
     },
     "buckets": rows,
     "errors": errors,
+  }
+
+
+async def _read_authoritative_application_entries() -> dict[str, dict[str, Any]]:
+  """Return only valid Etcd application entries used for destructive guards."""
+  from src.core import etcd_op, sync as sync_module
+
+  entries = await etcd_op.pull_from_etcd_by_key(sync_module.ETCD_KEY_APPLICATIONS)
+  if not isinstance(entries, dict):
+    raise RuntimeError("应用权威配置格式无效")
+  return {
+    str(name): dict(entry)
+    for name, entry in entries.items()
+    if isinstance(name, str) and isinstance(entry, dict)
   }
 
 
@@ -1077,8 +1127,38 @@ async def _require_unmanaged_bucket(bucket: str) -> dict[str, Any]:
   if item is None:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "未找到该未纳管存储桶")
   if item["kind"] != "unmanaged":
+    if item["kind"] == "needs_review":
+      raise CustomException(
+        ErrorDesc.STATUS_ERR,
+        "应用归属尚未完成权威校验，禁止执行保留或清理",
+      )
     raise CustomException(ErrorDesc.OPERATION_NOT_ALLOWED, "仅允许处置未关联应用的存储桶")
   return item
+
+
+def _partial_delete_recovery_targets(
+  item: dict[str, Any],
+  previous: StorageOperation | None,
+) -> tuple[list[str], list[str]] | None:
+  """Allow retry only when a prior guarded cleanup proved those sites removed."""
+  if previous is None or previous.status != "failed":
+    return None
+  result = dict(previous.result or {})
+  expected = {str(value) for value in result.get("servers") or [] if value}
+  removed = {str(value) for value in result.get("removed_servers") or [] if value}
+  present = {str(value) for value in item.get("servers") or [] if value}
+  missing = {str(value) for value in item.get("missing_servers") or [] if value}
+  if (
+    not expected
+    or not removed
+    or set(item.get("unreachable_servers") or [])
+    or expected != present | missing
+    or not missing
+    or not missing.issubset(removed)
+    or not present
+  ):
+    return None
+  return sorted(present), sorted(removed)
 
 
 async def retain_unmanaged_bucket(
@@ -1160,14 +1240,21 @@ async def delete_unmanaged_bucket(
       ErrorDesc.STATUS_ERR,
       "该存储桶已登记受控保留，取消保留后才能清理",
     )
-  if (
-    item.get("coverage_status") != "complete"
-    or item.get("missing_servers")
-    or item.get("unreachable_servers")
-  ):
+  previous = await storage_crud.read_latest_storage_operation(
+    "unmanaged_bucket_delete",
+    "all",
+    bucket=bucket,
+  )
+  recovery = _partial_delete_recovery_targets(item, previous)
+  if item.get("unreachable_servers"):
     raise CustomException(
       ErrorDesc.STATUS_ERR,
-      "所有 MinIO 站点均可达且均存在该存储桶后才能清理",
+      "所有 MinIO 站点可达后才能清理或继续清理",
+    )
+  if item.get("coverage_status") != "complete" and recovery is None:
+    raise CustomException(
+      ErrorDesc.STATUS_ERR,
+      "仅可继续此前已记录的部分清理；当前存储桶未在所有站点完整出现",
     )
   active = await storage_crud.read_active_storage_operation(
     "unmanaged_bucket_delete",
@@ -1184,8 +1271,19 @@ async def delete_unmanaged_bucket(
     target="",
     actor=actor,
   )
-  operation.message = "未纳管空存储桶清理任务已进入队列"
-  operation.result = {"servers": list(item.get("servers") or [])}
+  target_servers, removed_servers = recovery or (
+    list(item.get("servers") or []),
+    [],
+  )
+  operation.message = (
+    "未纳管空存储桶剩余站点清理任务已进入队列"
+    if recovery else "未纳管空存储桶清理任务已进入队列"
+  )
+  operation.result = {
+    "servers": sorted(set(target_servers) | set(removed_servers)),
+    "target_servers": target_servers,
+    "removed_servers": removed_servers,
+  }
   await operation.save()
   _enqueue_storage_operation(
     str(operation.id),
@@ -1203,6 +1301,9 @@ def _replication_operation_response(operation: StorageOperation) -> dict[str, An
   return {
     "message": operation.message,
     "bucket": operation.bucket,
+    "accepted": operation.status in {"queued", "running"},
+    "operation_id": str(operation.id),
+    "operation_status": operation.status,
     "source_server": detail.get("source_server") or (
       operation.server if operation.kind == "replication_resync" else None
     ),
@@ -1342,6 +1443,9 @@ def _running_resync_response(
   return {
     "message": "对象补传任务正在运行",
     "bucket": bucket,
+    "accepted": True,
+    "operation_id": None,
+    "operation_status": "running",
     "source_server": source,
     "target_server": target,
     "detail": {**detail, "already_running": True},
@@ -1586,14 +1690,31 @@ async def _run_unmanaged_bucket_delete_operation(operation: StorageOperation) ->
       await operation.save()
 
       item = await _require_unmanaged_bucket(bucket)
+      expected_servers = {
+        str(value) for value in (operation.result or {}).get("servers") or [] if value
+      }
+      target_servers = {
+        str(value) for value in (operation.result or {}).get("target_servers") or [] if value
+      }
+      previously_removed = {
+        str(value) for value in (operation.result or {}).get("removed_servers") or [] if value
+      }
+      present_servers = {str(value) for value in item.get("servers") or [] if value}
+      missing_servers = {str(value) for value in item.get("missing_servers") or [] if value}
+      if item.get("unreachable_servers"):
+        raise RuntimeError("存在不可达 MinIO 站点，无法安全清理")
+      if not expected_servers:
+        expected_servers = set(present_servers)
+      if not target_servers:
+        target_servers = set(present_servers)
       if (
-        item.get("coverage_status") != "complete"
-        or item.get("missing_servers")
-        or item.get("unreachable_servers")
+        target_servers != present_servers
+        or expected_servers != present_servers | missing_servers
+        or not missing_servers.issubset(previously_removed)
       ):
-        raise RuntimeError("所有 MinIO 站点均可达且均存在该存储桶后才能清理")
+        raise RuntimeError("存储桶站点覆盖已变化，拒绝继续清理")
 
-      servers = list(item.get("servers") or [])
+      servers = sorted(target_servers)
       summaries: dict[str, dict[str, int]] = {}
       errors: dict[str, str] = {}
       for server in servers:
@@ -1613,8 +1734,10 @@ async def _run_unmanaged_bucket_delete_operation(operation: StorageOperation) ->
           )
       if errors:
         operation.result = {
-          "servers": servers,
+          "servers": sorted(expected_servers),
+          "target_servers": servers,
           "object_summaries": summaries,
+          "removed_servers": sorted(previously_removed),
           "failures": errors,
         }
         raise RuntimeError("；".join(f"{server}: {message}" for server, message in errors.items()))
@@ -1632,10 +1755,12 @@ async def _run_unmanaged_bucket_delete_operation(operation: StorageOperation) ->
         else:
           remove_errors[server] = error
       if remove_errors:
+        all_removed = sorted(previously_removed | set(removed_servers))
         operation.result = {
-          "servers": servers,
+          "servers": sorted(expected_servers),
+          "target_servers": servers,
           "object_summaries": summaries,
-          "removed_servers": removed_servers,
+          "removed_servers": all_removed,
           "failures": remove_errors,
         }
         raise RuntimeError("；".join(f"{server}: {message}" for server, message in remove_errors.items()))
@@ -1645,14 +1770,15 @@ async def _run_unmanaged_bucket_delete_operation(operation: StorageOperation) ->
         status="deleted",
         reason="已按确认完成空存储桶清理",
         actor=operation.actor,
-        servers=servers,
+        servers=sorted(expected_servers),
       )
       operation.status = "succeeded"
       operation.message = "未纳管空存储桶清理完成"
       operation.result = {
-        "servers": servers,
+        "servers": sorted(expected_servers),
+        "target_servers": servers,
         "object_summaries": summaries,
-        "removed_servers": removed_servers,
+        "removed_servers": sorted(previously_removed | set(removed_servers)),
       }
   except StorageOperationLockBusy as error:
     operation.status = "failed"
@@ -1701,6 +1827,13 @@ async def execute_storage_operation(operation_id: str) -> None:
     await _run_unmanaged_bucket_delete_operation(operation)
   else:
     raise ValueError(f"不支持的存储运维任务类型: {operation.kind}")
+
+
+async def get_storage_operation(operation_id: str) -> dict[str, Any]:
+  operation = await StorageOperation.get(operation_id)
+  if operation is None:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "存储运维任务")
+  return _operation_dict(operation) or {}
 
 
 def _heal_result(items: list[dict[str, Any]]) -> dict[str, Any]:

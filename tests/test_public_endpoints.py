@@ -2,6 +2,9 @@
 from unittest.mock import AsyncMock, patch
 
 from src.modules.public.service import get_endpoints
+from src.modules.public import service as public_service
+from src.core.exception import CustomException
+import pytest
 
 
 def _server(*, region: str, domain: str = ""):
@@ -81,3 +84,11 @@ async def test_endpoints_keeps_host_port_fallback_for_unknown_region(monkeypatch
   endpoint = result["data"][0]
   assert endpoint["domain"] == "stor.1oa.com.cn"
   assert endpoint["endpoint"] == "http://10.32.129.241:6783"
+
+
+@pytest.mark.asyncio
+async def test_application_name_cannot_claim_reserved_archive_bucket(monkeypatch):
+  monkeypatch.setattr(public_service.settings, "OBJECT_ARCHIVE_BUCKET", "storagent-expired-archive")
+
+  with pytest.raises(CustomException, match="归档存储桶"):
+    await public_service._validate_application_name("storagent-expired-archive")

@@ -117,6 +117,11 @@ async def _validate_application_name(name: str) -> None:
       continue
     else:
       raise CustomException(ErrorDesc.INVALID_PARAMS, "应用别名只能包含连字符和字母数字")
+  if name.strip().lower() == settings.OBJECT_ARCHIVE_BUCKET.strip().lower():
+    raise CustomException(
+      ErrorDesc.INVALID_PARAMS,
+      "应用别名与系统归档存储桶保留名称冲突",
+    )
 
 async def create_region(
   name: str,
@@ -759,6 +764,55 @@ async def get_application_quota_usage(
     require_all=require_all,
   )
   return int(application.quota_bytes), usage
+
+
+def _newest_timestamp(*values: datetime | None) -> datetime | None:
+  normalized = []
+  for value in values:
+    if value is None:
+      continue
+    normalized.append(
+      value.replace(tzinfo=timezone.utc)
+      if value.tzinfo is None else value.astimezone(timezone.utc)
+    )
+  return max(normalized) if normalized else None
+
+
+async def get_application_quota_usage_aggregate(app_name: str) -> dict:
+  """Serve diagnostics from persisted App/Etcd aggregates, never a MinIO scan."""
+  application = await public_crud.read_application_by_name(app_name)
+  if not application:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "应用不存在")
+
+  cached_usage = max(int(getattr(application, "quota_usage_bytes", 0) or 0), 0)
+  cached_at = getattr(application, "quota_usage_updated_at", None)
+  state: dict = {}
+  aggregate_error = ""
+  try:
+    from src.modules.files import quota as upload_quota
+    state = await upload_quota.get_usage_aggregate(app_name)
+  except Exception as error:
+    aggregate_error = str(error)
+
+  state_usage = max(int(state.get("usage_bytes") or 0), 0)
+  updated_at = _newest_timestamp(cached_at, state.get("updated_at"))
+  now = utc_now()
+  max_age = max(float(settings.DIAGNOSTIC_QUOTA_AGGREGATE_MAX_AGE_SECONDS), 0.0)
+  fresh = bool(
+    updated_at is not None
+    and (now - updated_at).total_seconds() <= max_age
+  )
+  return {
+    "limit_bytes": max(int(application.quota_bytes or 0), 0),
+    # Choose the safe high watermark when a Mongo projection lags the Etcd
+    # logical counter; diagnostics must never promise quota that admission
+    # would subsequently reject.
+    "used_bytes": max(cached_usage, state_usage),
+    "updated_at": updated_at,
+    "fresh": fresh,
+    "source": "application_aggregate",
+    "aggregate_error": aggregate_error,
+  }
 
 
 async def get_application_quota_limit(app_name: str, *, client=None) -> int:

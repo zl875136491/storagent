@@ -8,73 +8,15 @@ import secrets
 from io import BytesIO
 
 from src.core.exception import CustomException, ErrorDesc
+from src.core.minio_errors import classify_minio_error
 from src.configs.configs import settings
 from src.modules.public.model import DiagnosticRun
 from src.utils.logger import logger
 
 
-_MINIO_AUTH_ERROR_CODES = frozenset({
-  "AccessDenied",
-  "AuthorizationHeaderMalformed",
-  "ExpiredToken",
-  "InvalidAccessKeyId",
-  "InvalidToken",
-  "SignatureDoesNotMatch",
-})
-_MINIO_NETWORK_ERROR_CODES = frozenset({
-  "InternalError",
-  "RequestTimeout",
-  "ServiceUnavailable",
-  "SlowDown",
-})
-_NETWORK_EXCEPTION_NAMES = frozenset({
-  "ConnectTimeoutError",
-  "MaxRetryError",
-  "NewConnectionError",
-  "ProtocolError",
-  "ReadTimeoutError",
-  "SSLError",
-})
-
-
-def _exception_chain(error: BaseException):
-  seen: set[int] = set()
-  current: BaseException | None = error
-  while current is not None and id(current) not in seen:
-    seen.add(id(current))
-    yield current
-    current = current.__cause__ or current.__context__
-
-
 def _storage_probe_error(error: BaseException, operation: str) -> CustomException:
-  """Return a safe, actionable public error without exposing MinIO secrets."""
-  chain = list(_exception_chain(error))
-  for item in chain:
-    source_code = str(getattr(item, "code", "") or "").strip()
-    if source_code in _MINIO_AUTH_ERROR_CODES:
-      return CustomException(
-        ErrorDesc.MINIO_AUTH_FAILED,
-        {
-          "operation": operation,
-          "category": "authentication",
-          "source_code": source_code,
-        },
-      )
-  for item in chain:
-    source_code = str(getattr(item, "code", "") or "").strip()
-    if (
-      source_code in _MINIO_NETWORK_ERROR_CODES
-      or isinstance(item, (TimeoutError, ConnectionError, OSError))
-      or type(item).__name__ in _NETWORK_EXCEPTION_NAMES
-    ):
-      details = {"operation": operation, "category": "network"}
-      if source_code:
-        details["source_code"] = source_code
-      return CustomException(ErrorDesc.MINIO_NETWORK_UNAVAILABLE, details)
-  return CustomException(
-    ErrorDesc.MINIO_ACCESS_FAILED,
-    {"operation": operation, "category": "operation"},
-  )
+  """Compatibility wrapper for diagnostics-specific call sites."""
+  return classify_minio_error(error, operation)
 
 
 def _percent(used: int, total: int) -> float:
@@ -476,41 +418,40 @@ async def list_runs(app_context: dict | None = None) -> dict:
 
 
 async def quota_capacity_probe(app_context: dict) -> dict:
-  """Return an APIKey-scoped quota and aggregate physical-capacity preflight."""
+  """Return an APIKey-scoped preflight from persisted aggregates only."""
   from src.modules.public import service as public_service
-  from src.modules.storage import operations
+  from src.modules.capacity import service as capacity_service
 
   app_name = str(app_context["app_name"])
-  (quota_bytes, quota_usage_bytes), overview = await asyncio.gather(
-    public_service.get_application_quota_usage(
-      app_name,
-      force=False,
-      require_all=True,
-    ),
-    operations.get_cluster_health_overview(),
+  quota, cluster = await asyncio.gather(
+    public_service.get_application_quota_usage_aggregate(app_name),
+    capacity_service.get_diagnostic_capacity_aggregate(settings.REGION),
   )
-  quota_bytes = max(int(quota_bytes or 0), 0)
-  quota_usage_bytes = max(int(quota_usage_bytes or 0), 0)
+  quota_bytes = max(int(quota.get("limit_bytes") or 0), 0)
+  quota_usage_bytes = max(int(quota.get("used_bytes") or 0), 0)
   quota_available_bytes = max(quota_bytes - quota_usage_bytes, 0)
-
-  cluster_summary = overview.get("summary") if isinstance(overview, dict) else {}
-  cluster_summary = cluster_summary if isinstance(cluster_summary, dict) else {}
-  raw_capacity_bytes = max(int(cluster_summary.get("raw_capacity_bytes") or 0), 0)
-  raw_used_bytes = max(int(cluster_summary.get("raw_used_bytes") or 0), 0)
+  raw_capacity_bytes = max(int(cluster.get("raw_capacity_bytes") or 0), 0)
+  raw_used_bytes = max(int(cluster.get("raw_used_bytes") or 0), 0)
   raw_available_bytes = max(raw_capacity_bytes - raw_used_bytes, 0)
-  cluster_count = max(int(cluster_summary.get("cluster_count") or 0), 0)
-  online_cluster_count = max(int(cluster_summary.get("online_clusters") or 0), 0)
-  cluster_status = str(cluster_summary.get("status") or "offline")
+  cluster_status = str(cluster.get("status") or "unknown")
+  replica_expected = max(int(cluster.get("expected_replica_count") or 0), 0)
+  replica_actual = max(int(cluster.get("actual_replica_count") or 0), 0)
 
   blocking_reasons: list[str] = []
   if quota_bytes <= 0:
     blocking_reasons.append("应用配额未配置")
   elif quota_available_bytes <= 0:
     blocking_reasons.append("应用可用配额不足")
-  if cluster_count <= 0 or online_cluster_count <= 0 or cluster_status == "offline":
-    blocking_reasons.append("没有可用的存储集群")
+  if not quota.get("fresh"):
+    blocking_reasons.append("应用配额聚合数据已过期或不可用")
+  if not cluster.get("fresh"):
+    blocking_reasons.append("当前区域容量快照已过期或不可用")
+  elif not cluster.get("reachable") or cluster_status != "online":
+    blocking_reasons.append("当前区域存储状态不是完全在线")
   elif raw_capacity_bytes <= 0 or raw_available_bytes <= 0:
-    blocking_reasons.append("集群物理可用容量不足")
+    blocking_reasons.append("当前区域物理可用容量不足")
+  if replica_actual < replica_expected:
+    blocking_reasons.append("当前区域复制冗余低于预期")
 
   warnings: list[str] = []
   quota_usage_percent = _percent(quota_usage_bytes, quota_bytes)
@@ -519,29 +460,34 @@ async def quota_capacity_probe(app_context: dict) -> dict:
     warnings.append("应用配额使用率已达到 85%")
   if raw_usage_percent >= 85:
     warnings.append("集群物理容量使用率已达到 85%")
-  if cluster_status not in ("online", "offline"):
-    warnings.append("集群容量状态不是完全在线")
+  if quota.get("aggregate_error"):
+    warnings.append("应用配额聚合状态暂不可读取，已使用本地投影")
 
   return {
     "ready": not blocking_reasons,
     "summary": (
       f"应用配额可用 {_format_bytes(quota_available_bytes)}（{quota_usage_percent:.1f}% 已用）；"
-      f"集群物理可用 {_format_bytes(raw_available_bytes)}（{raw_usage_percent:.1f}% 已用）"
+      f"当前区域容量可用 {_format_bytes(raw_available_bytes)}（{raw_usage_percent:.1f}% 已用）"
     ),
     "quota": {
       "limit_bytes": quota_bytes,
       "used_bytes": quota_usage_bytes,
       "available_bytes": quota_available_bytes,
       "usage_percent": quota_usage_percent,
+      "updated_at": quota.get("updated_at"),
+      "fresh": bool(quota.get("fresh")),
     },
     "cluster": {
+      "region": str(cluster.get("region") or settings.REGION),
       "status": cluster_status,
-      "cluster_count": cluster_count,
-      "online_cluster_count": online_cluster_count,
-      "raw_capacity_bytes": raw_capacity_bytes,
-      "raw_used_bytes": raw_used_bytes,
-      "raw_available_bytes": raw_available_bytes,
-      "raw_usage_percent": raw_usage_percent,
+      "reachable": bool(cluster.get("reachable")),
+      "available_bytes": raw_available_bytes,
+      "usage_percent": raw_usage_percent,
+      "captured_at": cluster.get("captured_at"),
+      "fresh": bool(cluster.get("fresh")),
+      "expected_replica_count": replica_expected,
+      "actual_replica_count": replica_actual,
+      "health_reasons": list(cluster.get("health_reasons") or []),
     },
     "warnings": warnings,
     "blocking_reasons": blocking_reasons,

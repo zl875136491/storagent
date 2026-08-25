@@ -208,6 +208,64 @@ def test_archive_copy_accepts_minio_rewritten_multipart_etag():
 
 
 @pytest.mark.asyncio
+async def test_archive_retry_completes_when_source_was_removed_before_catalog_commit(monkeypatch):
+  item = _catalog_item()
+  saved = []
+
+  class Client:
+    def bucket_exists(self, _bucket):
+      return True
+
+    def stat_object(self, bucket, *_args, **_kwargs):
+      if bucket == item.bucket:
+        error = RuntimeError("source version missing")
+        error.code = "NoSuchVersion"
+        raise error
+      return SimpleNamespace(size=item.size_bytes, etag=item.etag)
+
+    def copy_object(self, *_args, **_kwargs):
+      pytest.fail("a verified archive must not be copied again")
+
+    def remove_object(self, *_args, **_kwargs):
+      pytest.fail("a missing source must not be removed again")
+
+  async def claim(*_args, **_kwargs):
+    item.state = "archive_pending"
+    return item
+
+  async def save(target, **changes):
+    saved.append(changes)
+    for key, value in changes.items():
+      setattr(target, key, value)
+    return target
+
+  async def read_current(*_args):
+    return item
+
+  class Lock:
+    async def __aenter__(self):
+      return object()
+
+    async def __aexit__(self, *_args):
+      return False
+
+  monkeypatch.setattr(archive.crud, "claim_expired_object_for_archive", claim)
+  monkeypatch.setattr(archive.crud, "save_object", save)
+  monkeypatch.setattr(archive.crud, "read_object_by_id", read_current)
+  async def get_client(_item):
+    return Client()
+
+  monkeypatch.setattr(archive, "_get_client", get_client)
+  monkeypatch.setattr(archive.quota, "application_quota_lock", lambda _app: Lock())
+
+  result = await archive.archive_expired_object(item, now=utc_now())
+
+  assert result == "archived"
+  assert item.state == "archived"
+  assert saved[-1]["archive_checksum"] == item.etag
+
+
+@pytest.mark.asyncio
 async def test_archive_pass_counts_each_outcome(monkeypatch):
   rows = [_catalog_item(), _catalog_item()]
   rows[1].object_id = "obj-archive-2"

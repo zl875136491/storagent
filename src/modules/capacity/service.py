@@ -72,8 +72,6 @@ async def collect_snapshot() -> None:
   now = utc_now()
   sample_day = now.strftime("%Y-%m-%d")
   for cluster in overview.get("clusters", []):
-    if not cluster.get("reachable"):
-      continue
     region = str(cluster.get("region") or cluster.get("server") or "")
     replication_source = replication_by_server.get(cluster.get("server"), {})
     archive = archive_by_region.get(region, {})
@@ -88,6 +86,11 @@ async def collect_snapshot() -> None:
       archived_object_count=max(int(archive.get("archived_object_count") or 0), 0),
       expected_replica_count=max(int(replication_source.get("expected_target_count") or 0), 0),
       actual_replica_count=max(int(replication_source.get("actual_target_count") or 0), 0),
+      health_status=str(cluster.get("status") or (
+        "online" if cluster.get("reachable") else "offline"
+      )),
+      reachable=bool(cluster.get("reachable")),
+      health_reasons=[str(item) for item in (cluster.get("health_reasons") or [])],
       captured_at=now,
       sample_day=sample_day,
     )
@@ -181,3 +184,58 @@ async def get_planning() -> dict:
   if published:
     return published
   return {"generated_at": utc_now(), "data": []}
+
+
+async def get_diagnostic_capacity_aggregate(region: str) -> dict:
+  """Read the current-region capacity snapshot for caller diagnostics only."""
+  try:
+    rows = await RegionCapacitySnapshot.find(
+      RegionCapacitySnapshot.region == region,
+    ).sort("-captured_at").limit(1).to_list()
+  except Exception as error:
+    logger.warning("读取诊断容量快照失败 region=%s: %s", region, error)
+    return {
+      "region": region,
+      "status": "unknown",
+      "reachable": False,
+      "fresh": False,
+      "captured_at": None,
+      "raw_capacity_bytes": 0,
+      "raw_used_bytes": 0,
+      "expected_replica_count": 0,
+      "actual_replica_count": 0,
+      "health_reasons": ["容量快照不可读取"],
+    }
+  if not rows:
+    return {
+      "region": region,
+      "status": "unknown",
+      "reachable": False,
+      "fresh": False,
+      "captured_at": None,
+      "raw_capacity_bytes": 0,
+      "raw_used_bytes": 0,
+      "expected_replica_count": 0,
+      "actual_replica_count": 0,
+      "health_reasons": ["尚未采集当前区域容量快照"],
+    }
+  snapshot = rows[0]
+  captured_at = snapshot.captured_at
+  if captured_at.tzinfo is None:
+    captured_at = captured_at.replace(tzinfo=utc_now().tzinfo)
+  fresh = (utc_now() - captured_at).total_seconds() <= max(
+    float(settings.CAPACITY_SNAPSHOT_MAX_AGE_SECONDS),
+    0.0,
+  )
+  return {
+    "region": snapshot.region,
+    "status": str(getattr(snapshot, "health_status", "unknown") or "unknown"),
+    "reachable": bool(getattr(snapshot, "reachable", False)),
+    "fresh": fresh,
+    "captured_at": captured_at,
+    "raw_capacity_bytes": max(int(snapshot.raw_capacity_bytes or 0), 0),
+    "raw_used_bytes": max(int(snapshot.raw_used_bytes or 0), 0),
+    "expected_replica_count": max(int(snapshot.expected_replica_count or 0), 0),
+    "actual_replica_count": max(int(snapshot.actual_replica_count or 0), 0),
+    "health_reasons": list(getattr(snapshot, "health_reasons", None) or []),
+  }

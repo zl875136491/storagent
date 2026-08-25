@@ -224,12 +224,18 @@ class ReplicationResyncRequest(BaseModel):
   older_than: str | None = Field(None, max_length=64, description="可选 mc 时长，如 7d12h")
 
 
-UnmanagedBucketKind = Literal["unmanaged", "disabled_application", "system"]
+UnmanagedBucketKind = Literal[
+  "unmanaged",
+  "disabled_application",
+  "system",
+  "needs_review",
+]
 UnmanagedBucketDisposition = Literal[
   "unreviewed",
   "retained",
   "deleting",
   "delete_failed",
+  "needs_review",
   "not_applicable",
 ]
 
@@ -246,12 +252,16 @@ class UnmanagedBucketItem(BaseModel):
   disposition: UnmanagedBucketDisposition = "not_applicable"
   disposition_reason: str = ""
   disposition_updated_at: datetime | None = None
+  ownership_source: Literal["authoritative", "system", "unavailable"] = "authoritative"
+  ownership_reason: str = ""
+  cleanup_remaining_servers: list[str] = Field(default_factory=list)
 
 
 class UnmanagedBucketOperationsSummary(BaseModel):
   unmanaged_count: int = 0
   disabled_application_count: int = 0
   system_bucket_count: int = 0
+  needs_review_count: int = 0
   unavailable_server_count: int = 0
 
 
@@ -275,6 +285,9 @@ class UnmanagedBucketActionResponse(BaseModel):
   message: str
   bucket: str
   disposition: UnmanagedBucketDisposition
+  accepted: bool = False
+  operation_id: str | None = None
+  operation_status: Literal["queued", "running", "succeeded", "failed"] | None = None
   operation: dict[str, Any] | None = None
 
 
@@ -288,6 +301,9 @@ OrphanBucketOperationsResponse = UnmanagedBucketOperationsResponse
 class ReplicationOperationResponse(BaseModel):
   message: str
   bucket: str
+  accepted: bool = True
+  operation_id: str | None = None
+  operation_status: Literal["queued", "running", "succeeded", "failed"] | None = None
   source_server: str | None = None
   target_server: str | None = None
   detail: dict[str, Any] = Field(default_factory=dict)

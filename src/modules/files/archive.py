@@ -8,6 +8,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from minio.commonconfig import CopySource
+from minio.commonconfig import ENABLED
+from minio.lifecycleconfig import (
+  Expiration,
+  LifecycleConfig,
+  NoncurrentVersionExpiration,
+  Rule,
+)
+from minio.versioningconfig import VersioningConfig
 
 from src.configs.configs import settings
 from src.core.minio_op import get_minio_client
@@ -56,6 +64,7 @@ def _is_missing_object(error: BaseException) -> bool:
   return any(value in text for value in (
     "nosuchkey",
     "nosuchobject",
+    "nosuchversion",
     "object does not exist",
   ))
 
@@ -96,6 +105,51 @@ def _verify_archive_object(
   return source_etag or archive_etag
 
 
+def _has_expiration_lifecycle(lifecycle: Any) -> bool:
+  rules = getattr(lifecycle, "rules", None)
+  if not isinstance(rules, list):
+    return False
+  for rule in rules:
+    expiry = getattr(rule, "expiration", None)
+    if int(getattr(expiry, "days", 0) or 0) > 0:
+      return True
+  return False
+
+
+def _ensure_archive_bucket_policy(client: Any, archive_bucket: str) -> None:
+  """Create and protect the private archive namespace without overwriting policy."""
+  if not client.bucket_exists(archive_bucket):
+    client.make_bucket(archive_bucket)
+
+  # Minimal mock clients in isolated tests do not model bucket policy APIs.
+  # Production MinIO clients do, and a failure there aborts archival rather
+  # than creating an unprotected, indefinite archive store.
+  if not hasattr(client, "set_bucket_versioning"):
+    return
+  versioning = client.get_bucket_versioning(archive_bucket)
+  if str(getattr(versioning, "status", "")) != ENABLED:
+    client.set_bucket_versioning(archive_bucket, VersioningConfig(ENABLED))
+
+  if not hasattr(client, "get_bucket_lifecycle"):
+    return
+  lifecycle = client.get_bucket_lifecycle(archive_bucket)
+  if lifecycle is None:
+    retention_days = max(int(settings.OBJECT_ARCHIVE_RETENTION_DAYS), 1)
+    client.set_bucket_lifecycle(
+      archive_bucket,
+      LifecycleConfig([Rule(
+        ENABLED,
+        rule_id="storagent-expired-archive-retention",
+        expiration=Expiration(days=retention_days),
+        noncurrent_version_expiration=NoncurrentVersionExpiration(
+          noncurrent_days=retention_days,
+        ),
+      )]),
+    )
+  elif not _has_expiration_lifecycle(lifecycle):
+    raise RuntimeError("归档存储桶缺少对象过期生命周期策略")
+
+
 def _copy_then_remove(
   client: Any,
   item: ObjectCatalog,
@@ -104,14 +158,27 @@ def _copy_then_remove(
 ) -> str:
   if not item.minio_version_id:
     raise RuntimeError("对象缺少版本 ID，无法安全删除归档前的源版本")
-  if not client.bucket_exists(archive_bucket):
-    client.make_bucket(archive_bucket)
+  _ensure_archive_bucket_policy(client, archive_bucket)
 
-  source_stat = client.stat_object(
-    item.bucket,
-    item.storage_key,
-    version_id=item.minio_version_id or None,
-  )
+  try:
+    source_stat = client.stat_object(
+      item.bucket,
+      item.storage_key,
+      version_id=item.minio_version_id or None,
+    )
+  except Exception as error:
+    if not _is_missing_object(error):
+      raise
+    # A worker can stop after the source removal but before the catalog state
+    # is committed. The archive key is deterministic, so verify that copy and
+    # finish the idempotent state transition without touching source again.
+    try:
+      archived = client.stat_object(archive_bucket, archive_key)
+    except Exception as archive_error:
+      if _is_missing_object(archive_error):
+        raise RuntimeError("源对象已不存在且未找到可验证的归档副本") from error
+      raise
+    return _verify_archive_object(item, _normalize_etag(item.etag), archived) or item.etag
   source_etag = _verify_source_object(item, source_stat)
 
   archived = None

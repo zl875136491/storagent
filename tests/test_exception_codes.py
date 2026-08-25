@@ -84,6 +84,26 @@ def test_v2_minio_auth_error_is_not_retryable():
   }
 
 
+def test_shared_minio_error_classifier_keeps_auth_network_and_operation_distinct():
+  from src.core.minio_errors import classify_minio_error
+
+  class CodedError(RuntimeError):
+    def __init__(self, code):
+      self.code = code
+      super().__init__(code)
+
+  auth = classify_minio_error(CodedError("AccessDenied"), "multipart_write")
+  network = classify_minio_error(TimeoutError("timed out"), "download_chunk")
+  generic = classify_minio_error(RuntimeError("bad request"), "multipart_list_parts")
+
+  assert auth.error_desc == ErrorDesc.MINIO_AUTH_FAILED
+  assert v2_error_response(auth, "auth")['error']["code"] == "storage.authentication_failed"
+  assert network.error_desc == ErrorDesc.MINIO_NETWORK_UNAVAILABLE
+  assert v2_error_response(network, "network")["error"]["retryable"] is True
+  assert generic.error_desc == ErrorDesc.MINIO_ACCESS_FAILED
+  assert generic.reason == {"operation": "multipart_list_parts", "category": "operation"}
+
+
 @pytest.mark.asyncio
 async def test_custom_exception_log_includes_request_id(monkeypatch):
   from src.core import exception as exception_module

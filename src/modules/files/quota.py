@@ -283,6 +283,29 @@ async def get_observed_usage_bytes(app_name: str, client: Any = None) -> int:
       await client.close()
 
 
+async def get_usage_aggregate(app_name: str, client: Any = None) -> dict[str, Any]:
+  """Read the replicated logical-usage aggregate without contacting MinIO."""
+  own_client = client is None
+  if own_client:
+    client = await etcd_op.get_etcd_client()
+  try:
+    state = _normalize_state(await _read_dict(_state_key(app_name), client))
+    active = max(int(state.get("active_usage_bytes") or 0), 0)
+    observed = max(int(state.get("observed_usage_bytes") or 0), 0)
+    initialized = bool(state.get("logical_usage_initialized"))
+    return {
+      "usage_bytes": active if initialized else observed,
+      "active_usage_bytes": active,
+      "observed_usage_bytes": observed,
+      "deleted_retained_bytes": max(int(state.get("deleted_retained_bytes") or 0), 0),
+      "updated_at": _parse_datetime(state.get("observed_usage_updated_at")),
+      "initialized": initialized,
+    }
+  finally:
+    if own_client:
+      await client.close()
+
+
 async def _delete_key(key: str, client: Any) -> None:
   await client.delete(_full_key(key))
 

@@ -152,6 +152,9 @@ class RegionCapacitySnapshot(Document):
   archived_object_count: int = Field(default=0, ge=0)
   expected_replica_count: int = Field(default=0, ge=0)
   actual_replica_count: int = Field(default=0, ge=0)
+  health_status: Literal["online", "degraded", "critical", "offline", "unknown"] = "unknown"
+  reachable: bool = False
+  health_reasons: list[str] = Field(default_factory=list)
   captured_at: datetime = Field(default_factory=utc_now)
   sample_day: str
 
