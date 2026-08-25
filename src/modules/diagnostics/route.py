@@ -25,6 +25,12 @@ async def probe(
   return {"authenticated": True, "api_version": service.validate_version(version)}
 
 
+@router.get("/{version}/quota-capacity-probe", summary="自诊断应用配额与集群容量预检")
+async def quota_capacity_probe(version: str, context: dict = Depends(get_current_app_context)):
+  service.validate_version(version)
+  return await service.quota_capacity_probe(context)
+
+
 @router.post("/{version}/storage-probe", summary="自诊断临时存储读写")
 async def storage_probe(version: str, payload: dict, context: dict = Depends(get_current_app_context)):
   service.validate_version(version)
