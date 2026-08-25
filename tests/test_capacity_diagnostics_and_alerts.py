@@ -1,4 +1,5 @@
 """Focused contract tests for quota alerts, capacity planning and diagnostics."""
+from datetime import timedelta
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -8,6 +9,7 @@ from src.api import register_api
 from src.modules.diagnostics import service as diagnostics_service
 from src.modules.diagnostics import route as diagnostics_route
 from src.modules.public import quota_alert
+from src.utils.helpers import utc_now
 
 
 def test_new_operational_routes_are_registered_for_both_versions():
@@ -37,6 +39,8 @@ def test_diagnostic_script_is_versioned_and_keeps_key_out_of_report():
   assert "APIKey 与 ${API_VERSION} 契约验证通过" in script
   assert "run_quota_capacity_check" in script
   assert "配额与容量预检" in script
+  assert "response_blocking_reasons" in script
+  assert "阻断原因" in script
   assert "应用 APPID" not in script
   assert "APP_NAME=" not in script
   assert "?app_name=" not in script
@@ -118,6 +122,8 @@ async def test_quota_capacity_probe_returns_api_key_scoped_aggregate_preflight(m
     "usage_percent": 25.0,
     "updated_at": None,
     "fresh": True,
+    "source": "",
+    "freshness_basis": "",
   }
   assert result["cluster"]["region"] == "beijing"
   assert result["cluster"]["available_bytes"] == 512 * 1024 ** 3
@@ -184,6 +190,133 @@ async def test_quota_capacity_probe_blocks_stale_or_degraded_aggregate_without_m
     "当前区域容量快照已过期或不可用",
     "当前区域复制冗余低于预期",
   ]
+
+
+@pytest.mark.asyncio
+async def test_event_sourced_quota_aggregate_is_ready_when_idle(monkeypatch):
+  from src.modules.files import quota as files_quota
+  from src.modules.public import crud as public_crud
+  from src.modules.public import service as public_service
+
+  stale = utc_now() - timedelta(hours=6)
+  application = SimpleNamespace(
+    quota_bytes=100 * 1024 ** 3,
+    quota_usage_bytes=957,
+    quota_usage_updated_at=stale,
+  )
+
+  async def read_application(_name):
+    return application
+
+  async def read_usage(_name):
+    return {
+      "usage_bytes": 957,
+      "updated_at": stale,
+      "initialized": True,
+    }
+
+  monkeypatch.setattr(public_crud, "read_application_by_name", read_application)
+  monkeypatch.setattr(files_quota, "get_usage_aggregate", read_usage)
+
+  result = await public_service.get_application_quota_usage_aggregate("idle-app")
+
+  assert result["fresh"] is True
+  assert result["source"] == "logical_usage_aggregate"
+  assert result["freshness_basis"] == "event_sourced"
+
+
+@pytest.mark.asyncio
+async def test_uninitialized_quota_snapshot_still_expires(monkeypatch):
+  from src.modules.files import quota as files_quota
+  from src.modules.public import crud as public_crud
+  from src.modules.public import service as public_service
+
+  stale = utc_now() - timedelta(hours=6)
+  application = SimpleNamespace(
+    quota_bytes=100 * 1024 ** 3,
+    quota_usage_bytes=957,
+    quota_usage_updated_at=stale,
+  )
+
+  async def read_application(_name):
+    return application
+
+  async def read_usage(_name):
+    return {
+      "usage_bytes": 957,
+      "updated_at": stale,
+      "initialized": False,
+    }
+
+  monkeypatch.setattr(public_crud, "read_application_by_name", read_application)
+  monkeypatch.setattr(files_quota, "get_usage_aggregate", read_usage)
+
+  result = await public_service.get_application_quota_usage_aggregate("snapshot-app")
+
+  assert result["fresh"] is False
+  assert result["source"] == "application_usage_snapshot"
+  assert result["freshness_basis"] == "sampled"
+
+
+@pytest.mark.asyncio
+async def test_quota_aggregate_refresh_seeds_enabled_apps_on_authority(monkeypatch):
+  from src.modules.files import quota as files_quota
+  from src.modules.public import crud as public_crud
+  from src.modules.public import service as public_service
+
+  applications = [
+    SimpleNamespace(name="uno", enabled=True),
+    SimpleNamespace(name="disabled", enabled=False),
+  ]
+  refreshed: list[tuple[str, bool, bool]] = []
+  reconciled: list[tuple[str, int]] = []
+
+  async def read_applications():
+    return applications
+
+  async def refresh(application, *, force, require_all):
+    refreshed.append((application.name, force, require_all))
+    return 957
+
+  async def reconcile(app_name, observed_usage):
+    reconciled.append((app_name, observed_usage))
+    return {"initialized": True}
+
+  monkeypatch.setattr(public_service.settings, "REGION", "authority")
+  monkeypatch.setattr(public_service.settings, "SYNC_AUTHORITY_REGION", "authority")
+  monkeypatch.setattr(public_crud, "read_application_list", read_applications)
+  monkeypatch.setattr(public_service, "refresh_application_quota_usage", refresh)
+  monkeypatch.setattr(files_quota, "reconcile_usage_aggregate", reconcile)
+
+  result = await public_service.refresh_application_quota_aggregates_once()
+
+  assert result == {
+    "status": "completed",
+    "processed": 1,
+    "succeeded": 1,
+    "failed": 0,
+    "skipped": 1,
+  }
+  assert refreshed == [("uno", True, True)]
+  assert reconciled == [("uno", 957)]
+
+
+@pytest.mark.asyncio
+async def test_quota_aggregate_refresh_skips_non_authority(monkeypatch):
+  from src.modules.public import crud as public_crud
+  from src.modules.public import service as public_service
+
+  async def must_not_read_applications():
+    raise AssertionError("non-authority must not refresh MinIO quota aggregates")
+
+  monkeypatch.setattr(public_service.settings, "REGION", "replica")
+  monkeypatch.setattr(public_service.settings, "SYNC_AUTHORITY_REGION", "authority")
+  monkeypatch.setattr(public_crud, "read_application_list", must_not_read_applications)
+
+  result = await public_service.refresh_application_quota_aggregates_once()
+
+  assert result["status"] == "skipped"
+  assert result["processed"] == 0
 
 
 @pytest.mark.asyncio

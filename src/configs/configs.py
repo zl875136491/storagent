@@ -153,6 +153,9 @@ class Settings(BaseSettings):
   OBJECT_ARCHIVE_RETRY_SECONDS: float = 300.0
   APPLICATION_QUOTA_USAGE_CACHE_SECONDS: float = 60.0
   APPLICATION_QUOTA_USAGE_MAX_CONCURRENCY: int = 4
+  # The Celery authority periodically seeds/reconciles the Etcd logical quota
+  # aggregate for applications created before event-based quota accounting.
+  APPLICATION_QUOTA_AGGREGATE_INTERVAL_SECONDS: int = 3600
   APPLICATION_QUOTA_RESERVATION_TTL_SECONDS: int = 86400
   APPLICATION_QUOTA_MAX_ACTIVE_RESERVATIONS: int = 1000
   APPLICATION_UPLOAD_MAX_PART_BYTES: int = 64 * 1024 ** 2

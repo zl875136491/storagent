@@ -306,6 +306,32 @@ async def get_usage_aggregate(app_name: str, client: Any = None) -> dict[str, An
       await client.close()
 
 
+async def reconcile_usage_aggregate(
+  app_name: str,
+  observed_usage: int,
+) -> dict[str, Any]:
+  """Seed or reconcile the logical quota aggregate from a worker observation.
+
+  This function deliberately does not discover usage itself. The caller is a
+  scheduled authority worker that has already completed a full MinIO scan, so
+  request-time diagnostics can remain aggregate-only.
+  """
+  async with application_quota_lock(app_name) as client:
+    state, cleaned = await _reconcile_state_locked(
+      app_name,
+      client,
+      observed_usage=max(int(observed_usage), 0),
+    )
+  active = max(int(state.get("active_usage_bytes") or 0), 0)
+  observed = max(int(state.get("observed_usage_bytes") or 0), 0)
+  initialized = bool(state.get("logical_usage_initialized"))
+  return {
+    "usage_bytes": active if initialized else observed,
+    "initialized": initialized,
+    "cleaned_reservation_count": len(cleaned),
+  }
+
+
 async def _delete_key(key: str, client: Any) -> None:
   await client.delete(_full_key(key))
 

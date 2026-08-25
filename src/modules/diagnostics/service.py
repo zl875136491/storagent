@@ -223,6 +223,12 @@ response_compact_json() {
   tr '\r\n' ' ' <"$RESPONSE_FILE" | sed 's/[[:space:]][[:space:]]*/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
+response_blocking_reasons() {
+  sed -n 's/.*"blocking_reasons"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' "$RESPONSE_FILE" \
+    | sed 's/\\\\"/"/g; s/"//g; s/,/；/g' \
+    | head -n 1
+}
+
 run_dns_check() {
   # Test endpoints use a direct NUC IP. DNS is not applicable to an IP literal.
   if printf '%s' "$HOST" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || printf '%s' "$HOST" | grep -q ':'; then
@@ -293,7 +299,9 @@ run_quota_capacity_check() {
   if [ "$HTTP_STATUS" = "200" ] && grep -Eq '"ready"[[:space:]]*:[[:space:]]*true' "$RESPONSE_FILE"; then
     add_check quota_capacity passed "${summary}: ${response_json}" "$HTTP_LATENCY_MS" "$summary"
   elif [ "$HTTP_STATUS" = "200" ]; then
-    add_check quota_capacity failed "${summary}: ${response_json}" "$HTTP_LATENCY_MS" "$summary"
+    blocking_reasons="$(response_blocking_reasons)"
+    [ -n "$blocking_reasons" ] || blocking_reasons="预检未就绪，请查看诊断详情"
+    add_check quota_capacity failed "${summary}: ${response_json}" "$HTTP_LATENCY_MS" "${summary}；阻断原因：${blocking_reasons}"
     update_overall_status failed
   else
     add_check quota_capacity failed "配额与容量预检失败: $(request_failure_detail)" "$HTTP_LATENCY_MS"
@@ -476,6 +484,8 @@ async def quota_capacity_probe(app_context: dict) -> dict:
       "usage_percent": quota_usage_percent,
       "updated_at": quota.get("updated_at"),
       "fresh": bool(quota.get("fresh")),
+      "source": str(quota.get("source") or ""),
+      "freshness_basis": str(quota.get("freshness_basis") or ""),
     },
     "cluster": {
       "region": str(cluster.get("region") or settings.REGION),

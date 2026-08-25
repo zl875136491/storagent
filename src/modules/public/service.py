@@ -698,6 +698,50 @@ async def refresh_application_quota_usage(
   return usage
 
 
+async def refresh_application_quota_aggregates_once() -> dict[str, int | str]:
+  """Refresh the authoritative quota aggregate outside caller request paths."""
+  if settings.REGION != settings.SYNC_AUTHORITY_REGION:
+    return {
+      "status": "skipped",
+      "processed": 0,
+      "succeeded": 0,
+      "failed": 0,
+      "skipped": 0,
+    }
+
+  from src.modules.files import quota as upload_quota
+
+  applications = await public_crud.read_application_list()
+  result: dict[str, int | str] = {
+    "status": "completed",
+    "processed": 0,
+    "succeeded": 0,
+    "failed": 0,
+    "skipped": 0,
+  }
+  for application in applications:
+    if not application.enabled:
+      result["skipped"] = int(result["skipped"]) + 1
+      continue
+    result["processed"] = int(result["processed"]) + 1
+    try:
+      usage = await refresh_application_quota_usage(
+        application,
+        force=True,
+        require_all=True,
+      )
+      await upload_quota.reconcile_usage_aggregate(application.name, usage)
+      result["succeeded"] = int(result["succeeded"]) + 1
+    except Exception as error:
+      result["failed"] = int(result["failed"]) + 1
+      logger.warning(
+        "应用配额聚合刷新失败 app=%s error=%s",
+        application.name,
+        type(error).__name__,
+      )
+  return result
+
+
 async def _application_response(
   application: Application,
   *,
@@ -795,13 +839,27 @@ async def get_application_quota_usage_aggregate(app_name: str) -> dict:
     aggregate_error = str(error)
 
   state_usage = max(int(state.get("usage_bytes") or 0), 0)
+  logical_usage_initialized = bool(state.get("initialized"))
   updated_at = _newest_timestamp(cached_at, state.get("updated_at"))
   now = utc_now()
   max_age = max(float(settings.DIAGNOSTIC_QUOTA_AGGREGATE_MAX_AGE_SECONDS), 0.0)
-  fresh = bool(
-    updated_at is not None
-    and (now - updated_at).total_seconds() <= max_age
-  )
+  # Once the logical counter has been initialized, every supported upload,
+  # deletion and recovery path updates it transactionally in Etcd. Its
+  # timestamp represents the last mutation, not a periodic sample, so an idle
+  # application must not fail caller diagnostics merely because no object has
+  # changed recently. An uninitialized counter still relies on a sampled
+  # projection and remains subject to the freshness window.
+  if logical_usage_initialized and not aggregate_error:
+    fresh = True
+    source = "logical_usage_aggregate"
+    freshness_basis = "event_sourced"
+  else:
+    fresh = bool(
+      updated_at is not None
+      and (now - updated_at).total_seconds() <= max_age
+    )
+    source = "application_usage_snapshot"
+    freshness_basis = "sampled"
   return {
     "limit_bytes": max(int(application.quota_bytes or 0), 0),
     # Choose the safe high watermark when a Mongo projection lags the Etcd
@@ -810,7 +868,8 @@ async def get_application_quota_usage_aggregate(app_name: str) -> dict:
     "used_bytes": max(cached_usage, state_usage),
     "updated_at": updated_at,
     "fresh": fresh,
-    "source": "application_aggregate",
+    "source": source,
+    "freshness_basis": freshness_basis,
     "aggregate_error": aggregate_error,
   }
 
