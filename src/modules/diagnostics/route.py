@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import PlainTextResponse
 
 from src.core.auth import check_permissions, get_current_app_context, get_current_user
@@ -20,13 +20,9 @@ async def download_script(version: str):
 @router.get("/{version}/probe", summary="自诊断认证与版本契约探针")
 async def probe(
   version: str,
-  app_name: str = Query(..., min_length=1, max_length=128),
-  context: dict = Depends(get_current_app_context),
+  _context: dict = Depends(get_current_app_context),
 ):
-  if app_name != context["app_name"]:
-    from src.core.exception import CustomException, ErrorDesc
-    raise CustomException(ErrorDesc.INSUFFICIENT_PERMISSIONS, "APPID 与 APIKey 绑定应用不一致")
-  return {"authenticated": True, "api_version": service.validate_version(version), "app_name": context["app_name"]}
+  return {"authenticated": True, "api_version": service.validate_version(version)}
 
 
 @router.post("/{version}/storage-probe", summary="自诊断临时存储读写")

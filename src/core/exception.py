@@ -52,6 +52,8 @@ class ErrorDesc(Enum):
   MINIO_REPLICATE_FAILED = ("Minio 复制集设置失败", 400021)
   MINIO_CREATE_BUCKET_FAILED = ("Minio 创建存储桶失败", 400022)
   MINIO_ENABLE_VERSIONING_FAILED = ("Minio 开启版本控制失败", 400023)
+  MINIO_AUTH_FAILED = ("Minio 认证或授权失败", 502059)
+  MINIO_NETWORK_UNAVAILABLE = ("Minio 网络访问失败", 503060)
   
   # special resource
   STATUS_ERR = ("状态错误", 400020)
@@ -126,6 +128,8 @@ V2_ERROR_CODES: dict[ErrorDesc, tuple[str, bool]] = {
   ErrorDesc.SHARE_CONSUMED: ("share.consumed", False),
   ErrorDesc.SHARE_REVOKED: ("share.revoked", False),
   ErrorDesc.DOWNLOAD_SOURCE_UNAVAILABLE: ("storage.unavailable", True),
+  ErrorDesc.MINIO_AUTH_FAILED: ("storage.authentication_failed", False),
+  ErrorDesc.MINIO_NETWORK_UNAVAILABLE: ("storage.unavailable", True),
   ErrorDesc.RATE_LIMITED: ("rate_limit.exceeded", True),
   ErrorDesc.SYNC_FAILED: ("system.dependency_unavailable", True),
   ErrorDesc.MINIO_ACCESS_FAILED: ("storage.unavailable", True),
@@ -213,16 +217,17 @@ def error_response(msg: str, data: Optional[Any] = None, code: Optional[int] = N
 
 async def custom_exception_handler(request: Request, exc: CustomException):
   """捕获自定义的业务异常"""
+  request_id = str(getattr(request.state, "request_id", "") or "-")
   log_message = (
     f"[异常]: Message: {exc.message} | "
     f"URL: ({request.method}) {request.url} | Client IP: {request.client.host} | "
-    f"Code: {exc.code} | Detail: {exc.reason}"
+    f"Request ID: {request_id} | Code: {exc.code} | Detail: {exc.reason}"
   )
   logger.error(log_message)
   if request.url.path.startswith("/api/v2/"):
     return JSONResponse(
       status_code=exc.status_code,
-      content=jsonable_encoder(v2_error_response(exc, getattr(request.state, "request_id", ""))),
+      content=jsonable_encoder(v2_error_response(exc, request_id if request_id != "-" else "")),
     )
   return JSONResponse(
     status_code=exc.status_code,
@@ -240,10 +245,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     field = ".".join(str(loc) for loc in error["loc"])
     errors.append({"field": field, "message": error["msg"]})
 
+  request_id = str(getattr(request.state, "request_id", "") or "-")
   log_message = (
     f"捕获到请求参数验证错误 | "
     f"Method: {request.method} | URL: {request.url} | Client IP: {request.client.host} | "
-    f"Errors: {errors}"
+    f"Request ID: {request_id} | Errors: {errors}"
   )
   logger.warning(log_message)
 
@@ -257,7 +263,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
           "retryable": False,
           "details": {"errors": errors},
         },
-        "request_id": getattr(request.state, "request_id", ""),
+        "request_id": request_id if request_id != "-" else "",
       }),
     )
   return JSONResponse(
@@ -299,9 +305,11 @@ async def all_exception_handler(request: Request, exc: Exception):
   - DEBUG=True: 返回详细的错误信息和堆栈跟踪，便于调试
   - DEBUG=False: 只返回通用错误信息，不暴露内部实现细节
   """
+  request_id = str(getattr(request.state, "request_id", "") or "-")
   log_message = (
     f"捕获到未处理的全局异常: {exc} | "
-    f"Method: {request.method} | URL: {request.url} | Client IP: {request.client.host}"
+    f"Method: {request.method} | URL: {request.url} | Client IP: {request.client.host} | "
+    f"Request ID: {request_id}"
   )
   # 使用 logger.exception 可以自动记录完整的堆栈信息到日志
   logger.exception(log_message)
@@ -316,7 +324,7 @@ async def all_exception_handler(request: Request, exc: Exception):
           "retryable": False,
           "details": {},
         },
-        "request_id": getattr(request.state, "request_id", ""),
+        "request_id": request_id if request_id != "-" else "",
       }),
     )
   # 根据 DEBUG 标志决定响应内容

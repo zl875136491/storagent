@@ -1,5 +1,10 @@
 """稳定业务错误码契约（前端依赖 code 字段）。"""
+import json
+from types import SimpleNamespace
+
 from fastapi import FastAPI
+from starlette.requests import Request
+import pytest
 
 from src.api import register_api
 from src.core.exception import (
@@ -58,6 +63,62 @@ def test_v2_error_response_uses_stable_string_code_and_request_id():
       "details": {"object_id": "obj_1"},
     },
     "request_id": "req_1",
+  }
+
+
+def test_v2_minio_auth_error_is_not_retryable():
+  exc = CustomException(
+    ErrorDesc.MINIO_AUTH_FAILED,
+    {"operation": "read_write", "category": "authentication"},
+  )
+
+  assert exc.status_code == 502
+  assert v2_error_response(exc, "req_1") == {
+    "error": {
+      "code": "storage.authentication_failed",
+      "message": "Minio 认证或授权失败",
+      "retryable": False,
+      "details": {"operation": "read_write", "category": "authentication"},
+    },
+    "request_id": "req_1",
+  }
+
+
+@pytest.mark.asyncio
+async def test_custom_exception_log_includes_request_id(monkeypatch):
+  from src.core import exception as exception_module
+
+  messages = []
+  monkeypatch.setattr(exception_module, "logger", SimpleNamespace(error=messages.append))
+  request = Request({
+    "type": "http",
+    "http_version": "1.1",
+    "method": "GET",
+    "scheme": "http",
+    "path": "/api/v2/test",
+    "raw_path": b"/api/v2/test",
+    "query_string": b"",
+    "headers": [],
+    "client": ("127.0.0.1", 12345),
+    "server": ("testserver", 80),
+    "state": {},
+  })
+  request.state.request_id = "request-42"
+
+  response = await exception_module.custom_exception_handler(
+    request,
+    CustomException(ErrorDesc.MINIO_AUTH_FAILED, {"operation": "write"}),
+  )
+
+  assert "Request ID: request-42" in messages[0]
+  assert json.loads(response.body) == {
+    "error": {
+      "code": "storage.authentication_failed",
+      "message": "Minio 认证或授权失败",
+      "retryable": False,
+      "details": {"operation": "write"},
+    },
+    "request_id": "request-42",
   }
 
 

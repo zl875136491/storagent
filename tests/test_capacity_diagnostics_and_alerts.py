@@ -1,9 +1,12 @@
 """Focused contract tests for quota alerts, capacity planning and diagnostics."""
+from types import SimpleNamespace
+
 from fastapi import FastAPI
 import pytest
 
 from src.api import register_api
 from src.modules.diagnostics import service as diagnostics_service
+from src.modules.diagnostics import route as diagnostics_route
 from src.modules.public import quota_alert
 
 
@@ -29,6 +32,10 @@ def test_diagnostic_script_is_versioned_and_keeps_key_out_of_report():
   assert 'API_PREFIX="/api/v2"' in script
   assert '/diagnostics/${API_VERSION}/probe' in script
   assert "APIKey to the diagnostic report" in script
+  assert "APIKey 与 ${API_VERSION} 契约验证通过" in script
+  assert "应用 APPID" not in script
+  assert "APP_NAME=" not in script
+  assert "?app_name=" not in script
   assert "backend_port" not in script
   assert "应用后端服务端口" not in script
 
@@ -49,6 +56,201 @@ def test_diagnostic_script_normalizes_region_shorthand_before_dns_and_curl():
   assert "stty -echo" in script
   assert "APIKey（输入时不显示）" in script
   assert "API_KEY=\"$(trim \"$(ask" not in script
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_probe_uses_api_key_bound_application_context():
+  result = await diagnostics_route.probe("v2", _context={"app_name": "parts"})
+
+  assert result == {
+    "authenticated": True,
+    "api_version": "v2",
+  }
+
+
+@pytest.mark.asyncio
+async def test_storage_probe_decrypts_server_credentials_before_minio_access(monkeypatch):
+  from src.core import minio_op
+  from src.modules.storage import crud as storage_crud
+
+  server = SimpleNamespace(
+    host="minio.internal",
+    minio_port=9000,
+    access_key="enc:v1:encrypted-access-key",
+    secret_key="enc:v1:encrypted-secret-key",
+    master=True,
+  )
+
+  class Response:
+    def __init__(self, value):
+      self.value = value
+
+    def read(self):
+      return self.value
+
+    def close(self):
+      return None
+
+    def release_conn(self):
+      return None
+
+  class Client:
+    written = b""
+    removed = []
+
+    def put_object(self, _bucket, _key, data, _length):
+      self.written = data.read()
+
+    def get_object(self, _bucket, _key):
+      return Response(self.written)
+
+    def remove_object(self, bucket, key):
+      self.removed.append((bucket, key))
+
+  client = Client()
+  captured_credentials = []
+
+  async def read_servers():
+    return [server]
+
+  def plain_credentials(item):
+    assert item is server
+    return "plain-access-key", "plain-secret-key"
+
+  def get_client(host, port, access_key, secret_key):
+    captured_credentials.append((host, port, access_key, secret_key))
+    return client
+
+  monkeypatch.setattr(storage_crud, "read_minio_server_list", read_servers)
+  monkeypatch.setattr(storage_crud, "plain_minio_credentials", plain_credentials)
+  monkeypatch.setattr(minio_op, "get_minio_client", get_client)
+
+  result = await diagnostics_service.storage_probe({"app_name": "parts"}, "diag-1")
+
+  assert result == {"storage": "passed", "object_prefix": ".storagent-diagnostics/"}
+  assert captured_credentials == [
+    ("minio.internal", 9000, "plain-access-key", "plain-secret-key"),
+  ]
+  assert client.removed == [("parts", ".storagent-diagnostics/diag-1.txt")]
+
+
+@pytest.mark.asyncio
+async def test_storage_probe_preserves_primary_error_when_cleanup_also_fails(monkeypatch):
+  from src.core import minio_op
+  from src.core.exception import CustomException, ErrorDesc
+  from src.modules.storage import crud as storage_crud
+
+  class CodedError(RuntimeError):
+    def __init__(self, code):
+      self.code = code
+      super().__init__(code)
+
+  server = SimpleNamespace(
+    host="minio.internal", minio_port=9000,
+    access_key="enc:v1:access", secret_key="enc:v1:secret", master=True,
+  )
+
+  class Client:
+    cleanup_calls = 0
+
+    def put_object(self, *_args):
+      return None
+
+    def get_object(self, *_args):
+      raise CodedError("InvalidAccessKeyId")
+
+    def remove_object(self, *_args):
+      self.cleanup_calls += 1
+      raise TimeoutError("cleanup timed out")
+
+  client = Client()
+
+  async def read_servers():
+    return [server]
+
+  monkeypatch.setattr(storage_crud, "read_minio_server_list", read_servers)
+  monkeypatch.setattr(storage_crud, "plain_minio_credentials", lambda _item: ("access", "secret"))
+  monkeypatch.setattr(minio_op, "get_minio_client", lambda *_args: client)
+
+  with pytest.raises(CustomException) as error:
+    await diagnostics_service.storage_probe({"app_name": "parts"}, "diag-2")
+
+  assert error.value.error_desc == ErrorDesc.MINIO_AUTH_FAILED
+  assert error.value.reason == {
+    "operation": "read_write",
+    "category": "authentication",
+    "source_code": "InvalidAccessKeyId",
+  }
+  assert client.cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_storage_probe_does_not_cleanup_when_upload_fails(monkeypatch):
+  from src.core import minio_op
+  from src.core.exception import CustomException, ErrorDesc
+  from src.modules.storage import crud as storage_crud
+
+  class CodedError(RuntimeError):
+    def __init__(self, code):
+      self.code = code
+      super().__init__(code)
+
+  server = SimpleNamespace(
+    host="minio.internal", minio_port=9000,
+    access_key="enc:v1:access", secret_key="enc:v1:secret", master=True,
+  )
+
+  class Client:
+    cleanup_calls = 0
+
+    def put_object(self, *_args):
+      raise CodedError("InvalidAccessKeyId")
+
+    def remove_object(self, *_args):
+      self.cleanup_calls += 1
+
+  client = Client()
+
+  async def read_servers():
+    return [server]
+
+  monkeypatch.setattr(storage_crud, "read_minio_server_list", read_servers)
+  monkeypatch.setattr(storage_crud, "plain_minio_credentials", lambda _item: ("access", "secret"))
+  monkeypatch.setattr(minio_op, "get_minio_client", lambda *_args: client)
+
+  with pytest.raises(CustomException) as error:
+    await diagnostics_service.storage_probe({"app_name": "parts"}, "diag-3")
+
+  assert error.value.error_desc == ErrorDesc.MINIO_AUTH_FAILED
+  assert client.cleanup_calls == 0
+
+
+def test_storage_probe_error_categories_are_actionable():
+  from src.core.exception import ErrorDesc, v2_error_response
+
+  class CodedError(RuntimeError):
+    def __init__(self, code):
+      self.code = code
+      super().__init__(code)
+
+  authentication = diagnostics_service._storage_probe_error(
+    CodedError("InvalidAccessKeyId"), "write",
+  )
+  network = diagnostics_service._storage_probe_error(TimeoutError("slow"), "cleanup")
+
+  assert authentication.error_desc == ErrorDesc.MINIO_AUTH_FAILED
+  assert v2_error_response(authentication, "req-auth")["error"] == {
+    "code": "storage.authentication_failed",
+    "message": "Minio 认证或授权失败",
+    "retryable": False,
+    "details": {
+      "operation": "write",
+      "category": "authentication",
+      "source_code": "InvalidAccessKeyId",
+    },
+  }
+  assert network.error_desc == ErrorDesc.MINIO_NETWORK_UNAVAILABLE
+  assert v2_error_response(network, "req-network")["error"]["retryable"] is True
 
 
 @pytest.mark.asyncio

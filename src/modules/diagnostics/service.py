@@ -10,6 +10,71 @@ from io import BytesIO
 from src.core.exception import CustomException, ErrorDesc
 from src.configs.configs import settings
 from src.modules.public.model import DiagnosticRun
+from src.utils.logger import logger
+
+
+_MINIO_AUTH_ERROR_CODES = frozenset({
+  "AccessDenied",
+  "AuthorizationHeaderMalformed",
+  "ExpiredToken",
+  "InvalidAccessKeyId",
+  "InvalidToken",
+  "SignatureDoesNotMatch",
+})
+_MINIO_NETWORK_ERROR_CODES = frozenset({
+  "InternalError",
+  "RequestTimeout",
+  "ServiceUnavailable",
+  "SlowDown",
+})
+_NETWORK_EXCEPTION_NAMES = frozenset({
+  "ConnectTimeoutError",
+  "MaxRetryError",
+  "NewConnectionError",
+  "ProtocolError",
+  "ReadTimeoutError",
+  "SSLError",
+})
+
+
+def _exception_chain(error: BaseException):
+  seen: set[int] = set()
+  current: BaseException | None = error
+  while current is not None and id(current) not in seen:
+    seen.add(id(current))
+    yield current
+    current = current.__cause__ or current.__context__
+
+
+def _storage_probe_error(error: BaseException, operation: str) -> CustomException:
+  """Return a safe, actionable public error without exposing MinIO secrets."""
+  chain = list(_exception_chain(error))
+  for item in chain:
+    source_code = str(getattr(item, "code", "") or "").strip()
+    if source_code in _MINIO_AUTH_ERROR_CODES:
+      return CustomException(
+        ErrorDesc.MINIO_AUTH_FAILED,
+        {
+          "operation": operation,
+          "category": "authentication",
+          "source_code": source_code,
+        },
+      )
+  for item in chain:
+    source_code = str(getattr(item, "code", "") or "").strip()
+    if (
+      source_code in _MINIO_NETWORK_ERROR_CODES
+      or isinstance(item, (TimeoutError, ConnectionError, OSError))
+      or type(item).__name__ in _NETWORK_EXCEPTION_NAMES
+    ):
+      details = {"operation": operation, "category": "network"}
+      if source_code:
+        details["source_code"] = source_code
+      return CustomException(ErrorDesc.MINIO_NETWORK_UNAVAILABLE, details)
+  return CustomException(
+    ErrorDesc.MINIO_ACCESS_FAILED,
+    {"operation": operation, "category": "operation"},
+  )
 
 
 def validate_version(version: str) -> str:
@@ -230,10 +295,10 @@ run_gateway_check() {
 }
 
 run_authentication_check() {
-  request GET "${BASE_URL}${API_PREFIX}/diagnostics/${API_VERSION}/probe?app_name=${APP_NAME}" "" 15 true
+  request GET "${BASE_URL}${API_PREFIX}/diagnostics/${API_VERSION}/probe" "" 15 true
   if [ "$HTTP_STATUS" = "200" ] && grep -Eq '"authenticated"[[:space:]]*:[[:space:]]*true' "$RESPONSE_FILE"; then
     AUTHENTICATED=true
-    add_check authentication passed "APIKey、APPID 与 ${API_VERSION} 契约验证通过" "$HTTP_LATENCY_MS"
+    add_check authentication passed "APIKey 与 ${API_VERSION} 契约验证通过" "$HTTP_LATENCY_MS"
   else
     add_check authentication failed "认证或版本契约失败: $(request_failure_detail)" "$HTTP_LATENCY_MS"
     update_overall_status failed
@@ -289,10 +354,6 @@ command -v mktemp >/dev/null 2>&1 || fail "未找到 mktemp，无法安全创建
 BASE_INPUT="$(ask "Storagent 基础地址（回车默认 local；也可输入 local/bj/tj/ks/sz/hz 或完整地址）[${DEFAULT_BASE}]: ")" || fail "无法读取基础地址。请在交互式终端中运行此脚本。"
 BASE_URL="$(normalize_base_url "$BASE_INPUT")" || fail "基础地址无效。请输入区域代号或 http(s) 完整地址。"
 validate_base_url "$BASE_URL" || fail "基础地址格式无效: $BASE_URL"
-
-APP_NAME_INPUT="$(ask "应用 APPID: ")" || fail "无法读取应用 APPID。请在交互式终端中运行此脚本。"
-APP_NAME="$(trim "$APP_NAME_INPUT")"
-[ -n "$APP_NAME" ] || fail "应用 APPID 不能为空。"
 
 API_KEY="$(ask_secret "APIKey（输入时不显示）: ")" || fail "无法读取 APIKey。请在交互式终端中运行此脚本。"
 API_KEY="$(trim "$API_KEY")"
@@ -369,9 +430,19 @@ async def storage_probe(app_context: dict, run_id: str) -> dict:
   server = next((item for item in servers if item.master), servers[0])
   key = ".storagent-diagnostics/" + re.sub(r"[^A-Za-z0-9._-]", "-", run_id)[:96] + ".txt"
   payload = secrets.token_bytes(128)
-  client = get_minio_client(server.host, server.minio_port, server.access_key, server.secret_key)
+  try:
+    access_key, secret_key = storage_crud.plain_minio_credentials(server)
+  except Exception as error:
+    raise CustomException(
+      ErrorDesc.MINIO_AUTH_FAILED,
+      {"operation": "credentials", "category": "authentication"},
+    ) from error
+  client = get_minio_client(server.host, server.minio_port, access_key, secret_key)
+  uploaded = False
+  primary_error: BaseException | None = None
   try:
     await asyncio.to_thread(client.put_object, app_context["app_name"], key, BytesIO(payload), len(payload))
+    uploaded = True
     response = await asyncio.to_thread(client.get_object, app_context["app_name"], key)
     try:
       received = response.read()
@@ -381,10 +452,18 @@ async def storage_probe(app_context: dict, run_id: str) -> dict:
     if received != payload:
       raise RuntimeError("读取内容与写入内容不一致")
   except Exception as error:
-    raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, f"诊断读写失败: {error}") from error
+    primary_error = error
+    raise _storage_probe_error(error, "read_write") from error
   finally:
-    try:
-      await asyncio.to_thread(client.remove_object, app_context["app_name"], key)
-    except Exception as error:
-      raise CustomException(ErrorDesc.MINIO_ACCESS_FAILED, f"诊断对象清理失败: {error}") from error
+    if uploaded:
+      try:
+        await asyncio.to_thread(client.remove_object, app_context["app_name"], key)
+      except Exception as error:
+        if primary_error is None:
+          raise _storage_probe_error(error, "cleanup") from error
+        logger.warning(
+          "诊断临时对象清理失败，但保留原始诊断错误: primary={} cleanup={}",
+          type(primary_error).__name__,
+          type(error).__name__,
+        )
   return {"storage": "passed", "object_prefix": ".storagent-diagnostics/"}
