@@ -152,11 +152,8 @@ async def test_quota_capacity_probe_blocks_exhausted_quota_and_unavailable_capac
   result = await diagnostics_service.quota_capacity_probe({"app_name": "parts"})
 
   assert result["ready"] is False
-  assert result["blocking_reasons"] == [
-    "应用可用配额不足",
-    "当前区域存储状态不是完全在线",
-    "当前区域复制冗余低于预期",
-  ]
+  assert result["blocking_reasons"] == ["应用可用配额不足", "当前区域存储不可用"]
+  assert result["warnings"] == ["当前区域复制冗余低于预期", "应用配额使用率已达到 85%"]
 
 
 @pytest.mark.asyncio
@@ -184,10 +181,13 @@ async def test_quota_capacity_probe_blocks_stale_or_degraded_aggregate_without_m
 
   result = await diagnostics_service.quota_capacity_probe({"app_name": "parts"})
 
-  assert result["ready"] is False
-  assert result["blocking_reasons"] == [
-    "应用配额聚合数据已过期或不可用",
-    "当前区域容量快照已过期或不可用",
+  assert result["ready"] is True
+  assert result["blocking_reasons"] == []
+  assert result["preflight_status"] == "degraded"
+  assert result["confidence"] == "low"
+  assert result["warnings"] == [
+    "应用配额聚合数据已过期或不可用，当前结果为降级预检",
+    "当前区域容量快照已过期或不可用，当前结果为降级预检",
     "当前区域复制冗余低于预期",
   ]
 
@@ -264,14 +264,19 @@ async def test_quota_aggregate_refresh_seeds_enabled_apps_on_authority(monkeypat
   from src.modules.public import crud as public_crud
   from src.modules.public import service as public_service
 
-  applications = [
-    SimpleNamespace(name="uno", enabled=True),
-    SimpleNamespace(name="disabled", enabled=False),
-  ]
+  class Application(SimpleNamespace):
+    async def save(self):
+      return None
+
+  applications = [Application(name="uno", enabled=True, quota_usage_attempted_at=None)]
   refreshed: list[tuple[str, bool, bool]] = []
   reconciled: list[tuple[str, int]] = []
 
-  async def read_applications():
+  async def count_enabled():
+    return 1
+
+  async def read_candidates(limit):
+    assert limit > 0
     return applications
 
   async def refresh(application, *, force, require_all):
@@ -284,7 +289,8 @@ async def test_quota_aggregate_refresh_seeds_enabled_apps_on_authority(monkeypat
 
   monkeypatch.setattr(public_service.settings, "REGION", "authority")
   monkeypatch.setattr(public_service.settings, "SYNC_AUTHORITY_REGION", "authority")
-  monkeypatch.setattr(public_crud, "read_application_list", read_applications)
+  monkeypatch.setattr(public_crud, "count_enabled_applications", count_enabled)
+  monkeypatch.setattr(public_crud, "read_quota_refresh_candidates", read_candidates)
   monkeypatch.setattr(public_service, "refresh_application_quota_usage", refresh)
   monkeypatch.setattr(files_quota, "reconcile_usage_aggregate", reconcile)
 
@@ -295,7 +301,8 @@ async def test_quota_aggregate_refresh_seeds_enabled_apps_on_authority(monkeypat
     "processed": 1,
     "succeeded": 1,
     "failed": 0,
-    "skipped": 1,
+    "skipped": 0,
+    "deferred": 0,
   }
   assert refreshed == [("uno", True, True)]
   assert reconciled == [("uno", 957)]
@@ -306,17 +313,60 @@ async def test_quota_aggregate_refresh_skips_non_authority(monkeypatch):
   from src.modules.public import crud as public_crud
   from src.modules.public import service as public_service
 
-  async def must_not_read_applications():
+  async def must_not_read_applications(*_args, **_kwargs):
     raise AssertionError("non-authority must not refresh MinIO quota aggregates")
 
   monkeypatch.setattr(public_service.settings, "REGION", "replica")
   monkeypatch.setattr(public_service.settings, "SYNC_AUTHORITY_REGION", "authority")
-  monkeypatch.setattr(public_crud, "read_application_list", must_not_read_applications)
+  monkeypatch.setattr(public_crud, "count_enabled_applications", must_not_read_applications)
+  monkeypatch.setattr(public_crud, "read_quota_refresh_candidates", must_not_read_applications)
 
   result = await public_service.refresh_application_quota_aggregates_once()
 
   assert result["status"] == "skipped"
   assert result["processed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_quota_aggregate_marks_failed_candidate_attempted_and_defers_rest(monkeypatch):
+  from src.modules.public import crud as public_crud
+  from src.modules.public import service as public_service
+
+  class Application(SimpleNamespace):
+    async def save(self):
+      self.saved = True
+
+  failed = Application(name="oldest", enabled=True, quota_usage_attempted_at=None, saved=False)
+
+  async def count_enabled():
+    return 3
+
+  async def read_candidates(limit):
+    assert limit == 1
+    return [failed]
+
+  async def fail_refresh(*_args, **_kwargs):
+    raise RuntimeError("minio unavailable")
+
+  monkeypatch.setattr(public_service.settings, "REGION", "authority")
+  monkeypatch.setattr(public_service.settings, "SYNC_AUTHORITY_REGION", "authority")
+  monkeypatch.setattr(public_service.settings, "APPLICATION_QUOTA_AGGREGATE_BATCH_SIZE", 1)
+  monkeypatch.setattr(public_crud, "count_enabled_applications", count_enabled)
+  monkeypatch.setattr(public_crud, "read_quota_refresh_candidates", read_candidates)
+  monkeypatch.setattr(public_service, "refresh_application_quota_usage", fail_refresh)
+
+  result = await public_service.refresh_application_quota_aggregates_once()
+
+  assert result == {
+    "status": "completed",
+    "processed": 1,
+    "succeeded": 0,
+    "failed": 1,
+    "skipped": 0,
+    "deferred": 2,
+  }
+  assert failed.saved is True
+  assert failed.quota_usage_attempted_at is not None
 
 
 @pytest.mark.asyncio
@@ -491,7 +541,7 @@ def test_storage_probe_error_categories_are_actionable():
 
   assert authentication.error_desc == ErrorDesc.MINIO_AUTH_FAILED
   assert v2_error_response(authentication, "req-auth")["error"] == {
-    "code": "storage.authentication_failed",
+      "code": "storage.unavailable",
     "message": "Minio 认证或授权失败",
     "retryable": False,
     "details": {
@@ -558,6 +608,47 @@ async def test_get_planning_reads_etcd_on_non_authority(monkeypatch):
   result = await service.get_planning()
   assert result["data"][0]["region"] == "beijing"
   assert "called" not in pushed
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_capacity_prefers_published_authority_sample(monkeypatch):
+  from src.modules.capacity import service
+
+  captured_at = utc_now()
+
+  async def load_published():
+    return {
+      "generated_at": captured_at,
+      "data": [{
+        "region": "Beijing",
+        "raw_capacity_bytes": 1000,
+        "raw_used_bytes": 250,
+        "expected_replica_count": 4,
+        "actual_replica_count": 3,
+        "captured_at": captured_at,
+        "health_status": "degraded",
+        "reachable": True,
+        "health_reasons": ["one replica is catching up"],
+      }],
+    }
+
+  monkeypatch.setattr(service, "_load_published", load_published)
+
+  result = await service.get_diagnostic_capacity_aggregate("beijing")
+
+  assert result == {
+    "region": "beijing",
+    "status": "degraded",
+    "reachable": True,
+    "fresh": True,
+    "captured_at": captured_at,
+    "raw_capacity_bytes": 1000,
+    "raw_used_bytes": 250,
+    "expected_replica_count": 4,
+    "actual_replica_count": 3,
+    "health_reasons": ["one replica is catching up"],
+    "source": "etcd_published",
+  }
 
 
 @pytest.mark.asyncio

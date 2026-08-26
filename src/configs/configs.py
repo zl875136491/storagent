@@ -92,14 +92,30 @@ class Settings(BaseSettings):
   CELERY_MONGODB_ROUTING_COLLECTION: str = "celery.routing"
   CELERY_MONGODB_QUEUES_COLLECTION: str = "celery.queues"
   CELERY_MONGODB_RESULT_COLLECTION: str = "celery_taskmeta"
+  # A producer only publishes to the queue belonging to its own Region and
+  # protocol.  A protocol bump intentionally creates a new queue so an old
+  # worker cannot consume an incompatible maintenance task during rollout.
+  CELERY_TASK_QUEUE_PREFIX: str = "storagent"
+  CELERY_TASK_PROTOCOL_VERSION: int = 2
+  CELERY_BEAT_LOCK_COLLECTION: str = "celery_beat_locks"
+  CELERY_BEAT_LOCK_TTL_SECONDS: int = 45
+  CELERY_BEAT_FOLLOWER_POLL_SECONDS: float = 5.0
+  CELERY_OPERATION_START_TIMEOUT_SECONDS: int = 180
+  CELERY_OPERATION_RUNNING_TIMEOUT_SECONDS: int = 7200
+  CELERY_OPERATION_WATCHDOG_INTERVAL_SECONDS: float = 60.0
   # Worker-side observability records are written alongside Celery results.
   # Keeping the database explicit supports deployments whose result backend is
   # separated from the broker database.
   CELERY_MONGODB_RESULT_DATABASE: str = ""
   CELERY_TASK_HISTORY_COLLECTION: str = "celery_task_history"
   CELERY_WORKER_HEARTBEAT_COLLECTION: str = "celery_worker_heartbeats"
+  CELERY_TASK_HISTORY_RETENTION_DAYS: int = 30
+  CELERY_WORKER_HEARTBEAT_RETENTION_DAYS: int = 7
   CELERY_RUNTIME_TIMEOUT_SECONDS: float = 1.5
   CELERY_WORKER_STALE_AFTER_SECONDS: int = 90
+  CELERY_OVERVIEW_CACHE_SECONDS: float = 8.0
+  CELERY_OVERVIEW_RATE_LIMIT_PER_MINUTE: int = 20
+  CELERY_HISTORY_RATE_LIMIT_PER_MINUTE: int = 40
   AUTH_CLEANUP_INTERVAL_SECONDS: int = 3600
 
   # Minio
@@ -151,6 +167,12 @@ class Settings(BaseSettings):
   # Soft-deleted objects remain recoverable until restore_until. Once that
   # deadline is reached they are copied to this internal bucket, then removed
   # from the application bucket by the local archive worker.
+  # The default is deliberately off: enabling a source-version deletion path
+  # requires an explicit post-rollout archive validation in each environment.
+  OBJECT_ARCHIVE_ENABLED: bool = False
+  # Existing archive bucket policy is never changed implicitly. This explicit
+  # bootstrap switch is intended for a freshly provisioned test environment.
+  OBJECT_ARCHIVE_AUTOCONFIGURE: bool = False
   OBJECT_RECOVERY_PERIOD_DAYS: int = 30
   OBJECT_ARCHIVE_BUCKET: str = "storagent-expired-archive"
   # Archive objects are retained independently from the application recovery
@@ -160,11 +182,13 @@ class Settings(BaseSettings):
   OBJECT_ARCHIVE_INTERVAL_SECONDS: float = 300.0
   OBJECT_ARCHIVE_BATCH_SIZE: int = 50
   OBJECT_ARCHIVE_RETRY_SECONDS: float = 300.0
+  OBJECT_ARCHIVE_POLICY_CHECK_SECONDS: int = 300
   APPLICATION_QUOTA_USAGE_CACHE_SECONDS: float = 60.0
   APPLICATION_QUOTA_USAGE_MAX_CONCURRENCY: int = 4
   # The Celery authority periodically seeds/reconciles the Etcd logical quota
   # aggregate for applications created before event-based quota accounting.
   APPLICATION_QUOTA_AGGREGATE_INTERVAL_SECONDS: int = 3600
+  APPLICATION_QUOTA_AGGREGATE_BATCH_SIZE: int = 50
   APPLICATION_QUOTA_RESERVATION_TTL_SECONDS: int = 86400
   APPLICATION_QUOTA_MAX_ACTIVE_RESERVATIONS: int = 1000
   APPLICATION_UPLOAD_MAX_PART_BYTES: int = 64 * 1024 ** 2
@@ -173,6 +197,7 @@ class Settings(BaseSettings):
   # for an unchanged threshold are suppressed for this interval.
   QUOTA_ALERT_COOLDOWN_SECONDS: int = 86400
   CAPACITY_SNAPSHOT_INTERVAL_SECONDS: int = 3600
+  CAPACITY_SNAPSHOT_MAX_CONCURRENCY: int = 3
   # Caller diagnostics must consume persisted aggregates, never trigger a
   # foreground MinIO scan. A stale aggregate is reported as not ready.
   CAPACITY_SNAPSHOT_MAX_AGE_SECONDS: int = 10800
@@ -242,17 +267,48 @@ class Settings(BaseSettings):
     errors: list[str] = []
     if self.OBJECT_RECOVERY_PERIOD_DAYS < 1:
       errors.append("OBJECT_RECOVERY_PERIOD_DAYS 必须大于 0")
-    if not self.OBJECT_ARCHIVE_BUCKET.strip():
-      errors.append("OBJECT_ARCHIVE_BUCKET 不能为空")
-    archive_bucket = self.OBJECT_ARCHIVE_BUCKET.strip()
-    if archive_bucket != archive_bucket.lower():
-      errors.append("OBJECT_ARCHIVE_BUCKET 必须使用小写的 MinIO 存储桶名称")
-    if not _MINIO_BUCKET_RE.fullmatch(archive_bucket) or ".." in archive_bucket:
-      errors.append("OBJECT_ARCHIVE_BUCKET 必须是合法的 MinIO 存储桶名称")
-    if self.OBJECT_ARCHIVE_RETENTION_DAYS < self.OBJECT_RECOVERY_PERIOD_DAYS:
-      errors.append("OBJECT_ARCHIVE_RETENTION_DAYS 不能小于 OBJECT_RECOVERY_PERIOD_DAYS")
+    if self.OBJECT_ARCHIVE_ENABLED:
+      if not self.OBJECT_ARCHIVE_BUCKET.strip():
+        errors.append("OBJECT_ARCHIVE_BUCKET 不能为空")
+      archive_bucket = self.OBJECT_ARCHIVE_BUCKET.strip()
+      if archive_bucket != archive_bucket.lower():
+        errors.append("OBJECT_ARCHIVE_BUCKET 必须使用小写的 MinIO 存储桶名称")
+      if not _MINIO_BUCKET_RE.fullmatch(archive_bucket) or ".." in archive_bucket:
+        errors.append("OBJECT_ARCHIVE_BUCKET 必须是合法的 MinIO 存储桶名称")
+      if self.OBJECT_ARCHIVE_RETENTION_DAYS < self.OBJECT_RECOVERY_PERIOD_DAYS:
+        errors.append("OBJECT_ARCHIVE_RETENTION_DAYS 不能小于 OBJECT_RECOVERY_PERIOD_DAYS")
+      if self.OBJECT_ARCHIVE_BATCH_SIZE < 1 or self.OBJECT_ARCHIVE_BATCH_SIZE > 1000:
+        errors.append("OBJECT_ARCHIVE_BATCH_SIZE 必须在 1 到 1000 之间")
     if self.REGION.strip().lower() in ("", "undefined"):
       errors.append("REGION 未设置（不能为 undefined）")
+    try:
+      from src.core.celery_routing import (
+        normalize_protocol_version,
+        normalize_queue_prefix,
+        normalize_region,
+      )
+
+      normalize_region(self.REGION)
+      normalize_queue_prefix(self.CELERY_TASK_QUEUE_PREFIX)
+      normalize_protocol_version(self.CELERY_TASK_PROTOCOL_VERSION)
+    except ValueError as error:
+      errors.append(f"Celery 区域路由配置无效: {error}")
+    if self.CELERY_BEAT_LOCK_TTL_SECONDS < 15:
+      errors.append("CELERY_BEAT_LOCK_TTL_SECONDS 不能小于 15 秒")
+    if self.CELERY_OPERATION_START_TIMEOUT_SECONDS < 30:
+      errors.append("CELERY_OPERATION_START_TIMEOUT_SECONDS 不能小于 30 秒")
+    if self.CELERY_OPERATION_RUNNING_TIMEOUT_SECONDS < self.CELERY_OPERATION_START_TIMEOUT_SECONDS:
+      errors.append("CELERY_OPERATION_RUNNING_TIMEOUT_SECONDS 不能小于启动超时")
+    if self.CELERY_OPERATION_WATCHDOG_INTERVAL_SECONDS < 15:
+      errors.append("CELERY_OPERATION_WATCHDOG_INTERVAL_SECONDS 不能小于 15 秒")
+    if self.CELERY_TASK_HISTORY_RETENTION_DAYS < 1:
+      errors.append("CELERY_TASK_HISTORY_RETENTION_DAYS 必须大于 0")
+    if self.CELERY_WORKER_HEARTBEAT_RETENTION_DAYS < 1:
+      errors.append("CELERY_WORKER_HEARTBEAT_RETENTION_DAYS 必须大于 0")
+    if self.APPLICATION_QUOTA_AGGREGATE_BATCH_SIZE < 1 or self.APPLICATION_QUOTA_AGGREGATE_BATCH_SIZE > 1000:
+      errors.append("APPLICATION_QUOTA_AGGREGATE_BATCH_SIZE 必须在 1 到 1000 之间")
+    if self.CAPACITY_SNAPSHOT_MAX_CONCURRENCY < 1 or self.CAPACITY_SNAPSHOT_MAX_CONCURRENCY > 20:
+      errors.append("CAPACITY_SNAPSHOT_MAX_CONCURRENCY 必须在 1 到 20 之间")
 
     weak_secrets = {
       "",

@@ -24,8 +24,16 @@ def _catalog_item():
   )
 
 
+def _enable_archive(monkeypatch):
+  archive.clear_archive_policy_cache()
+  monkeypatch.setattr(archive.settings, "OBJECT_ARCHIVE_ENABLED", True)
+  monkeypatch.setattr(archive.settings, "OBJECT_ARCHIVE_AUTOCONFIGURE", True)
+  monkeypatch.setattr(archive.settings, "REGION", "beijing")
+
+
 @pytest.mark.asyncio
 async def test_archive_expired_object_copies_then_removes_source(monkeypatch):
+  _enable_archive(monkeypatch)
   item = _catalog_item()
   # PyMongo returns BSON datetimes without tzinfo by default.
   item.restore_until = item.restore_until.replace(tzinfo=None)
@@ -110,6 +118,7 @@ async def test_archive_expired_object_copies_then_removes_source(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_archive_failure_keeps_source_and_schedules_retry(monkeypatch):
+  _enable_archive(monkeypatch)
   item = _catalog_item()
   saved = []
 
@@ -209,6 +218,7 @@ def test_archive_copy_accepts_minio_rewritten_multipart_etag():
 
 @pytest.mark.asyncio
 async def test_archive_retry_completes_when_source_was_removed_before_catalog_commit(monkeypatch):
+  _enable_archive(monkeypatch)
   item = _catalog_item()
   saved = []
 
@@ -267,6 +277,7 @@ async def test_archive_retry_completes_when_source_was_removed_before_catalog_co
 
 @pytest.mark.asyncio
 async def test_archive_pass_counts_each_outcome(monkeypatch):
+  _enable_archive(monkeypatch)
   rows = [_catalog_item(), _catalog_item()]
   rows[1].object_id = "obj-archive-2"
   outcomes = iter(["archived", "failed"])
@@ -279,7 +290,83 @@ async def test_archive_pass_counts_each_outcome(monkeypatch):
 
   monkeypatch.setattr(archive.crud, "list_expired_objects_for_archive", list_rows)
   monkeypatch.setattr(archive, "archive_expired_object", archive_one)
+  async def consensus():
+    return None
+  monkeypatch.setattr(archive, "_assert_archive_policy_consensus", consensus)
 
   result = await archive.archive_expired_objects_once()
 
   assert result == {"candidates": 2, "archived": 1, "failed": 1, "skipped": 0}
+
+
+@pytest.mark.asyncio
+async def test_archive_disabled_never_claims_candidate(monkeypatch):
+  item = _catalog_item()
+
+  async def must_not_claim(*_args, **_kwargs):
+    raise AssertionError("disabled archive must not lease a source object")
+
+  monkeypatch.setattr(archive.settings, "OBJECT_ARCHIVE_ENABLED", False)
+  monkeypatch.setattr(archive.crud, "claim_expired_object_for_archive", must_not_claim)
+
+  assert await archive.archive_expired_object(item) == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_archive_skips_foreign_region_before_claim(monkeypatch):
+  _enable_archive(monkeypatch)
+  item = _catalog_item()
+  item.source_region = "shanghai"
+
+  async def must_not_claim(*_args, **_kwargs):
+    raise AssertionError("foreign Region must not lease an archive candidate")
+
+  monkeypatch.setattr(archive.crud, "claim_expired_object_for_archive", must_not_claim)
+
+  assert await archive.archive_expired_object(item) == "skipped"
+
+
+def test_archive_autoconfigure_handles_minio_missing_lifecycle_response(monkeypatch):
+  _enable_archive(monkeypatch)
+  configured = []
+
+  class Client:
+    def bucket_exists(self, _bucket):
+      return True
+
+    def get_bucket_versioning(self, _bucket):
+      return SimpleNamespace(status="Enabled")
+
+    def set_bucket_versioning(self, _bucket, _config):
+      raise AssertionError("an enabled bucket must not have versioning rewritten")
+
+    def get_bucket_lifecycle(self, _bucket):
+      error = RuntimeError("The lifecycle configuration does not exist")
+      error.code = "NoSuchLifecycleConfiguration"
+      raise error
+
+    def set_bucket_lifecycle(self, bucket, lifecycle):
+      configured.append((bucket, lifecycle))
+
+  archive._ensure_archive_bucket_policy(Client(), "storagent-expired-archive")
+
+  assert len(configured) == 1
+  rule = configured[0][1].rules[0]
+  assert rule.rule_id == archive.ARCHIVE_LIFECYCLE_RULE_ID
+  assert rule.status == "Enabled"
+
+
+@pytest.mark.asyncio
+async def test_non_authority_archive_requires_matching_published_policy(monkeypatch):
+  _enable_archive(monkeypatch)
+  monkeypatch.setattr(archive.settings, "REGION", "tianjin")
+  monkeypatch.setattr(archive.settings, "SYNC_AUTHORITY_REGION", "beijing")
+
+  async def pull(_key):
+    return {"fingerprint": "different"}
+
+  from src.core import etcd_op
+  monkeypatch.setattr(etcd_op, "pull_from_etcd_by_key", pull)
+
+  with pytest.raises(RuntimeError, match="配置不一致"):
+    await archive._assert_archive_policy_consensus()

@@ -54,5 +54,6 @@ class ObjectCatalog(Document):
       IndexModel([("app_name", 1), ("object_key", 1)], unique=True),
       IndexModel([("app_name", 1), ("state", 1), ("object_key", 1), ("object_id", 1)]),
       IndexModel([("state", 1), ("archive_after", 1)]),
+      IndexModel([("source_region", 1), ("state", 1), ("archive_after", 1)]),
       IndexModel([("state", 1), ("purge_after", 1)]),
     ]

@@ -98,10 +98,29 @@
 
 ## 5. 发布与回滚
 
-1. 镜像构建前跑 `pytest`（Jenkins Test 阶段）。
-2. 滚动时先等新实例 `/ready`，再摘旧实例。
-3. 优雅关闭默认约 30s（`GRACEFUL_SHUTDOWN_TIMEOUT`）。
-4. 回滚：部署上一镜像标签；确认 `.env` 未引入不兼容的密钥/REGION。
+### 5.1 通用发布
+
+1. 在测试环境完成单元、接口和真实依赖验证；本地 commit 不等于已完成环境验证。
+2. 先以只读方式核对每个节点的 `REGION`、`SYNC_AUTHORITY_REGION`、Etcd、MinIO、Mongo 和 CORS/secret 配置。
+3. 新 API 实例必须先通过 `/ready` 再接入流量；优雅关闭默认约 30 秒（`GRACEFUL_SHUTDOWN_TIMEOUT`）。
+4. 不在同一发布中修改 `OBJECT_RECOVERY_PERIOD_DAYS`。该值直接影响 v2 删除对象的 `restore_until`。
+
+### 5.2 Celery 协议发布
+
+Celery 的 Region queue 和 task protocol 是 Backend、Worker、Frontend 的共同兼容面。详细任务清单、状态机和参数见 [`CELERY_OPERATIONS.md`](CELERY_OPERATIONS.md)。
+
+1. 使旧 API producer 静默或摘流，排空旧共享 `celery` 队列中的手工任务。
+2. 停止旧 Worker/Beat 后部署新 Worker；验证每个 Region 的 `storagent.<region>.v<protocol>` 队列、11 个已注册任务、Worker 心跳和每 Region 单 Beat 租约。
+3. 部署 Backend，验证 `/ready`、v1/v2 存储运维兼容接口、诊断和一条可回收的手工任务。
+4. 最后部署 Frontend。旧前端在过渡期仍依赖的 `orphan-buckets` 旧响应模型和复制运维 HTTP 200 受理语义必须保留。
+5. 回滚前先停止新 producer，并排空或人工标记新协议队列中的手工任务；不能仅回滚 Worker 或 Backend。
+
+### 5.3 归档首次开启
+
+1. 首发保持 `OBJECT_ARCHIVE_ENABLED=false`。
+2. 每个 Region 用可回收的真实版本化对象完成复制、校验、恢复和源版本删除演练。
+3. 核对归档桶版本控制、`storagent-expired-archive-retention` 生命周期规则、当前/非当前版本保留期，以及权威 Region 发布的策略 fingerprint。
+4. 先用很小的 `OBJECT_ARCHIVE_BATCH_SIZE` 灰度。生产环境不得设置 `OBJECT_ARCHIVE_AUTOCONFIGURE=true`。
 
 ## 6. 限流与审计
 
@@ -110,8 +129,9 @@
 
 ## 6.1 Celery 背景任务
 
-- Celery worker、默认队列、任务生命周期记录与跨 Region 分发风险见 [`CELERY_OPERATIONS.md`](CELERY_OPERATIONS.md)。
-- 当前实现没有 Region task routing；部署时必须确认 MongoDB broker 是否按 Region 隔离。若多个 Region 共享 broker，不能假定手工运维任务会由创建它的 Region 执行。
+- Celery worker、Region queue、任务生命周期记录和跨 Region 保护见 [`CELERY_OPERATIONS.md`](CELERY_OPERATIONS.md)。
+- 当前实现按 `storagent.<region>.v<protocol>` 路由。Worker 只消费本区协议队列，并拒绝没有有效 Region/protocol header 的任务。
+- 同 Region 多 Worker 可同时运行，但只有持有 Mongo Beat lease 的一个实例会投递周期任务。Celery 运维页面可核对 expected queue、Worker 队列、任务来源 Region 和 Beat 租约。
 
 ## 7. 联系与升级
 

@@ -230,6 +230,36 @@ UnmanagedBucketKind = Literal[
   "system",
   "needs_review",
 ]
+
+
+# The legacy /operations/orphan-buckets route is intentionally retained for
+# older console bundles. New clients must use the unmanaged-buckets contracts
+# below; these models freeze the previous response vocabulary.
+OrphanBucketKind = Literal["orphan", "disabled_application", "system"]
+
+
+class OrphanBucketItem(BaseModel):
+  name: str
+  kind: OrphanBucketKind
+  app_name: str = ""
+  app_shown_name: str = ""
+  servers: list[str] = Field(default_factory=list)
+  missing_servers: list[str] = Field(default_factory=list)
+
+
+class OrphanBucketOperationsSummary(BaseModel):
+  orphan_count: int = 0
+  disabled_application_count: int = 0
+  system_bucket_count: int = 0
+  unavailable_server_count: int = 0
+
+
+class OrphanBucketOperationsResponse(BaseModel):
+  generated_at: datetime
+  servers: list[str] = Field(default_factory=list)
+  summary: OrphanBucketOperationsSummary
+  buckets: list[OrphanBucketItem] = Field(default_factory=list)
+  errors: dict[str, str] = Field(default_factory=dict)
 UnmanagedBucketDisposition = Literal[
   "unreviewed",
   "retained",
@@ -289,14 +319,6 @@ class UnmanagedBucketActionResponse(BaseModel):
   operation_id: str | None = None
   operation_status: Literal["queued", "running", "succeeded", "failed"] | None = None
   operation: dict[str, Any] | None = None
-
-
-# The old endpoint remains temporarily available for prior console builds.
-OrphanBucketKind = UnmanagedBucketKind
-OrphanBucketItem = UnmanagedBucketItem
-OrphanBucketOperationsSummary = UnmanagedBucketOperationsSummary
-OrphanBucketOperationsResponse = UnmanagedBucketOperationsResponse
-
 
 class ReplicationOperationResponse(BaseModel):
   message: str
@@ -396,6 +418,10 @@ class StorageOperationItem(BaseModel):
   actor: str
   message: str
   result: dict[str, Any] = Field(default_factory=dict)
+  origin_region: str = ""
+  celery_task_id: str = ""
+  dispatch_attempts: int = 0
+  dispatched_at: datetime | None = None
   created_at: datetime
   started_at: datetime | None = None
   finished_at: datetime | None = None

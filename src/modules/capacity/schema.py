@@ -31,6 +31,13 @@ class RegionCapacityItem(BaseModel):
   estimated_days_to_95: int | None = None
   risks: list[str] = Field(default_factory=list)
   trend: list[CapacityTrendPoint] = Field(default_factory=list)
+  # These fields are used by caller diagnostics on non-authority Regions. They
+  # are additive for the planning page and keep the authoritative sample's
+  # confidence separate from capacity admission.
+  captured_at: datetime | None = None
+  health_status: str = "unknown"
+  reachable: bool = False
+  health_reasons: list[str] = Field(default_factory=list)
 
 
 class CapacityPlanningResponse(BaseModel):

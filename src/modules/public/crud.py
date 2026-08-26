@@ -212,6 +212,21 @@ async def read_application_list() -> List[Application]:
   """
   return await Application.find_all(fetch_links=True).to_list()
 
+
+async def count_enabled_applications() -> int:
+  """Count enabled applications without loading author links for a refresh run."""
+  return await Application.find(Application.enabled == True).count()  # noqa: E712
+
+
+async def read_quota_refresh_candidates(limit: int) -> List[Application]:
+  """Return the least-recently-attempted enabled applications in one batch."""
+  return await Application.find(
+    Application.enabled == True,  # noqa: E712
+  ).sort(
+    "+quota_usage_attempted_at",
+    "+name",
+  ).limit(max(int(limit), 1)).to_list()
+
 async def read_application_by_id(application_id: str | ObjectId) -> Application | None:
   """
   获取应用

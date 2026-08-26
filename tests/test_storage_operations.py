@@ -995,8 +995,8 @@ async def test_unmanaged_bucket_delete_requires_confirmation_and_queues_task(mon
     }
     return operation
 
-  def enqueue(operation_id, factory):
-    queued.append(operation_id)
+  async def enqueue(operation, factory):
+    queued.append(operation.id)
     coro = factory()
     coro.close()
 
@@ -1135,9 +1135,123 @@ def test_replication_task_acceptance_contract_is_explicit():
     item for item in route.router.routes
     if item.path == "/operations/replication/{bucket_name}/resync"
   )
-  assert reconcile_route.status_code == 202
-  assert resync_route.status_code == 202
+  assert reconcile_route.status_code == 200
+  assert resync_route.status_code == 200
   assert response["accepted"] is True
   assert response["operation_id"] == "operation-1"
   assert response["operation_status"] == "queued"
   schema.ReplicationOperationResponse.model_validate(response)
+
+
+@pytest.mark.asyncio
+async def test_storage_worker_claim_is_atomic_before_external_action(monkeypatch):
+  operation = SimpleNamespace(
+    id="operation-claim-1",
+    kind="replication_reconcile",
+    status="queued",
+    origin_region="beijing",
+    result={},
+  )
+  calls = {}
+
+  class Collection:
+    async def find_one_and_update(self, query, update, *, return_document):
+      calls["query"] = query
+      calls["update"] = update
+      return {"claimed": True}
+
+  async def read_operation(operation_id):
+    assert operation_id == "operation-claim-1"
+    return operation
+
+  async def run_reconcile(current):
+    calls["executed"] = current
+    current.status = "succeeded"
+
+  monkeypatch.setattr(operations.settings, "REGION", "beijing")
+  monkeypatch.setattr(operations.StorageOperation, "get", read_operation)
+  monkeypatch.setattr(operations.StorageOperation, "get_motor_collection", lambda: Collection())
+  monkeypatch.setattr(operations.StorageOperation, "model_validate", lambda _raw: operation)
+  monkeypatch.setattr(operations, "_run_replication_reconcile_operation", run_reconcile)
+
+  result = await operations.execute_storage_operation(
+    "operation-claim-1",
+    origin_region="beijing",
+  )
+
+  assert calls["query"] == {
+    "_id": "operation-claim-1",
+    "status": "queued",
+    "origin_region": {"$in": ["", "beijing"]},
+  }
+  assert calls["update"]["$set"]["status"] == "running"
+  assert calls["executed"] is operation
+  assert result == {"status": "succeeded", "operation_id": "operation-claim-1"}
+
+
+@pytest.mark.asyncio
+async def test_storage_worker_does_not_execute_when_watchdog_already_failed_task(monkeypatch):
+  operation = SimpleNamespace(
+    id="operation-stale-1",
+    kind="replication_reconcile",
+    status="failed",
+    origin_region="beijing",
+    result={"recovery_required": True},
+  )
+
+  class Collection:
+    async def find_one_and_update(self, *_args, **_kwargs):
+      return None
+
+  async def read_operation(_operation_id):
+    return operation
+
+  async def must_not_execute(_operation):
+    raise AssertionError("watchdog-failed operation must not execute")
+
+  monkeypatch.setattr(operations.settings, "REGION", "beijing")
+  monkeypatch.setattr(operations.StorageOperation, "get", read_operation)
+  monkeypatch.setattr(operations.StorageOperation, "get_motor_collection", lambda: Collection())
+  monkeypatch.setattr(operations, "_run_replication_reconcile_operation", must_not_execute)
+
+  result = await operations.execute_storage_operation(
+    "operation-stale-1",
+    origin_region="beijing",
+  )
+
+  assert result == {"status": "skipped", "reason": "terminal_operation"}
+
+
+@pytest.mark.asyncio
+async def test_legacy_orphan_route_keeps_orphan_vocabulary(monkeypatch):
+  async def unmanaged_overview():
+    return {
+      "generated_at": utc_now(),
+      "servers": ["beijing", "tianjin"],
+      "summary": {"unavailable_server_count": 1},
+      "buckets": [{
+        "name": "legacy-bucket",
+        "kind": "unmanaged",
+        "app_name": "",
+        "app_shown_name": "",
+        "servers": ["beijing"],
+        "missing_servers": [],
+        "unreachable_servers": ["tianjin"],
+      }],
+      "errors": {"tianjin": "unreachable"},
+    }
+
+  monkeypatch.setattr(operations, "get_unmanaged_bucket_overview", unmanaged_overview)
+
+  result = await operations.get_orphan_bucket_overview()
+
+  assert result["summary"]["orphan_count"] == 1
+  assert result["buckets"] == [{
+    "name": "legacy-bucket",
+    "kind": "orphan",
+    "app_name": "",
+    "app_shown_name": "",
+    "servers": ["beijing"],
+    "missing_servers": ["tianjin"],
+  }]
+  schema.OrphanBucketOperationsResponse.model_validate(result)

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -13,6 +15,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 from src.configs.configs import settings
 from src.core.celery_client import broker_url, celery_app, result_backend
+from src.core.celery_routing import task_queue_name
 from src.modules.celery import schema
 from src.utils.helpers import utc_now
 from src.utils.logger import logger
@@ -96,6 +99,27 @@ TASK_CATALOG = (
     "execution_scope": "产生事件的本区 Mongo",
     "description": "异步写入本区审计事件；Celery 不可用时调用方会回退为同步落库。",
   },
+  {
+    "name": "storagent.maintenance.recover_queued_tasks",
+    "display_name": "运维任务状态看门狗",
+    "trigger": "周期调度",
+    "schedule_setting": "CELERY_OPERATION_WATCHDOG_INTERVAL_SECONDS",
+    "execution_scope": "本区持久化运维任务",
+    "description": "将长期未启动或运行超时的存储、Etcd 运维任务标记为需要人工复核。",
+  },
+)
+
+_overview_cache_lock = asyncio.Lock()
+_overview_cache_value: schema.CeleryOverviewResponse | None = None
+_overview_cache_at = 0.0
+
+_SENSITIVE_VALUE_RE = re.compile(
+  r"(?i)(api[_-]?key|access[_-]?key|secret|token|password|authorization)"
+  r"([=:]\s*)([^\s,;&]+)",
+)
+_CREDENTIAL_URL_RE = re.compile(r"(?i)((?:mongodb(?:\+srv)?|https?)://)[^/@\s]+@")
+_QUERY_SECRET_RE = re.compile(
+  r"(?i)([?&](?:api[_-]?key|access[_-]?key|secret|token|password)=)[^&#\s]+",
 )
 
 
@@ -133,11 +157,32 @@ def _as_int(value: Any, default: int = 0) -> int:
     return default
 
 
-def _summary(value: Any, limit: int = 500) -> str:
+def _expected_queue() -> str:
+  try:
+    return task_queue_name(
+      settings.REGION,
+      queue_prefix=settings.CELERY_TASK_QUEUE_PREFIX,
+      protocol_version=settings.CELERY_TASK_PROTOCOL_VERSION,
+    )
+  except ValueError:
+    return ""
+
+
+def _redact(value: Any, limit: int = 600) -> str:
   if value is None:
     return ""
   if isinstance(value, bytes):
     value = value.decode("utf-8", errors="replace")
+  text = " ".join(str(value).split())
+  text = _CREDENTIAL_URL_RE.sub(r"\1***@", text)
+  text = _QUERY_SECRET_RE.sub(r"\1***", text)
+  text = _SENSITIVE_VALUE_RE.sub(r"\1\2***", text)
+  return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _summary(value: Any, limit: int = 500) -> str:
+  if value is None:
+    return ""
   if isinstance(value, (dict, list, tuple)):
     try:
       text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
@@ -145,8 +190,7 @@ def _summary(value: Any, limit: int = 500) -> str:
       text = str(value)
   else:
     text = str(value)
-  text = " ".join(text.split())
-  return text[:limit] + ("..." if len(text) > limit else "")
+  return _redact(text, limit=limit)
 
 
 def _error_summary(value: Any) -> str:
@@ -155,6 +199,13 @@ def _error_summary(value: Any) -> str:
     return ""
   lines = [line.strip() for line in text.splitlines() if line.strip()]
   return lines[-1] if lines else text
+
+
+def clear_overview_cache() -> None:
+  """Clear the short runtime-inspection cache for tests and diagnostics."""
+  global _overview_cache_value, _overview_cache_at
+  _overview_cache_value = None
+  _overview_cache_at = 0.0
 
 
 def task_catalog() -> list[schema.CeleryTaskCatalogItem]:
@@ -226,12 +277,15 @@ def _task_from_runtime(
   if not task_id and not name:
     return None
   delivery = request.get("delivery_info") if isinstance(request.get("delivery_info"), dict) else {}
+  headers = request.get("headers") if isinstance(request.get("headers"), dict) else {}
   return schema.CeleryTaskExecution(
     id=task_id or "-",
     name=name or "未知任务",
     status=status,
     worker=worker,
     queue=str(delivery.get("routing_key") or "celery"),
+    origin_region=str(headers.get("storagent-origin-region") or ""),
+    task_protocol=str(headers.get("storagent-task-protocol") or ""),
     retries=_as_int(request.get("retries")),
     received_at=_as_datetime(request.get("time_start")),
     started_at=_as_datetime(request.get("time_start")),
@@ -288,14 +342,22 @@ async def _load_persistence() -> dict[str, Any]:
         "last_seen": 1,
         "started_at": 1,
         "concurrency": 1,
+        "queue": 1,
+        "task_protocol": 1,
+        "beat_enabled": 1,
       },
     ).to_list(length=500)
+    beat_lock_rows = await broker_db[settings.CELERY_BEAT_LOCK_COLLECTION].find(
+      {},
+      {"_id": 0, "key": 1, "owner": 1, "expires_at": 1, "updated_at": 1},
+    ).to_list(length=100)
     return {
       "broker_database": broker_db_name,
       "pending_rows": pending_rows,
       "routing_rows": routing_rows,
       "queue_rows": queue_rows,
       "heartbeat_rows": heartbeat_rows,
+      "beat_lock_rows": beat_lock_rows,
     }
   finally:
     broker_client.close()
@@ -307,7 +369,7 @@ def _queue_statuses(
   pending_rows: list[dict[str, Any]],
   routing_rows: list[dict[str, Any]],
   queue_rows: list[dict[str, Any]],
-  worker_count: int,
+  workers: list[schema.CeleryWorkerStatus],
 ) -> list[schema.CeleryQueueStatus]:
   pending = {str(row.get("_id") or "celery"): _as_int(row.get("count")) for row in pending_rows}
   routing: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -315,7 +377,9 @@ def _queue_statuses(
     queue = str(row.get("queue") or "")
     if queue and not queue.endswith(".pidbox"):
       routing[queue].append(row)
-  known = {"celery", *pending.keys(), *routing.keys()}
+  known = {*pending.keys(), *routing.keys()}
+  if _expected_queue():
+    known.add(_expected_queue())
   known.update(str(row.get("_id") or "") for row in queue_rows if str(row.get("_id") or "") and not str(row.get("_id")).endswith(".pidbox"))
   rows = []
   for name in sorted(known):
@@ -327,9 +391,85 @@ def _queue_statuses(
       pending_count=pending.get(name, 0),
       exchange=str(routes[0].get("exchange") or "celery") if routes else "celery",
       routing_keys=sorted({str(item.get("routing_key") or name) for item in routes}) or [name],
-      worker_count=worker_count,
+      worker_count=sum(
+        1
+        for worker in workers
+        if worker.status == "online" and worker.queue == name
+      ),
     ))
   return rows
+
+
+def _compatible_heartbeat_rows(
+  rows: list[dict[str, Any]],
+  *,
+  online_workers: set[str] | None = None,
+) -> list[dict[str, Any]]:
+  """Keep only routable heartbeats and collapse replaced Worker instances.
+
+  Heartbeats from the legacy shared queue predate the Region/protocol contract
+  and cannot be attributed safely.  A normal container restart also changes
+  the Worker hostname, leaving a stale record behind until its TTL expires.
+  If a fresh compatible heartbeat exists for the same Region queue, it is the
+  authoritative instance; otherwise retain the most recent record so a real
+  outage remains visible to operators.
+  """
+  now = utc_now()
+  stale_after = max(_as_int(settings.CELERY_WORKER_STALE_AFTER_SECONDS), 1)
+  grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+  for original in rows:
+    worker = str(original.get("worker") or "").strip()
+    region = str(original.get("region") or "").strip().lower()
+    queue = str(original.get("queue") or "").strip()
+    protocol = str(original.get("task_protocol") or "").strip()
+    if not worker or not region or not queue or not protocol:
+      continue
+    try:
+      expected_queue = task_queue_name(
+        region,
+        queue_prefix=settings.CELERY_TASK_QUEUE_PREFIX,
+        protocol_version=protocol,
+      )
+    except ValueError:
+      continue
+    if queue != expected_queue:
+      continue
+    grouped[(region, queue, protocol)].append({
+      **original,
+      "worker": worker,
+      "region": region,
+      "queue": queue,
+      "task_protocol": protocol,
+    })
+
+  filtered: list[dict[str, Any]] = []
+  for key in sorted(grouped):
+    group = grouped[key]
+
+    # A successful control inspect is stronger evidence than a heartbeat. It
+    # identifies the exact current process after a fast container restart,
+    # while the prior process can still look fresh for one heartbeat interval.
+    inspected = [
+      row for row in group
+      if str(row.get("worker") or "") in (online_workers or set())
+    ]
+    if inspected:
+      filtered.extend(inspected)
+      continue
+
+    def last_seen(row: dict[str, Any]) -> datetime:
+      return _as_datetime(row.get("last_seen")) or datetime.min.replace(tzinfo=timezone.utc)
+
+    current = [
+      row for row in group
+      if str(row.get("status") or "").lower() != "offline"
+      and (now - last_seen(row)).total_seconds() <= stale_after
+    ]
+    if current:
+      filtered.extend(current)
+    else:
+      filtered.append(max(group, key=last_seen))
+  return sorted(filtered, key=lambda row: str(row.get("worker") or ""))
 
 
 def _worker_statuses(
@@ -342,9 +482,13 @@ def _worker_statuses(
   reserved = runtime.get("reserved") or {}
   scheduled = runtime.get("scheduled") or {}
   registered = runtime.get("registered") or {}
+  online_runtime_workers = {str(name) for name in set(ping) | set(stats)}
   heartbeat_by_worker = {
     str(row.get("worker") or ""): row
-    for row in heartbeat_rows
+    for row in _compatible_heartbeat_rows(
+      heartbeat_rows,
+      online_workers=online_runtime_workers,
+    )
     if str(row.get("worker") or "")
   }
   names = set(ping) | set(stats) | set(active) | set(reserved) | set(scheduled) | set(registered) | set(heartbeat_by_worker)
@@ -386,6 +530,9 @@ def _worker_statuses(
       processed_count=sum(_as_int(value) for value in total.values()),
       concurrency=_as_int(pool.get("max-concurrency")) or _as_int(heartbeat.get("concurrency")) or None,
       registered_task_count=len(registered.get(name) or []),
+      queue=str(heartbeat.get("queue") or ""),
+      task_protocol=str(heartbeat.get("task_protocol") or ""),
+      beat_enabled=bool(heartbeat.get("beat_enabled", False)),
       source=source,
     ))
     for item in active.get(name) or []:
@@ -403,13 +550,39 @@ def _worker_statuses(
   return workers, active_tasks, reserved_tasks, scheduled_tasks
 
 
-async def get_overview() -> schema.CeleryOverviewResponse:
+def _beat_leaders(rows: list[dict[str, Any]]) -> list[schema.CeleryBeatLeader]:
+  now = utc_now()
+  result = []
+  for row in rows:
+    key = str(row.get("key") or "")
+    if not key.startswith("storagent-beat:"):
+      continue
+    expires_at = _as_datetime(row.get("expires_at"))
+    result.append(schema.CeleryBeatLeader(
+      key=key,
+      owner=str(row.get("owner") or ""),
+      expires_at=expires_at,
+      updated_at=_as_datetime(row.get("updated_at")),
+      active=bool(expires_at and expires_at > now),
+    ))
+  return sorted(result, key=lambda item: item.key)
+
+
+async def _build_overview() -> schema.CeleryOverviewResponse:
   generated_at = utc_now()
   catalog = task_catalog()
+  expected_queue = _expected_queue()
   if not settings.CELERY_ENABLED:
     return schema.CeleryOverviewResponse(
       generated_at=generated_at,
-      broker=schema.CeleryBrokerStatus(enabled=False, reachable=False, message="当前节点未启用 Celery"),
+      broker=schema.CeleryBrokerStatus(
+        enabled=False,
+        reachable=False,
+        message="当前节点未启用 Celery",
+        region=settings.REGION,
+        expected_queue=expected_queue,
+        task_protocol=str(settings.CELERY_TASK_PROTOCOL_VERSION),
+      ),
       task_catalog=catalog,
       inspection_message="当前节点未启用 Celery，未执行运行时探测。",
     )
@@ -430,7 +603,7 @@ async def get_overview() -> schema.CeleryOverviewResponse:
     list(persistence.get("pending_rows") or []),
     list(persistence.get("routing_rows") or []),
     list(persistence.get("queue_rows") or []),
-    sum(1 for worker in workers if worker.status == "online"),
+    workers,
   )
   messages = [item for item in (persistence_error, *inspect_errors) if item]
   return schema.CeleryOverviewResponse(
@@ -440,6 +613,9 @@ async def get_overview() -> schema.CeleryOverviewResponse:
       reachable=not bool(persistence_error),
       database=str(persistence.get("broker_database") or ""),
       message=persistence_error,
+      region=settings.REGION,
+      expected_queue=expected_queue,
+      task_protocol=str(settings.CELERY_TASK_PROTOCOL_VERSION),
     ),
     workers=workers,
     queues=queues,
@@ -447,11 +623,33 @@ async def get_overview() -> schema.CeleryOverviewResponse:
     reserved_tasks=reserved_tasks,
     scheduled_tasks=scheduled_tasks,
     task_catalog=catalog,
+    beat_leaders=_beat_leaders(list(persistence.get("beat_lock_rows") or [])),
     inspection_message="；".join(messages),
   )
 
 
+async def get_overview() -> schema.CeleryOverviewResponse:
+  """Return a short-lived shared runtime snapshot for the operations page."""
+  global _overview_cache_value, _overview_cache_at
+  if not settings.CELERY_ENABLED:
+    return await _build_overview()
+  ttl = max(float(settings.CELERY_OVERVIEW_CACHE_SECONDS), 0.0)
+  now = time.monotonic()
+  if _overview_cache_value is not None and now - _overview_cache_at < ttl:
+    return _overview_cache_value
+  async with _overview_cache_lock:
+    now = time.monotonic()
+    if _overview_cache_value is not None and now - _overview_cache_at < ttl:
+      return _overview_cache_value
+    overview = await _build_overview()
+    _overview_cache_value = overview
+    _overview_cache_at = now
+    return overview
+
+
 def _history_item(row: dict[str, Any]) -> schema.CeleryTaskExecution:
+  has_safe_summary = int(row.get("result_summary_version") or 0) >= 2
+  has_safe_error = int(row.get("error_summary_version") or 0) >= 2
   return schema.CeleryTaskExecution(
     id=str(row.get("task_id") or row.get("_id") or "-"),
     name=str(row.get("task_name") or "未记录任务名"),
@@ -459,13 +657,27 @@ def _history_item(row: dict[str, Any]) -> schema.CeleryTaskExecution:
     worker=str(row.get("worker") or ""),
     region=str(row.get("region") or ""),
     queue=str(row.get("queue") or "celery"),
+    origin_region=str(row.get("origin_region") or ""),
+    task_protocol=str(row.get("task_protocol") or ""),
     retries=_as_int(row.get("retries")),
     received_at=_as_datetime(row.get("received_at")),
     started_at=_as_datetime(row.get("started_at")),
     finished_at=_as_datetime(row.get("finished_at") or row.get("date_done")),
     duration_ms=_as_int(row.get("duration_ms")) or None,
-    result_summary=_summary(row.get("result_summary") if "result_summary" in row else row.get("result")),
-    error=_error_summary(row.get("error") if "error" in row else row.get("traceback")),
+    result_summary=(
+      _summary(row.get("result_summary"))
+      if has_safe_summary else (
+        "历史记录未暴露任务返回内容"
+        if row.get("result") is not None or row.get("result_summary") is not None else ""
+      )
+    ),
+    error=(
+      _error_summary(row.get("error"))
+      if has_safe_error else (
+        "历史记录已隐藏未脱敏的失败详情"
+        if row.get("error") is not None or row.get("traceback") is not None else ""
+      )
+    ),
     source=str(row.get("source") or "history"),
   )
 
@@ -494,7 +706,9 @@ async def get_history(limit: int = 50) -> schema.CeleryHistoryResponse:
         "task_id": 1, "task_name": 1, "status": 1, "worker": 1,
         "region": 1, "queue": 1, "retries": 1, "received_at": 1,
         "started_at": 1, "finished_at": 1, "duration_ms": 1,
-        "result_summary": 1, "error": 1,
+        "result_summary": 1, "result_summary_version": 1,
+        "error": 1, "error_summary_version": 1,
+        "origin_region": 1, "task_protocol": 1,
       },
     ).sort("updated_at", -1).limit(limit).to_list(length=limit)
     rows = [_history_item({**row, "source": "history"}) for row in history_rows]

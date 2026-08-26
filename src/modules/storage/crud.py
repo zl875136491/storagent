@@ -272,6 +272,7 @@ async def create_storage_operation(
     bucket=bucket,
     target=target,
     actor=actor,
+    origin_region=str(settings.REGION).strip().lower(),
   )
   await operation.insert()
   return operation

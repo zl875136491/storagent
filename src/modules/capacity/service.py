@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 from src.configs.configs import settings
 from src.modules.capacity import schema
@@ -19,7 +20,7 @@ def _day(value) -> str:
 
 
 def _is_authority() -> bool:
-  return settings.REGION == settings.SYNC_AUTHORITY_REGION
+  return str(settings.REGION).strip().lower() == str(settings.SYNC_AUTHORITY_REGION).strip().lower()
 
 
 def _planning_payload(planning: dict) -> dict:
@@ -55,8 +56,12 @@ async def collect_snapshot() -> None:
   if not _is_authority():
     return
   overview, replication = await asyncio.gather(
-    operations.get_cluster_health_overview(),
-    operations.get_replication_overview(),
+    operations.get_cluster_health_overview(
+      max_concurrency=settings.CAPACITY_SNAPSHOT_MAX_CONCURRENCY,
+    ),
+    operations.get_replication_overview(
+      max_concurrency=settings.CAPACITY_SNAPSHOT_MAX_CONCURRENCY,
+    ),
   )
   replication_by_server = {
     item.get("server"): item
@@ -166,6 +171,10 @@ async def _compute_planning() -> dict:
       "waterline_percent": round(waterline, 2), "daily_growth_bytes": growth,
       "estimated_days_to_70": days70, "estimated_days_to_85": days85, "estimated_days_to_95": days95,
       "risks": risks,
+      "captured_at": latest.captured_at,
+      "health_status": latest.health_status,
+      "reachable": latest.reachable,
+      "health_reasons": latest.health_reasons,
       "trend": [{"captured_at": item.captured_at, "raw_capacity_bytes": item.raw_capacity_bytes, "raw_used_bytes": item.raw_used_bytes, "logical_usage_bytes": item.logical_usage_bytes, "object_count": item.object_count, "archive_bytes": item.archive_bytes} for item in samples],
     })
   return {"generated_at": utc_now(), "data": data}
@@ -186,8 +195,98 @@ async def get_planning() -> dict:
   return {"generated_at": utc_now(), "data": []}
 
 
+def _normalize_captured_at(value) -> object:
+  if value is None:
+    return None
+  if isinstance(value, str):
+    try:
+      value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+      return None
+  if getattr(value, "tzinfo", None) is None:
+    return value.replace(tzinfo=utc_now().tzinfo)
+  return value.astimezone(timezone.utc)
+
+
+def _diagnostic_from_values(
+  *,
+  region: str,
+  status: str,
+  reachable: bool,
+  captured_at,
+  raw_capacity_bytes: int,
+  raw_used_bytes: int,
+  expected_replica_count: int,
+  actual_replica_count: int,
+  health_reasons: list[str],
+  source: str,
+) -> dict:
+  captured_at = _normalize_captured_at(captured_at)
+  fresh = bool(captured_at) and (utc_now() - captured_at).total_seconds() <= max(
+    float(settings.CAPACITY_SNAPSHOT_MAX_AGE_SECONDS),
+    0.0,
+  )
+  return {
+    "region": region,
+    "status": str(status or "unknown"),
+    "reachable": bool(reachable),
+    "fresh": fresh,
+    "captured_at": captured_at,
+    "raw_capacity_bytes": max(int(raw_capacity_bytes or 0), 0),
+    "raw_used_bytes": max(int(raw_used_bytes or 0), 0),
+    "expected_replica_count": max(int(expected_replica_count or 0), 0),
+    "actual_replica_count": max(int(actual_replica_count or 0), 0),
+    "health_reasons": [str(item) for item in health_reasons],
+    "source": source,
+  }
+
+
+async def _published_diagnostic_capacity(region: str) -> dict | None:
+  published = await _load_published()
+  if not published:
+    return None
+  normalized_region = str(region).strip().lower()
+  for row in published.get("data") or []:
+    if (
+      not isinstance(row, dict)
+      or str(row.get("region") or "").strip().lower() != normalized_region
+    ):
+      continue
+    captured_at = row.get("captured_at")
+    # Older Etcd payloads did not include the per-region capture time. The
+    # newest trend sample is the most precise compatible fallback.
+    if captured_at is None:
+      trend = row.get("trend") or []
+      if trend and isinstance(trend[-1], dict):
+        captured_at = trend[-1].get("captured_at")
+    return _diagnostic_from_values(
+      region=region,
+      status=str(row.get("health_status") or "unknown"),
+      reachable=bool(row.get("reachable")),
+      captured_at=captured_at,
+      raw_capacity_bytes=int(row.get("raw_capacity_bytes") or 0),
+      raw_used_bytes=int(row.get("raw_used_bytes") or 0),
+      expected_replica_count=int(row.get("expected_replica_count") or 0),
+      actual_replica_count=int(row.get("actual_replica_count") or 0),
+      health_reasons=list(row.get("health_reasons") or []),
+      source="etcd_published",
+    )
+  return None
+
+
 async def get_diagnostic_capacity_aggregate(region: str) -> dict:
-  """Read the current-region capacity snapshot for caller diagnostics only."""
+  """Read a current-region capacity sample without querying MinIO.
+
+  The authority publishes its sample to Etcd. Every Region reads that shared
+  payload first; a local MongoDB document is a compatibility fallback only.
+  """
+  try:
+    published = await _published_diagnostic_capacity(region)
+  except Exception as error:
+    logger.warning("读取 Etcd 诊断容量快照失败 region=%s: %s", region, error)
+    published = None
+  if published is not None:
+    return published
   try:
     rows = await RegionCapacitySnapshot.find(
       RegionCapacitySnapshot.region == region,
@@ -205,6 +304,7 @@ async def get_diagnostic_capacity_aggregate(region: str) -> dict:
       "expected_replica_count": 0,
       "actual_replica_count": 0,
       "health_reasons": ["容量快照不可读取"],
+      "source": "unavailable",
     }
   if not rows:
     return {
@@ -218,24 +318,18 @@ async def get_diagnostic_capacity_aggregate(region: str) -> dict:
       "expected_replica_count": 0,
       "actual_replica_count": 0,
       "health_reasons": ["尚未采集当前区域容量快照"],
+      "source": "unavailable",
     }
   snapshot = rows[0]
-  captured_at = snapshot.captured_at
-  if captured_at.tzinfo is None:
-    captured_at = captured_at.replace(tzinfo=utc_now().tzinfo)
-  fresh = (utc_now() - captured_at).total_seconds() <= max(
-    float(settings.CAPACITY_SNAPSHOT_MAX_AGE_SECONDS),
-    0.0,
+  return _diagnostic_from_values(
+    region=snapshot.region,
+    status=str(getattr(snapshot, "health_status", "unknown") or "unknown"),
+    reachable=bool(getattr(snapshot, "reachable", False)),
+    captured_at=snapshot.captured_at,
+    raw_capacity_bytes=snapshot.raw_capacity_bytes,
+    raw_used_bytes=snapshot.raw_used_bytes,
+    expected_replica_count=snapshot.expected_replica_count,
+    actual_replica_count=snapshot.actual_replica_count,
+    health_reasons=list(getattr(snapshot, "health_reasons", None) or []),
+    source="local_snapshot",
   )
-  return {
-    "region": snapshot.region,
-    "status": str(getattr(snapshot, "health_status", "unknown") or "unknown"),
-    "reachable": bool(getattr(snapshot, "reachable", False)),
-    "fresh": fresh,
-    "captured_at": captured_at,
-    "raw_capacity_bytes": max(int(snapshot.raw_capacity_bytes or 0), 0),
-    "raw_used_bytes": max(int(snapshot.raw_used_bytes or 0), 0),
-    "expected_replica_count": max(int(snapshot.expected_replica_count or 0), 0),
-    "actual_replica_count": max(int(snapshot.actual_replica_count or 0), 0),
-    "health_reasons": list(getattr(snapshot, "health_reasons", None) or []),
-  }

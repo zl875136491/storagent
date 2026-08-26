@@ -11,6 +11,7 @@ from fastapi import Request
 
 from src.core.exception import CustomException, ErrorDesc
 from src.core import metrics as metrics_mod
+from src.configs.configs import settings
 
 _lock = Lock()
 _hits: dict[str, deque[float]] = defaultdict(deque)
@@ -71,6 +72,24 @@ def rate_limit_one_time_download(request: Request) -> None:
 def rate_limit_ai(request: Request, username: str) -> None:
   ip = _client_ip(request)
   check_rate_limit(f"ai:{username}:{ip}", limit=30, window_seconds=60.0)
+
+
+def rate_limit_celery_overview(request: Request, username: str) -> None:
+  ip = _client_ip(request)
+  check_rate_limit(
+    f"celery-overview:{username}:{ip}",
+    limit=max(int(settings.CELERY_OVERVIEW_RATE_LIMIT_PER_MINUTE), 1),
+    window_seconds=60.0,
+  )
+
+
+def rate_limit_celery_history(request: Request, username: str) -> None:
+  ip = _client_ip(request)
+  check_rate_limit(
+    f"celery-history:{username}:{ip}",
+    limit=max(int(settings.CELERY_HISTORY_RATE_LIMIT_PER_MINUTE), 1),
+    window_seconds=60.0,
+  )
 
 
 def rate_limit_oa_request(request: Request, username: str) -> None:

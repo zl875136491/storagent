@@ -314,7 +314,7 @@ async def get_unmanaged_bucket_operations(
 
 @router.get(
   path="/operations/orphan-buckets",
-  response_model=storage_schema.UnmanagedBucketOperationsResponse,
+  response_model=storage_schema.OrphanBucketOperationsResponse,
   include_in_schema=False,
 )
 async def get_orphan_bucket_operations_compat(
@@ -322,7 +322,7 @@ async def get_orphan_bucket_operations_compat(
 ):
   """Compatibility endpoint for older console bundles."""
   await check_permissions(current_user, ["storage_operations_manage"])
-  return await storage_operations.get_unmanaged_bucket_overview()
+  return await storage_operations.get_orphan_bucket_overview()
 
 
 @router.post(
@@ -390,7 +390,7 @@ async def delete_unmanaged_bucket(
 @router.post(
   path="/operations/replication/{bucket_name}/reconcile",
   response_model=storage_schema.ReplicationOperationResponse,
-  status_code=status.HTTP_202_ACCEPTED,
+  status_code=status.HTTP_200_OK,
   summary="校准存储桶复制规则",
 )
 async def reconcile_bucket_replication(
@@ -407,7 +407,7 @@ async def reconcile_bucket_replication(
 @router.post(
   path="/operations/replication/{bucket_name}/resync",
   response_model=storage_schema.ReplicationOperationResponse,
-  status_code=status.HTTP_202_ACCEPTED,
+  status_code=status.HTTP_200_OK,
   summary="启动复制链路对象补传",
 )
 async def start_bucket_replication_resync(

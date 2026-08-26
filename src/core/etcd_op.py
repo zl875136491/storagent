@@ -17,6 +17,7 @@ _WATCH_IGNORED_PREFIXES = (
   f"{ETCD_PREFIX}locks/",
   f"{ETCD_PREFIX}quota/",
   f"{ETCD_PREFIX}capacity_planning",
+  f"{ETCD_PREFIX}object_archive_policy",
 )
 
 

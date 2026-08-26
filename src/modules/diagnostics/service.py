@@ -446,22 +446,28 @@ async def quota_capacity_probe(app_context: dict) -> dict:
   replica_actual = max(int(cluster.get("actual_replica_count") or 0), 0)
 
   blocking_reasons: list[str] = []
+  warnings: list[str] = []
   if quota_bytes <= 0:
     blocking_reasons.append("应用配额未配置")
   elif quota_available_bytes <= 0:
     blocking_reasons.append("应用可用配额不足")
   if not quota.get("fresh"):
-    blocking_reasons.append("应用配额聚合数据已过期或不可用")
+    warnings.append("应用配额聚合数据已过期或不可用，当前结果为降级预检")
   if not cluster.get("fresh"):
-    blocking_reasons.append("当前区域容量快照已过期或不可用")
-  elif not cluster.get("reachable") or cluster_status != "online":
-    blocking_reasons.append("当前区域存储状态不是完全在线")
-  elif raw_capacity_bytes <= 0 or raw_available_bytes <= 0:
+    warnings.append("当前区域容量快照已过期或不可用，当前结果为降级预检")
+  elif cluster_status in {"offline", "unreachable", "critical"}:
+    blocking_reasons.append("当前区域存储不可用")
+  elif not cluster.get("reachable"):
+    warnings.append("当前区域存储可达性尚未确认")
+  elif raw_capacity_bytes > 0 and raw_available_bytes <= 0:
     blocking_reasons.append("当前区域物理可用容量不足")
+  elif raw_capacity_bytes <= 0:
+    warnings.append("当前区域容量快照未报告有效物理容量")
+  elif cluster_status not in {"online", "healthy"}:
+    warnings.append("当前区域存储状态需要关注")
   if replica_actual < replica_expected:
-    blocking_reasons.append("当前区域复制冗余低于预期")
+    warnings.append("当前区域复制冗余低于预期")
 
-  warnings: list[str] = []
   quota_usage_percent = _percent(quota_usage_bytes, quota_bytes)
   raw_usage_percent = _percent(raw_used_bytes, raw_capacity_bytes)
   if quota_usage_percent >= 85:
@@ -470,9 +476,13 @@ async def quota_capacity_probe(app_context: dict) -> dict:
     warnings.append("集群物理容量使用率已达到 85%")
   if quota.get("aggregate_error"):
     warnings.append("应用配额聚合状态暂不可读取，已使用本地投影")
+  preflight_status = "blocked" if blocking_reasons else "degraded" if warnings else "ready"
+  confidence = "high" if not warnings else "degraded" if (quota.get("fresh") and cluster.get("fresh")) else "low"
 
   return {
     "ready": not blocking_reasons,
+    "preflight_status": preflight_status,
+    "confidence": confidence,
     "summary": (
       f"应用配额可用 {_format_bytes(quota_available_bytes)}（{quota_usage_percent:.1f}% 已用）；"
       f"当前区域容量可用 {_format_bytes(raw_available_bytes)}（{raw_usage_percent:.1f}% 已用）"
@@ -498,6 +508,7 @@ async def quota_capacity_probe(app_context: dict) -> dict:
       "expected_replica_count": replica_expected,
       "actual_replica_count": replica_actual,
       "health_reasons": list(cluster.get("health_reasons") or []),
+      "source": str(cluster.get("source") or ""),
     },
     "warnings": warnings,
     "blocking_reasons": blocking_reasons,

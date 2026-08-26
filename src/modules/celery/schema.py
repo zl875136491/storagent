@@ -12,6 +12,9 @@ class CeleryBrokerStatus(BaseModel):
   transport: str = "mongodb"
   database: str = ""
   message: str = ""
+  region: str = ""
+  expected_queue: str = ""
+  task_protocol: str = ""
 
 
 class CeleryWorkerStatus(BaseModel):
@@ -27,6 +30,9 @@ class CeleryWorkerStatus(BaseModel):
   processed_count: int = 0
   concurrency: int | None = None
   registered_task_count: int = 0
+  queue: str = ""
+  task_protocol: str = ""
+  beat_enabled: bool = False
   source: str = "inspect"
 
 
@@ -45,6 +51,8 @@ class CeleryTaskExecution(BaseModel):
   worker: str = ""
   region: str = ""
   queue: str = "celery"
+  origin_region: str = ""
+  task_protocol: str = ""
   retries: int = 0
   received_at: datetime | None = None
   started_at: datetime | None = None
@@ -65,6 +73,14 @@ class CeleryTaskCatalogItem(BaseModel):
   description: str
 
 
+class CeleryBeatLeader(BaseModel):
+  key: str
+  owner: str = ""
+  expires_at: datetime | None = None
+  updated_at: datetime | None = None
+  active: bool = False
+
+
 class CeleryOverviewResponse(BaseModel):
   generated_at: datetime
   broker: CeleryBrokerStatus
@@ -74,6 +90,7 @@ class CeleryOverviewResponse(BaseModel):
   reserved_tasks: list[CeleryTaskExecution] = Field(default_factory=list)
   scheduled_tasks: list[CeleryTaskExecution] = Field(default_factory=list)
   task_catalog: list[CeleryTaskCatalogItem] = Field(default_factory=list)
+  beat_leaders: list[CeleryBeatLeader] = Field(default_factory=list)
   inspection_message: str = ""
 
 

@@ -128,7 +128,10 @@ V2_ERROR_CODES: dict[ErrorDesc, tuple[str, bool]] = {
   ErrorDesc.SHARE_CONSUMED: ("share.consumed", False),
   ErrorDesc.SHARE_REVOKED: ("share.revoked", False),
   ErrorDesc.DOWNLOAD_SOURCE_UNAVAILABLE: ("storage.unavailable", True),
-  ErrorDesc.MINIO_AUTH_FAILED: ("storage.authentication_failed", False),
+  # v2 callers historically key their retry/alert handling on the stable
+  # storage.unavailable code. Keep that top-level contract while details and
+  # retryable distinguish authentication from network/transient failures.
+  ErrorDesc.MINIO_AUTH_FAILED: ("storage.unavailable", False),
   ErrorDesc.MINIO_NETWORK_UNAVAILABLE: ("storage.unavailable", True),
   ErrorDesc.RATE_LIMITED: ("rate_limit.exceeded", True),
   ErrorDesc.SYNC_FAILED: ("system.dependency_unavailable", True),

@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from typing import Any
+
+from pymongo.errors import DuplicateKeyError
 
 from src.utils.logger import logger
 from src.core import metrics as metrics_mod
@@ -28,6 +31,9 @@ async def _persist(
   resource: str,
   success: bool,
   detail: str,
+  *,
+  event_id: str = "",
+  raise_on_failure: bool = False,
 ) -> None:
   try:
     from src.configs.configs import settings
@@ -40,13 +46,42 @@ async def _persist(
       success=success,
       detail=detail,
       region=settings.REGION,
+      event_id=event_id or None,
     ).insert()
+  except DuplicateKeyError:
+    # A broker acknowledgement can be lost after MongoDB committed the audit
+    # row. The deterministic event id turns a redelivery into a no-op.
+    return
   except Exception as e:
     # 落库失败不影响主流程
     logger.warning(f"审计落库失败: {e}")
+    if raise_on_failure:
+      raise
 
 
-persist_audit_event = _persist
+async def persist_audit_event(
+  action: str,
+  actor: str,
+  resource: str,
+  success: bool,
+  detail: str,
+  event_id: str = "",
+) -> None:
+  """Persist a worker-delivered audit event with retryable failure semantics.
+
+  The event UUID is unique, so retrying after a broker acknowledgement or
+  worker-loss window is safe. Local API fallbacks continue to use the best
+  effort helper above and never make the foreground request fail.
+  """
+  await _persist(
+    action,
+    actor,
+    resource,
+    success,
+    detail,
+    event_id=event_id,
+    raise_on_failure=True,
+  )
 
 
 def audit(
@@ -60,6 +95,7 @@ def audit(
   actor_s = actor or "-"
   resource_s = resource or "-"
   detail_s = _detail_str(detail)
+  event_id = uuid.uuid4().hex
   payload = {
     "audit": True,
     "action": action,
@@ -77,10 +113,18 @@ def audit(
 
   try:
     from src.core.celery_client import dispatch_task
-    task_id = dispatch_task("storagent.audit.persist", action, actor_s, resource_s, success, detail_s)
+    task_id = dispatch_task(
+      "storagent.audit.persist",
+      action,
+      actor_s,
+      resource_s,
+      success,
+      detail_s,
+      event_id,
+    )
     if task_id is None:
       loop = asyncio.get_running_loop()
-      loop.create_task(_persist(action, actor_s, resource_s, success, detail_s))
+      loop.create_task(_persist(action, actor_s, resource_s, success, detail_s, event_id=event_id))
   except RuntimeError:
     # 无事件循环（如纯同步单测）时仅写日志
     pass
@@ -89,6 +133,6 @@ def audit(
     logger.warning("Celery 审计任务派发失败，回退到本地执行: {}", error)
     try:
       loop = asyncio.get_running_loop()
-      loop.create_task(_persist(action, actor_s, resource_s, success, detail_s))
+      loop.create_task(_persist(action, actor_s, resource_s, success, detail_s, event_id=event_id))
     except RuntimeError:
       pass

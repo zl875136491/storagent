@@ -132,6 +132,10 @@ class EtcdTaskResponse(BaseModel):
   created_at: datetime
   started_at: datetime | None = None
   finished_at: datetime | None = None
+  origin_region: str = ""
+  celery_task_id: str = ""
+  dispatch_attempts: int = 0
+  dispatched_at: datetime | None = None
 
 
 class EtcdTaskListResponse(BaseModel):

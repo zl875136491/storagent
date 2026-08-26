@@ -1,4 +1,6 @@
 """Read-only Etcd operations status contract tests."""
+from types import SimpleNamespace
+
 import pytest
 
 from src.api import register_api
@@ -87,3 +89,98 @@ async def test_status_marks_quorum_loss_critical(monkeypatch):
   assert result.status == "critical"
   assert result.quorum is False
   assert "quorum" in " ".join(result.reasons)
+
+
+@pytest.mark.asyncio
+async def test_etcd_worker_claim_is_atomic_before_side_effect(monkeypatch):
+  task = SimpleNamespace(
+    id="etcd-task-1",
+    kind="keyspace",
+    status="queued",
+    origin_region="beijing",
+    result={},
+    error="",
+    message="任务已排队",
+    started_at=None,
+    finished_at=None,
+    save_calls=0,
+  )
+  calls = {}
+
+  async def save():
+    task.save_calls += 1
+
+  task.save = save
+
+  class Collection:
+    async def find_one_and_update(self, query, update, *, return_document):
+      calls["query"] = query
+      calls["update"] = update
+      task.status = "running"
+      return {"claimed": True}
+
+  async def read_task(task_id):
+    assert task_id == "etcd-task-1"
+    return task
+
+  async def keyspace(actor):
+    assert actor == "admin"
+    return service.schema.EtcdOperationResponse(
+      kind="keyspace",
+      status="succeeded",
+      message="ok",
+      detail={"key_count": 1},
+      created_at=service.utc_now(),
+    )
+
+  monkeypatch.setattr(service.settings, "REGION", "beijing")
+  monkeypatch.setattr(service.EtcdOperationTask, "get", read_task)
+  monkeypatch.setattr(service.EtcdOperationTask, "get_motor_collection", lambda: Collection())
+  monkeypatch.setattr(service.EtcdOperationTask, "model_validate", lambda _raw: task)
+  monkeypatch.setattr(service, "keyspace", keyspace)
+
+  result = await service._execute_task("etcd-task-1", "admin", None, origin_region="beijing")
+
+  assert calls["query"] == {
+    "_id": "etcd-task-1",
+    "status": "queued",
+    "origin_region": {"$in": ["", "beijing"]},
+  }
+  assert calls["update"]["$set"]["status"] == "running"
+  assert result == {"status": "succeeded", "task_id": "etcd-task-1"}
+  assert task.status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_etcd_worker_rejects_foreign_region_before_execution(monkeypatch):
+  task = SimpleNamespace(
+    id="etcd-task-foreign",
+    kind="defrag",
+    status="queued",
+    origin_region="tianjin",
+    result={},
+    error="",
+    message="",
+    finished_at=None,
+  )
+
+  async def save():
+    return None
+
+  async def read_task(_task_id):
+    return task
+
+  task.save = save
+  monkeypatch.setattr(service.settings, "REGION", "beijing")
+  monkeypatch.setattr(service.EtcdOperationTask, "get", read_task)
+
+  with pytest.raises(service.EtcdOperationRegionMismatchError):
+    await service._execute_task(
+      "etcd-task-foreign",
+      "admin",
+      None,
+      origin_region="tianjin",
+    )
+
+  assert task.status == "failed"
+  assert task.result["recovery_required"] is True

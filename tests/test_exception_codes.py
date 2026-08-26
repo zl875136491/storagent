@@ -75,7 +75,7 @@ def test_v2_minio_auth_error_is_not_retryable():
   assert exc.status_code == 502
   assert v2_error_response(exc, "req_1") == {
     "error": {
-      "code": "storage.authentication_failed",
+      "code": "storage.unavailable",
       "message": "Minio 认证或授权失败",
       "retryable": False,
       "details": {"operation": "read_write", "category": "authentication"},
@@ -97,7 +97,7 @@ def test_shared_minio_error_classifier_keeps_auth_network_and_operation_distinct
   generic = classify_minio_error(RuntimeError("bad request"), "multipart_list_parts")
 
   assert auth.error_desc == ErrorDesc.MINIO_AUTH_FAILED
-  assert v2_error_response(auth, "auth")['error']["code"] == "storage.authentication_failed"
+  assert v2_error_response(auth, "auth")['error']["code"] == "storage.unavailable"
   assert network.error_desc == ErrorDesc.MINIO_NETWORK_UNAVAILABLE
   assert v2_error_response(network, "network")["error"]["retryable"] is True
   assert generic.error_desc == ErrorDesc.MINIO_ACCESS_FAILED
@@ -133,7 +133,7 @@ async def test_custom_exception_log_includes_request_id(monkeypatch):
   assert "Request ID: request-42" in messages[0]
   assert json.loads(response.body) == {
     "error": {
-      "code": "storage.authentication_failed",
+      "code": "storage.unavailable",
       "message": "Minio 认证或授权失败",
       "retryable": False,
       "details": {"operation": "write"},

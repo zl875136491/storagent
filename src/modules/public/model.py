@@ -37,6 +37,10 @@ class Application(Document):
   # Usage is a node-local cache. The quota itself is synchronized through Etcd.
   quota_usage_bytes: int = Field(default=0, ge=0)
   quota_usage_updated_at: datetime | None = Field(default=None)
+  # This is intentionally separate from ``quota_usage_updated_at``. Failed
+  # MinIO reads remain stale, but must not monopolize every bounded refresh
+  # batch and starve the rest of the applications.
+  quota_usage_attempted_at: datetime | None = Field(default=None)
   # Browser Origins allowed to call the data plane directly from this app.
   domains: List[str] = Field(default_factory=list)
   # regions: List[Link[Region]] = Field(default=[])
@@ -56,6 +60,7 @@ class Application(Document):
     indexes = [
       IndexModel(["name"], unique=True),
       IndexModel(["shown_name"], unique=True),
+      IndexModel([("enabled", 1), ("quota_usage_attempted_at", 1), ("name", 1)]),
     ]
 
 class APIKey(Document):
@@ -146,6 +151,9 @@ class AuditEvent(Document):
   success: bool = Field(default=True)
   detail: str = Field(default="")
   region: str = Field(default="")
+  # New asynchronous audit writes carry a UUID. Sparse indexing keeps legacy
+  # records, which have no event id, valid during the migration.
+  event_id: str | None = None
   created_at: datetime = Field(default_factory=utc_now)
 
   class Settings:
@@ -158,6 +166,7 @@ class AuditEvent(Document):
       IndexModel([("action", 1), ("created_at", -1)]),
       IndexModel([("actor", 1), ("created_at", -1)]),
       IndexModel([("region", 1), ("created_at", -1)]),
+      IndexModel([("event_id", 1)], unique=True, sparse=True),
     ]
 
 

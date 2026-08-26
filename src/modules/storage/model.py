@@ -108,6 +108,12 @@ class StorageOperation(Document):
   actor: str = "-"
   message: str = ""
   result: dict[str, Any] = Field(default_factory=dict)
+  # This operation belongs to the Region whose MongoDB created it. Celery
+  # routing and worker-side validation use it as a second execution guard.
+  origin_region: str = ""
+  celery_task_id: str = ""
+  dispatch_attempts: int = Field(default=0, ge=0)
+  dispatched_at: datetime | None = None
   created_at: datetime = Field(default_factory=utc_now)
   started_at: datetime | None = None
   finished_at: datetime | None = None
@@ -118,6 +124,7 @@ class StorageOperation(Document):
     indexes = [
       IndexModel([("created_at", -1)]),
       IndexModel([("kind", 1), ("bucket", 1), ("server", 1), ("target", 1), ("status", 1)]),
+      IndexModel([("origin_region", 1), ("status", 1), ("dispatched_at", 1)]),
       IndexModel(["expires_at"], expireAfterSeconds=0),
     ]
 
@@ -190,10 +197,18 @@ class EtcdOperationTask(Document):
   message: str = ""
   result: dict[str, Any] = Field(default_factory=dict)
   error: str = ""
+  origin_region: str = ""
+  celery_task_id: str = ""
+  dispatch_attempts: int = Field(default=0, ge=0)
+  dispatched_at: datetime | None = None
   created_at: datetime = Field(default_factory=utc_now)
   started_at: datetime | None = None
   finished_at: datetime | None = None
 
   class Settings:
     name = "etcd_operation_task"
-    indexes = [IndexModel(["created_at"], unique=False), IndexModel(["status", "created_at"])]
+    indexes = [
+      IndexModel(["created_at"], unique=False),
+      IndexModel(["status", "created_at"]),
+      IndexModel([("origin_region", 1), ("status", 1), ("dispatched_at", 1)]),
+    ]

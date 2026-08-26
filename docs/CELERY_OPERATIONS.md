@@ -1,98 +1,146 @@
-# Celery 背景任务运行说明
+# Celery Background Tasks
 
-审阅基线：2026-08-25。本文件说明当前 Storagent 代码中 Celery 的触发、执行、分发与跨区域行为；不把设计预期当作现有保证。
+审阅日期：2026-08-26。本文件描述当前已实现的 Celery 分发、执行和故障处置机制。它适用于共享 MongoDB broker 的多 Region 部署。
 
-## 1. 组件与数据流
+## 1. Core Model
 
-每个部署了 worker 的 Region 运行一个独立的 Celery 进程：
+每个 Region 的 API 和 Worker 必须使用相同的以下配置：
 
-```text
-FastAPI / Celery Beat
-        |
-        | send_task(...)
-        v
-MongoDB broker: celery.messages / celery.routing / celery.queues
-        |
-        v
-Celery worker
-        |
-        +--> 本区 Mongo / MinIO / Etcd
-        +--> MongoDB result: celery_taskmeta
-        +--> MongoDB observability: celery_task_history / celery_worker_heartbeats
+```dotenv
+REGION=beijing
+CELERY_TASK_QUEUE_PREFIX=storagent
+CELERY_TASK_PROTOCOL_VERSION=2
+CELERY_BROKER_URL=mongodb://...
+CELERY_RESULT_BACKEND=mongodb://...
 ```
 
-当前启动命令位于 worker 的 `worker.sh`：一个 worker 同时启动 `worker` 和 `beat`，并启用 Celery events。worker 使用 MongoDB 作为 broker 和 result backend，启用 `task_acks_late`、`task_reject_on_worker_lost`、`worker_prefetch_multiplier=1`，任务异常会按各任务定义最多自动重试 5 次。
+任务队列的唯一名称为：
 
-管理 API 不会返回 broker URL、账号密码、任务参数或 kwargs。运行态来自 Celery inspect；队列深度、任务历史和 worker 心跳来自 MongoDB。旧的 `celery_taskmeta` 只有状态、结果和完成时间，**没有任务名、执行 Region 或 worker**；新版本开始由 `celery_task_history` 记录这些字段。
+```text
+<CELERY_TASK_QUEUE_PREFIX>.<REGION lowercase>.v<CELERY_TASK_PROTOCOL_VERSION>
+```
 
-## 2. 当前分发结论
+例如北京 Region 的协议 2 队列是 `storagent.beijing.v2`。API producer 只向本 Region 队列投递任务，并附带以下 Celery header：
 
-### 2.1 代码层没有按 Region 路由
+```text
+storagent-origin-region: beijing
+storagent-task-protocol: 2
+```
 
-`src/core/celery_client.py` 的 `dispatch_task()` 调用 `send_task()` 时没有指定 `queue`；worker 也没有配置 `task_routes`。因此所有任务默认发往 `celery` 队列，代码本身没有携带或校验“来源 Region”。
+Worker 只订阅自己的队列，且每个任务入口都验证 header。缺少 header、来源 Region 不一致或协议不一致都会失败，绝不会回退消费旧的共享 `celery` 队列。因此，即使多个 Region 共用同一个 MongoDB broker，也不能跨区取走任务。
 
-### 2.2 是否跨区重复，取决于 broker 是否隔离
+## 2. Scheduler and Ownership
 
-| 部署条件 | 实际行为 |
-|---|---|
-| 每个 Region 使用自己的 MongoDB broker/数据库 | 每个 Region 的 worker 只能消费自己 broker 中的 `celery` 消息。周期任务会在每个 Region 各调度一次，适合本区清理、归档和同步。 |
-| 多个 Region 共用同一个 MongoDB broker/数据库 | 任一 worker 都可能消费任一消息；每个带 `--beat` 的 worker 还会独立投递一份周期任务。当前没有 leader election、分布式 Beat 锁或 Region queue，因此会出现重复调度和跨区误消费风险。 |
+一个 Worker 可以启用 Beat，但同 Region、同协议的多个 Worker 会通过 Mongo 集合 `celery_beat_locks` 竞争短租约：
 
-**结论**：当前实现不是“每个 Region 的 Celery 天然只做本区任务”。它只在“broker 按 Region 隔离”这一部署前提成立时表现为本区执行。若 broker 共享，调度和消费都不具备 Region 隔离保证。
+```text
+storagent-beat:<region>:v<protocol>
+```
 
-### 2.3 权威区域任务的实际保护
+只有租约持有者执行 `tick()` 并投递周期任务。无法访问 broker 时 Beat 失去领导权并停止投递，而不是在分区时继续重复调度。
 
-下列任务在函数入口检查 `REGION == SYNC_AUTHORITY_REGION`，非权威区域会直接跳过业务动作：复制策略校准、应用配额聚合、容量快照、MinIO 自愈巡检。这个保护能避免非权威 Region 执行核心动作，但无法阻止多余消息被投递、消费和写入结果。
+| 任务 | 触发方式 | 调度/执行范围 | 重试策略 |
+|---|---|---|---|
+| `storagent.auth.cleanup_expired_tokens` | Beat | 本区认证数据 | 可重试 |
+| `storagent.files.archive_expired_objects` | Beat，显式开启归档后 | 本区且 `source_region` 匹配的对象 | 可重试，复制/删除幂等 |
+| `storagent.etcd.reconcile` | Beat | 本区 Mongo 与共享 Etcd | 可重试 |
+| `storagent.maintenance.recover_queued_tasks` | Beat | 本区存储/Etcd 手工任务 | 可重试 |
+| `storagent.replication.reconcile_policies` | Beat | 仅 `SYNC_AUTHORITY_REGION` | 可重试 |
+| `storagent.public.refresh_quota_aggregates` | Beat | 仅权威 Region，按批次轮转 | 可重试 |
+| `storagent.capacity.snapshot` | Beat | 仅权威 Region | 可重试 |
+| `storagent.storage.monitor_cluster_health` | Beat | 仅权威 Region，且 `AUTO_HEAL_ENABLED=true` | 可重试 |
+| `storagent.etcd.execute` | Etcd 运维操作 | 创建任务的本区 Mongo | 不自动重试 |
+| `storagent.storage.execute_operation` | 存储运维操作 | 创建任务的本区 Mongo | 不自动重试 |
+| `storagent.audit.persist` | 审计事件 | 产生事件的本区 Mongo | 可重试，`event_id` 幂等 |
 
-## 3. 已注册任务清单
+权威任务不会由非权威 Region 的 Beat schedule 生成；入口仍保留 Region 判断，防止手工投递或错误配置绕过调度保护。
 
-| 任务 | 触发 | 执行角色 | 执行范围与保护 | 当前分发机制 |
-|---|---|---|---|---|
-| `storagent.auth.cleanup_expired_tokens` | Beat，`AUTH_CLEANUP_INTERVAL_SECONDS` | Celery worker | 清理本区 JWT 吊销记录和 OA 挑战；无权威区域限制 | 默认 `celery` 队列 |
-| `storagent.files.archive_expired_objects` | Beat，`OBJECT_ARCHIVE_INTERVAL_SECONDS` | Celery worker | 扫描本区 `ObjectCatalog`，将恢复期超时对象复制到内部归档桶后删除源对象；无权威区域限制 | 默认 `celery` 队列 |
-| `storagent.etcd.reconcile` | Beat，`SYNC_RECONCILE_INTERVAL_SECONDS` | Celery worker | 执行本区 Mongo 与共享 Etcd 的全量校准；无单一调度者保护 | 默认 `celery` 队列 |
-| `storagent.replication.reconcile_policies` | Beat，`REPLICATION_RECONCILE_INTERVAL_SECONDS` | Celery worker | 仅权威区域补齐应用复制规则和桶配额；非权威区域返回 | 默认 `celery` 队列 |
-| `storagent.public.refresh_quota_aggregates` | Beat，`APPLICATION_QUOTA_AGGREGATE_INTERVAL_SECONDS` | Celery worker | 仅权威区域采集各区应用用量并更新 Etcd 聚合；非权威区域返回 `skipped` | 默认 `celery` 队列 |
-| `storagent.capacity.snapshot` | Beat，`CAPACITY_SNAPSHOT_INTERVAL_SECONDS` | Celery worker | 仅权威区域采集容量快照并发布容量规划；非权威区域返回 | 默认 `celery` 队列 |
-| `storagent.storage.monitor_cluster_health` | Beat，`CLUSTER_HEALTH_CHECK_INTERVAL_SECONDS` | Celery worker | 仅权威区域，且 `AUTO_HEAL_ENABLED=true` 时执行；否则返回 | 默认 `celery` 队列 |
-| `storagent.etcd.execute` | Etcd 运维页面创建任务 | Celery worker | 根据本区 Mongo 中的 `EtcdOperationTask` ID 执行检查、压缩、defrag 或解除告警 | 默认 `celery` 队列 |
-| `storagent.storage.execute_operation` | 存储运维页面创建任务 | Celery worker | 根据本区 Mongo 中的 `StorageOperation` ID 执行复制校准、resync、自愈或未纳管桶删除 | 默认 `celery` 队列 |
-| `storagent.audit.persist` | 任意调用 `audit.audit()` 的业务操作 | Celery worker | 将审计事件写入当前执行 worker 所连接的本区 Mongo；派发失败时 API 进程回退为本地异步落库 | 默认 `celery` 队列 |
+## 3. Manual Operation State Machine
 
-## 4. 共享 broker 时的风险
+存储运维和 Etcd 运维任务先落库，再派发 Celery。持久化记录包含：
 
-| 场景 | 现有后果 | 风险级别 |
-|---|---|---|
-| 多 Region 都运行 `--beat` | 每个 Beat 都会投递相同周期任务 | 高：重复消息和多余重试；权威任务虽会跳过但仍消耗资源 |
-| 手工 Etcd / 存储运维任务被异地 worker 取走 | 任务 ID 在异地 Mongo 通常不存在，worker 直接返回；若本地存在同 ID，可能执行错误的本地任务 | 高：执行结果与发起页面不一致，无法保证任务落在创建 Region |
-| 审计任务被异地 worker 取走 | 审计落到异地 Mongo，Region 归属偏离原始操作 | 中：审计追溯不完整 |
-| 文件归档被异地 worker 取走 | 扫描的是异地对象目录和归档桶，不是发起 Beat 的 Region | 中：调度节奏和归档责任失真 |
-| Etcd 全量校准被任意 worker 消费 | 不能保证每个 Region 在自己的周期内完成校准 | 中：某些 Region 的收敛时效不可预测 |
+```text
+origin_region, celery_task_id, dispatch_attempts, dispatched_at
+```
 
-## 5. 现有测试环境观察
+Worker 不使用“读取后直接保存”的方式进入执行态，而是原子地将本区 `queued` 记录领取为 `running`。这避免了延迟消息与看门狗并发时，Worker 覆盖 `failed/recovery_required` 状态并继续执行外部副作用。
 
-截至 2026-08-25 的测试环境，backend A（`REGION=nuc-docker-a`）和 backend B（`REGION=nuc-docker-b`）都配置到同一个 `storagent_celery` broker 数据库；其中只运行了一个 `REGION=nuc-docker-a` 的 worker。broker 中只有一个业务队列 `celery`，另有 Celery control 的临时 `pidbox` 队列。
+```text
+queued --(Worker atomic claim)--> running --(confirmed result)--> succeeded/failed
+   |                                  |
+   +--(start timeout)--> failed        +--(running timeout)--> failed
+                         recovery_required=true
+```
 
-这意味着测试环境已经存在一条明确的跨 Region 风险路径：由 backend B 派发的 `storagent.etcd.execute`、`storagent.storage.execute_operation` 或 `storagent.audit.persist` 可以被 A worker 消费。前两个任务会按 A 的本区 Mongo 查询传入的任务 ID，通常找不到时直接返回；审计任务则可能写入 A 的本区审计库。当前测试环境只有一个 Beat，因此尚未发生“多个 Beat 重复投递周期任务”；一旦 B 也启动带 `--beat` 的 worker，就会出现第 4 节所述的重复调度风险。
+`storagent.maintenance.recover_queued_tasks` 会将以下任务标记为需要人工复核，不会盲目重新投递：
 
-已在 2026-08-25 做过一次实测：由 backend B（`REGION=nuc-docker-b`）投递的 `storagent.audit.persist`，任务 ID 为 `759bd5a1-8d94-48d9-8dff-12366d094c84`；`celery_task_history` 记录显示它由 `storagent-nuc-docker-a@49d48e41a49a` 执行，记录 Region 为 `nuc-docker-a`，状态为 `SUCCESS`。这证明共享 broker 下的跨 Region 消费已在测试环境实际发生，不是仅凭代码推断。
+- 已派发但在 `CELERY_OPERATION_START_TIMEOUT_SECONDS` 内未进入 `running`；
+- 已运行超过 `CELERY_OPERATION_RUNNING_TIMEOUT_SECONDS`。
 
-新建的 Celery 运维页面会显示当前 broker 中的 worker 名称、心跳上报 Region、默认队列深度和任务历史。若各 Region 使用隔离 broker，需要分别打开各 Region 的管理端查看本区 worker；如果同一页面出现多个 Region 的 worker，则说明这些 worker 可见于同一个 broker，必须按“共享 broker”风险处理。
+这样处理是刻意的：复制 resync、MinIO 删除、Etcd compact/defrag 在“外部调用已成功、进程在落库前中断”的窗口中不一定可以安全重放。人工复核原生 MinIO/Etcd 状态后，再创建新的运维任务。
 
-## 6. 后续整改建议
+审计任务例外：每个 producer 在投递时生成 UUID `event_id`，Mongo 对该字段有 sparse unique index。重复投递会作为成功处理，因此可以安全自动重试。
 
-以下是需要单独立项的分发改造，不是本次只读管理模块隐含完成的行为：
+## 4. Archive Safety
 
-1. 周期任务只运行一个 Beat：可部署单独 scheduler，或引入带分布式锁的 Beat 实现；权威任务应只由权威 Region 调度。
-2. 以 Region 建立任务队列，例如 `celery.<region>`，并在 producer 上为本区任务显式指定 queue。
-3. 手工任务参数携带 `origin_region`，worker 在执行业务前校验它与自身 `REGION` 一致；不一致应拒绝并留下可诊断状态，而不是静默返回。
-4. 对可能重复的周期任务补充显式幂等键或分布式锁；`task_acks_late` 只解决 worker 丢失后的重新投递，不解决多 Beat 产生的重复投递。
-5. 在所有 Region 的页面核对 worker 心跳、broker 数据库与队列名称；部署配置变更必须把 broker 隔离策略写入运维清单。
+对象恢复期归档默认关闭：
 
-## 7. 排障顺序
+```dotenv
+OBJECT_ARCHIVE_ENABLED=false
+OBJECT_ARCHIVE_AUTOCONFIGURE=false
+```
 
-1. 在 Celery 运维页面确认 broker 可用、worker 为在线、队列积压是否增长。
-2. 查看执行中、待取和定时任务，确认任务名、worker、Region 与预期一致。
-3. 在历史记录中查看 `FAILURE` / `RETRY`，再转到对应的存储运维、Etcd 运维或审计页面确认业务状态。
-4. 若历史记录显示“旧记录，任务名不可追溯”，这是旧版 `celery_taskmeta` 数据限制；等待本版本部署后的新任务写入 `celery_task_history`。
-5. 若看到多个 Region worker 位于同一个 broker，暂停把手工本区运维任务投入该队列，先实施第 6 节的分区与调度改造。
+开启后，Worker 只扫描 `source_region == REGION` 的目录记录；缺失源 Region 的旧记录和其他 Region 的记录均不会被当前节点认领。归档前必须满足：
+
+1. 权威 Region 已在 Etcd 发布相同的归档策略 fingerprint；
+2. 归档桶已启用版本控制；
+3. 存在名为 `storagent-expired-archive-retention` 的生命周期规则；
+4. 当前版本和非当前版本的保留期均不小于 `OBJECT_ARCHIVE_RETENTION_DAYS`；
+5. 已用真实的版本化对象完成复制、校验、恢复和源版本删除演练。
+
+生产环境不得设置 `OBJECT_ARCHIVE_AUTOCONFIGURE=true`。该选项仅用于新建的测试桶；已有归档桶策略不会被服务静默覆盖。
+
+## 5. Capacity and Quota Workload Bounds
+
+- 归档每轮最多处理 `OBJECT_ARCHIVE_BATCH_SIZE` 条记录；
+- 配额聚合每轮读取最多 `APPLICATION_QUOTA_AGGREGATE_BATCH_SIZE` 个启用应用；按 `quota_usage_attempted_at` 轮转，持续失败的应用不会饿死后续应用；
+- 容量快照对 MinIO 集群/复制检查使用 `CAPACITY_SNAPSHOT_MAX_CONCURRENCY`，复制检查不会为全部桶-Region 组合预建 asyncio Task；
+- 调用方诊断只读取持久化配额聚合和 Etcd 发布的容量规划，绝不在请求路径扫描 MinIO。
+
+容量样本过期、复制冗余偏低或状态为 degraded 会返回降级预检和 warning；只有明确的配额耗尽、fresh offline/unreachable/critical 或已知物理容量耗尽才阻断完整自诊断。
+
+## 6. Observability
+
+Worker 将最小化的任务生命周期和心跳写入 result MongoDB：
+
+- `celery_task_history`：默认保留 30 天；
+- `celery_worker_heartbeats`：默认保留 7 天；
+- 两个集合都使用 TTL index；
+- result 只保留白名单中的运行计数，error 会脱敏 token、password、URL 凭据和 query secret。
+
+Celery 运维页面是只读的。服务端对 overview 做 `CELERY_OVERVIEW_CACHE_SECONDS` 短缓存，并分别限制 overview/history 的用户和客户端 IP 请求频率。页面显示 expected queue、Worker 实际队列/协议、任务来源 Region 和 Beat 租约，便于定位不匹配配置。
+
+旧的 `celery_taskmeta` 没有经过新的脱敏协议；页面只显示“历史记录已隐藏未脱敏内容”，不会泄露旧 result/traceback。
+
+## 7. Release and Rollback
+
+区域队列协议与 Worker 任务注册是 Backend、Worker、Frontend 的共同兼容面，不能把三个仓库当成可任意错峰的独立发布单元。
+
+### 发布前检查
+
+1. 对每个测试/生产节点只读核对 `REGION`、权威 Region、Broker/Result URL、queue prefix、protocol、恢复期、归档开关和 TTL/批次配置。
+2. 确认现有 `celery` 旧队列没有未完成的手工任务；必要时先由旧 Worker 排空。
+3. 暂停新的手工运维任务，并在切换窗口中让旧 API producer 停止投递旧队列。
+4. 确认新 Worker 的注册任务包含本表 11 项，且心跳显示预期 Region queue。
+
+### 推荐顺序
+
+1. 使 API producer 静默或摘流，排空旧 `celery` 队列；
+2. 停止旧 Beat/Worker，部署同一兼容版本的新 Worker；
+3. 验证新 Region queue、心跳、Beat 单租约和任务注册；
+4. 部署 Backend 并验证 `/ready`、诊断和一条可回收的手工任务；
+5. 恢复 API 流量，最后发布 Frontend。
+
+新 Worker 故意不消费没有 envelope 的旧队列，因此“先替换 Worker、旧 Backend 仍持续处理流量”不是安全的发布方式。
+
+回滚前先停止新 producer，并排空或人工标记新 `v<protocol>` 队列中的手工任务；不得仅回滚 Worker 而让新 Backend 继续向协议队列投递。归档已经删除的源对象不能依赖代码回滚恢复，必须按归档恢复流程处理。

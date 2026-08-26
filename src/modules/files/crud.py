@@ -127,13 +127,17 @@ async def list_expired_objects_for_archive(
   now: datetime,
   *,
   limit: int,
+  source_region: str | None = None,
 ) -> list[ObjectCatalog]:
   """Find catalog rows that are past their recovery period and due to retry."""
-  return await ObjectCatalog.find(
+  filters = [
     In(ObjectCatalog.state, ["soft_deleted", "archive_pending", "archive_failed"]),
     LTE(ObjectCatalog.restore_until, now),
     LTE(ObjectCatalog.archive_after, now),
-  ).sort(
+  ]
+  if source_region is not None:
+    filters.append(ObjectCatalog.source_region == source_region)
+  return await ObjectCatalog.find(*filters).sort(
     +ObjectCatalog.archive_after, +ObjectCatalog.object_id,
   ).limit(max(int(limit), 1)).to_list()
 
@@ -144,16 +148,20 @@ async def claim_expired_object_for_archive(
   *,
   now: datetime,
   retry_after: timedelta,
+  source_region: str | None = None,
 ) -> ObjectCatalog | None:
   """Atomically lease one eligible row so concurrent workers cannot archive it twice."""
-  raw = await ObjectCatalog.get_motor_collection().find_one_and_update(
-    {
+  query = {
       "app_name": app_name,
       "object_id": object_id,
       "state": {"$in": ["soft_deleted", "archive_pending", "archive_failed"]},
       "restore_until": {"$ne": None, "$lte": now},
       "archive_after": {"$ne": None, "$lte": now},
-    },
+  }
+  if source_region is not None:
+    query["source_region"] = source_region
+  raw = await ObjectCatalog.get_motor_collection().find_one_and_update(
+    query,
     {
       "$set": {
         "state": "archive_pending",

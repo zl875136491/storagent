@@ -10,13 +10,15 @@ import asyncio
 import hashlib
 import io
 import os
+import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
 import aetcd
+from pymongo import ReturnDocument
 
 from src.configs.configs import DEFAULT_ETCD_ENDPOINTS, settings
 from src.core import metrics
@@ -29,6 +31,18 @@ from src.modules.storage.model import EtcdOperationEvent, EtcdOperationTask
 _cache_lock = asyncio.Lock()
 _cached_snapshot: schema.EtcdClusterStatusResponse | None = None
 _cached_at = 0.0
+
+
+class EtcdOperationNotFoundError(RuntimeError):
+  """The receiving Region cannot find a locally persisted Etcd operation."""
+
+
+class EtcdOperationRegionMismatchError(RuntimeError):
+  """A task envelope does not match the Region that owns the operation."""
+
+
+def _local_region() -> str:
+  return str(settings.REGION).strip().lower()
 
 
 def _value(source: Any, *names: str, default: Any = None) -> Any:
@@ -485,16 +499,76 @@ def _task_response(task: EtcdOperationTask) -> schema.EtcdTaskResponse:
     id=str(task.id), kind=task.kind, status=task.status, actor=task.actor, message=task.message,
     result=task.result, error=task.error, created_at=task.created_at,
     started_at=task.started_at, finished_at=task.finished_at,
+    origin_region=task.origin_region,
+    celery_task_id=task.celery_task_id,
+    dispatch_attempts=task.dispatch_attempts,
+    dispatched_at=task.dispatched_at,
   )
 
 
-async def _execute_task(task_id: str, actor: str, revision: int | None) -> None:
+def _operation_error(error: BaseException) -> str:
+  """Persist an actionable but non-sensitive manual-operation error."""
+  text = " ".join(str(error).split())
+  # Aetcd/HTTP exceptions can contain credentialed endpoint URLs. The task
+  # history is visible to operations users and must not become a secret sink.
+  text = re.sub(r"(https?://)[^/@\s:]+(?::[^/@\s]+)?@", r"\1***@", text)
+  return f"{type(error).__name__}: {text}"[:1000]
+
+
+async def _execute_task(
+  task_id: str,
+  actor: str,
+  revision: int | None,
+  *,
+  origin_region: str | None = None,
+) -> dict[str, str]:
   task = await EtcdOperationTask.get(task_id)
   if task is None:
-    return
-  task.status = "running"
-  task.started_at = utc_now()
-  await task.save()
+    raise EtcdOperationNotFoundError(f"本区 MongoDB 未找到 Etcd 运维任务: {task_id}")
+  expected_region = str(origin_region or task.origin_region or _local_region()).strip().lower()
+  local_region = _local_region()
+  if expected_region != local_region:
+    task.status = "failed"
+    task.message = f"任务区域不匹配，拒绝执行: origin={expected_region} worker={local_region}"
+    task.error = "任务区域不匹配"
+    task.result = {**dict(task.result or {}), "recovery_required": True}
+    task.finished_at = utc_now()
+    await task.save()
+    raise EtcdOperationRegionMismatchError(task.message)
+  if not task.origin_region:
+    task.origin_region = local_region
+    await task.save()
+  if task.status in {"succeeded", "failed"}:
+    return {"status": "skipped", "reason": "terminal_task"}
+  if task.status == "running":
+    return {"status": "skipped", "reason": "already_running"}
+
+  # Use a conditional claim rather than a read-then-save transition. This
+  # keeps the watchdog's failed/recovery_required decision authoritative when
+  # it races a delayed worker delivery.
+  raw = await EtcdOperationTask.get_motor_collection().find_one_and_update(
+    {
+      "_id": task.id,
+      "status": "queued",
+      "origin_region": {"$in": ["", local_region]},
+    },
+    {
+      "$set": {
+        "status": "running",
+        "started_at": utc_now(),
+      },
+    },
+    return_document=ReturnDocument.AFTER,
+  )
+  if raw is None:
+    latest = await EtcdOperationTask.get(task_id)
+    if latest is None:
+      raise EtcdOperationNotFoundError(f"本区 MongoDB 未找到 Etcd 运维任务: {task_id}")
+    return {
+      "status": "skipped",
+      "reason": "already_running" if latest.status == "running" else "terminal_task",
+    }
+  task = EtcdOperationTask.model_validate(raw)
   try:
     if task.kind == "keyspace":
       result = await keyspace(actor)
@@ -511,24 +585,98 @@ async def _execute_task(task_id: str, actor: str, revision: int | None) -> None:
     task.result = {"kind": result.kind, "status": result.status, "detail": result.detail}
   except Exception as error:
     task.status = "failed"
-    task.error = str(error)
+    task.error = _operation_error(error)
     task.message = "Etcd 运维任务执行失败"
+    if task.kind != "keyspace":
+      task.result = {**dict(task.result or {}), "recovery_required": True}
   task.finished_at = utc_now()
   await task.save()
+  return {"status": task.status, "task_id": str(task.id)}
 
 
 async def create_task(kind: str, actor: str, revision: int | None = None) -> schema.EtcdTaskResponse:
-  task = EtcdOperationTask(kind=kind, actor=actor, message="任务已排队")
+  task = EtcdOperationTask(
+    kind=kind,
+    actor=actor,
+    message="任务已排队",
+    origin_region=_local_region(),
+  )
   await task.insert()
+  task.dispatched_at = utc_now()
+  task.dispatch_attempts = 1
+  await task.save()
   try:
     from src.core.celery_client import dispatch_task
-    task_id = dispatch_task("storagent.etcd.execute", str(task.id), actor, revision)
+    task_id = dispatch_task(
+      "storagent.etcd.execute",
+      str(task.id),
+      actor,
+      revision,
+      origin_region=task.origin_region,
+    )
     if task_id is None:
-      asyncio.create_task(_execute_task(str(task.id), actor, revision))
+      asyncio.create_task(
+        _execute_task(str(task.id), actor, revision, origin_region=task.origin_region),
+      )
+    else:
+      task.celery_task_id = task_id
+      await task.save()
   except Exception as error:
     logger.warning("Celery Etcd 任务派发失败，回退到本地执行: {}", error)
-    asyncio.create_task(_execute_task(str(task.id), actor, revision))
+    asyncio.create_task(
+      _execute_task(str(task.id), actor, revision, origin_region=task.origin_region),
+    )
   return _task_response(task)
+
+
+async def recover_stale_tasks_once() -> dict[str, int]:
+  """Fail ambiguous manual Etcd tasks instead of replaying side effects."""
+  now = utc_now()
+  start_cutoff = now - timedelta(
+    seconds=max(int(settings.CELERY_OPERATION_START_TIMEOUT_SECONDS), 30),
+  )
+  running_cutoff = now - timedelta(
+    seconds=max(
+      int(settings.CELERY_OPERATION_RUNNING_TIMEOUT_SECONDS),
+      int(settings.CELERY_OPERATION_START_TIMEOUT_SECONDS),
+    ),
+  )
+  rows = await EtcdOperationTask.get_motor_collection().find({
+    "status": {"$in": ["queued", "running"]},
+    "origin_region": {"$in": ["", _local_region()]},
+    "$or": [
+      {
+        "status": "queued",
+        "$or": [
+          {"dispatched_at": {"$lte": start_cutoff}},
+          {"dispatched_at": None, "created_at": {"$lte": start_cutoff}},
+        ],
+      },
+      {"status": "running", "started_at": {"$lte": running_cutoff}},
+    ],
+  }).to_list(length=500)
+  result = {"queued_timeout": 0, "running_timeout": 0}
+  for raw in rows:
+    task = EtcdOperationTask.model_validate(raw)
+    if task.status == "queued":
+      reason = "任务已派发但未由本区 Worker 在超时内确认执行"
+      result["queued_timeout"] += 1
+    else:
+      reason = "任务运行超时，Etcd 外部操作状态未知，需要人工复核"
+      result["running_timeout"] += 1
+    task.status = "failed"
+    task.message = reason
+    task.error = reason
+    task.result = {
+      **dict(task.result or {}),
+      "recovery_required": True,
+      "recovery_reason": reason,
+      "recovered_at": now,
+    }
+    task.finished_at = now
+    await task.save()
+    metrics.incr("etcd_operation_watchdog_failures_total")
+  return result
 
 
 async def get_task(task_id: str) -> schema.EtcdTaskResponse | None:

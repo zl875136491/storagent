@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from pymongo import ReturnDocument
 
 from src.configs.configs import settings
 from src.core import audit, metrics as metrics_mod, minio_op
@@ -22,8 +24,20 @@ _DURATION_RE = re.compile(r"^(?:[0-9]+(?:ms|s|m|h|d|w))+$")
 _background_tasks: set[asyncio.Task] = set()
 
 
+def _local_region() -> str:
+  return str(settings.REGION).strip().lower()
+
+
 class StorageOperationLockBusy(RuntimeError):
   pass
+
+
+class StorageOperationNotFoundError(RuntimeError):
+  """The consuming worker cannot find the operation in its local MongoDB."""
+
+
+class StorageOperationRegionMismatchError(RuntimeError):
+  """The persisted operation does not belong to the executing Region."""
 
 
 @asynccontextmanager
@@ -151,6 +165,10 @@ def _operation_dict(operation: StorageOperation | None) -> dict[str, Any] | None
     "actor": operation.actor,
     "message": operation.message,
     "result": operation.result,
+    "origin_region": str(getattr(operation, "origin_region", "") or ""),
+    "celery_task_id": str(getattr(operation, "celery_task_id", "") or ""),
+    "dispatch_attempts": max(int(getattr(operation, "dispatch_attempts", 0) or 0), 0),
+    "dispatched_at": getattr(operation, "dispatched_at", None),
     "created_at": operation.created_at,
     "started_at": operation.started_at,
     "finished_at": operation.finished_at,
@@ -347,10 +365,10 @@ def parse_cluster_admin_info(
   }
 
 
-async def get_cluster_health_overview() -> dict[str, Any]:
+async def get_cluster_health_overview(*, max_concurrency: int | None = None) -> dict[str, Any]:
   checked_at = utc_now()
   servers = await storage_crud.read_minio_server_list()
-  semaphore = asyncio.Semaphore(5)
+  semaphore = asyncio.Semaphore(max(int(max_concurrency or 5), 1))
 
   async def inspect(server: Any) -> dict[str, Any]:
     async with semaphore:
@@ -813,7 +831,11 @@ def _aggregate_source_status_reasons(
   return reasons
 
 
-async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
+async def get_replication_overview(
+  bucket: str | None = None,
+  *,
+  max_concurrency: int | None = None,
+) -> dict[str, Any]:
   servers = await storage_crud.read_minio_server_list()
   server_names = sorted(server.name for server in servers)
   endpoints = {
@@ -831,7 +853,7 @@ async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
   else:
     bucket_names = sorted(app_names)
 
-  semaphore = asyncio.Semaphore(5)
+  semaphore = asyncio.Semaphore(max(int(max_concurrency or 5), 1))
 
   async def inspect(bucket_name: str, source: str) -> dict[str, Any]:
     async with semaphore:
@@ -880,15 +902,16 @@ async def get_replication_overview(bucket: str | None = None) -> dict[str, Any]:
       resync_status_known=resync_success,
     )
 
-  tasks = {
-    (bucket_name, source): asyncio.create_task(inspect(bucket_name, source))
-    for bucket_name in bucket_names
-    for source in server_names
-  }
   buckets: list[dict[str, Any]] = []
   all_sources: list[dict[str, Any]] = []
   for bucket_name in bucket_names:
-    sources = [await tasks[(bucket_name, source)] for source in server_names]
+    # Do not create one asyncio Task for every bucket/source pair up front.
+    # Large installations can have thousands of applications; processing one
+    # bucket row at a time keeps scheduler memory and MinIO control pressure
+    # bounded by the configured semaphore and the number of Regions.
+    sources = list(await asyncio.gather(*(
+      inspect(bucket_name, source) for source in server_names
+    )))
     all_sources.extend(sources)
     bucket_status = _worst_replication_status([item["status"] for item in sources])
     buckets.append({
@@ -1117,8 +1140,47 @@ async def _read_authoritative_application_entries() -> dict[str, dict[str, Any]]
   }
 
 
-# Compatibility alias for an older console route.
-get_orphan_bucket_overview = get_unmanaged_bucket_overview
+async def get_orphan_bucket_overview() -> dict[str, Any]:
+  """Serialize the modern inventory using the legacy orphan-bucket contract.
+
+  The old route had no mutation entry points, so retaining its vocabulary is
+  safe and avoids breaking cached console bundles. Buckets whose authoritative
+  ownership cannot be verified are surfaced as legacy ``orphan`` rows; the
+  modern route remains the only route that exposes their guarded disposition.
+  """
+  overview = await get_unmanaged_bucket_overview()
+  rows = []
+  for item in overview.get("buckets") or []:
+    kind = str(item.get("kind") or "unmanaged")
+    if kind == "unmanaged" or kind == "needs_review":
+      legacy_kind = "orphan"
+    elif kind == "disabled_application":
+      legacy_kind = "disabled_application"
+    else:
+      legacy_kind = "system"
+    missing = set(str(value) for value in item.get("missing_servers") or [] if value)
+    missing.update(str(value) for value in item.get("unreachable_servers") or [] if value)
+    rows.append({
+      "name": str(item.get("name") or ""),
+      "kind": legacy_kind,
+      "app_name": str(item.get("app_name") or ""),
+      "app_shown_name": str(item.get("app_shown_name") or ""),
+      "servers": list(item.get("servers") or []),
+      "missing_servers": sorted(missing),
+    })
+  rows.sort(key=lambda item: ({"orphan": 0, "disabled_application": 1, "system": 2}[item["kind"]], item["name"]))
+  return {
+    "generated_at": overview.get("generated_at") or utc_now(),
+    "servers": list(overview.get("servers") or []),
+    "summary": {
+      "orphan_count": sum(item["kind"] == "orphan" for item in rows),
+      "disabled_application_count": sum(item["kind"] == "disabled_application" for item in rows),
+      "system_bucket_count": sum(item["kind"] == "system" for item in rows),
+      "unavailable_server_count": int((overview.get("summary") or {}).get("unavailable_server_count") or 0),
+    },
+    "buckets": rows,
+    "errors": dict(overview.get("errors") or {}),
+  }
 
 
 async def _require_unmanaged_bucket(bucket: str) -> dict[str, Any]:
@@ -1285,8 +1347,8 @@ async def delete_unmanaged_bucket(
     "removed_servers": removed_servers,
   }
   await operation.save()
-  _enqueue_storage_operation(
-    str(operation.id),
+  await _enqueue_storage_operation(
+    operation,
     lambda: _run_unmanaged_bucket_delete_operation(operation),
   )
   return _operation_dict(operation) or {}
@@ -1411,7 +1473,7 @@ async def reconcile_bucket_replication(bucket: str, actor: str) -> dict[str, Any
   operation.message = "复制规则校准任务已进入队列"
   operation.result = {"scope": "full_mesh"}
   await operation.save()
-  _enqueue_storage_operation(str(operation.id), lambda: _run_replication_reconcile_operation(operation))
+  await _enqueue_storage_operation(operation, lambda: _run_replication_reconcile_operation(operation))
   return _replication_operation_response(operation)
 
 
@@ -1610,7 +1672,7 @@ async def start_replication_resync(
     "older_than": older_than or "",
   }
   await operation.save()
-  _enqueue_storage_operation(str(operation.id), lambda: _run_replication_resync_operation(operation))
+  await _enqueue_storage_operation(operation, lambda: _run_replication_resync_operation(operation))
   return _replication_operation_response(operation)
 
 
@@ -1667,15 +1729,31 @@ def _spawn(coro: Any) -> None:
   task.add_done_callback(_background_tasks.discard)
 
 
-def _enqueue_storage_operation(operation_id: str, fallback_factory) -> None:
-  """Send an operation to Celery, retaining a local fallback for outages."""
+async def _enqueue_storage_operation(operation: StorageOperation, fallback_factory) -> None:
+  """Persist dispatch metadata before publishing a Region-bound task.
+
+  A broker acknowledgement only proves message persistence, not business task
+  execution. The watchdog can therefore distinguish a queued operation from a
+  worker that actually moved it to ``running``.
+  """
+  operation.origin_region = str(getattr(operation, "origin_region", "") or _local_region()).strip().lower()
+  operation.dispatched_at = utc_now()
+  operation.dispatch_attempts = max(int(getattr(operation, "dispatch_attempts", 0) or 0), 0) + 1
+  await operation.save()
   try:
     from src.core.celery_client import dispatch_task
-    task_id = dispatch_task("storagent.storage.execute_operation", operation_id)
+    task_id = dispatch_task(
+      "storagent.storage.execute_operation",
+      str(operation.id),
+      origin_region=operation.origin_region,
+    )
     if task_id is None:
       _spawn(fallback_factory())
+      return
+    operation.celery_task_id = task_id
+    await operation.save()
   except Exception as error:
-    logger.warning("Celery 任务派发失败，回退到本地执行 operation={}: {}", operation_id, error)
+    logger.warning("Celery 任务派发失败，回退到本地执行 operation={}: {}", operation.id, error)
     _spawn(fallback_factory())
 
 
@@ -1812,11 +1890,64 @@ async def _run_unmanaged_bucket_delete_operation(operation: StorageOperation) ->
     )
 
 
-async def execute_storage_operation(operation_id: str) -> None:
+async def execute_storage_operation(
+  operation_id: str,
+  *,
+  origin_region: str | None = None,
+) -> dict[str, Any]:
   """Worker entry point for one persisted storage operation."""
   operation = await StorageOperation.get(operation_id)
   if operation is None:
-    return
+    raise StorageOperationNotFoundError(
+      f"本区 MongoDB 未找到存储运维任务: {operation_id}",
+    )
+  expected_region = str(origin_region or operation.origin_region or _local_region()).strip().lower()
+  local_region = _local_region()
+  if expected_region != local_region:
+    operation.status = "failed"
+    operation.message = (
+      f"任务区域不匹配，拒绝执行: origin={expected_region} worker={local_region}"
+    )
+    operation.finished_at = utc_now()
+    operation.result = {**dict(operation.result or {}), "recovery_required": True}
+    await operation.save()
+    raise StorageOperationRegionMismatchError(operation.message)
+  if not operation.origin_region:
+    operation.origin_region = local_region
+    await operation.save()
+  if operation.status in {"succeeded", "failed"}:
+    return {"status": "skipped", "reason": "terminal_operation"}
+  if operation.status == "running":
+    return {"status": "skipped", "reason": "already_running"}
+
+  # Claim the work atomically. A stale-task watchdog can mark a queued row as
+  # failed while the worker is starting; a read-then-save transition would let
+  # the worker overwrite that safety decision and execute an ambiguous action.
+  raw = await StorageOperation.get_motor_collection().find_one_and_update(
+    {
+      "_id": operation.id,
+      "status": "queued",
+      "origin_region": {"$in": ["", local_region]},
+    },
+    {
+      "$set": {
+        "status": "running",
+        "started_at": utc_now(),
+      },
+    },
+    return_document=ReturnDocument.AFTER,
+  )
+  if raw is None:
+    latest = await StorageOperation.get(operation_id)
+    if latest is None:
+      raise StorageOperationNotFoundError(
+        f"本区 Mongo 未找到存储运维任务: {operation_id}",
+      )
+    return {
+      "status": "skipped",
+      "reason": "already_running" if latest.status == "running" else "terminal_operation",
+    }
+  operation = StorageOperation.model_validate(raw)
   if operation.kind == "replication_reconcile":
     await _run_replication_reconcile_operation(operation)
   elif operation.kind == "replication_resync":
@@ -1827,6 +1958,65 @@ async def execute_storage_operation(operation_id: str) -> None:
     await _run_unmanaged_bucket_delete_operation(operation)
   else:
     raise ValueError(f"不支持的存储运维任务类型: {operation.kind}")
+  return {"status": operation.status, "operation_id": str(operation.id)}
+
+
+async def recover_stale_storage_operations_once() -> dict[str, int]:
+  """Surface unacknowledged and ambiguous operations instead of replaying them.
+
+  Replaying a MinIO command after a worker crash can duplicate a resync or
+  remove an object after the first attempt already succeeded. A terminal
+  ``failed`` state with ``recovery_required`` is safer and lets the operator
+  retry only after inspecting the native MinIO state.
+  """
+  now = utc_now()
+  start_cutoff = now - timedelta(
+    seconds=max(int(settings.CELERY_OPERATION_START_TIMEOUT_SECONDS), 30),
+  )
+  running_cutoff = now - timedelta(
+    seconds=max(
+      int(settings.CELERY_OPERATION_RUNNING_TIMEOUT_SECONDS),
+      int(settings.CELERY_OPERATION_START_TIMEOUT_SECONDS),
+    ),
+  )
+  raw_rows = await StorageOperation.get_motor_collection().find({
+    "status": {"$in": ["queued", "running"]},
+    "origin_region": {"$in": ["", _local_region()]},
+    "$or": [
+      {
+        "status": "queued",
+        "$or": [
+          {"dispatched_at": {"$lte": start_cutoff}},
+          {"dispatched_at": None, "created_at": {"$lte": start_cutoff}},
+        ],
+      },
+      {
+        "status": "running",
+        "started_at": {"$lte": running_cutoff},
+      },
+    ],
+  }).to_list(length=500)
+  result = {"queued_timeout": 0, "running_timeout": 0}
+  for raw in raw_rows:
+    operation = StorageOperation.model_validate(raw)
+    if operation.status == "queued":
+      reason = "任务已派发但未由本区 Worker 在超时内确认执行"
+      result["queued_timeout"] += 1
+    else:
+      reason = "任务运行超时，外部副作用状态未知，需要人工复核"
+      result["running_timeout"] += 1
+    operation.status = "failed"
+    operation.finished_at = now
+    operation.message = reason
+    operation.result = {
+      **dict(operation.result or {}),
+      "recovery_required": True,
+      "recovery_reason": reason,
+      "recovered_at": now,
+    }
+    await operation.save()
+    metrics_mod.incr("storage_operation_watchdog_failures_total")
+  return result
 
 
 async def get_storage_operation(operation_id: str) -> dict[str, Any]:
@@ -1929,7 +2119,7 @@ async def start_cluster_heal(server_name: str, actor: str) -> dict[str, Any]:
   )
   operation.message = "自愈巡检任务已进入队列"
   await operation.save()
-  _enqueue_storage_operation(str(operation.id), lambda: _run_heal_operation(operation))
+  await _enqueue_storage_operation(operation, lambda: _run_heal_operation(operation))
   return _operation_dict(operation) or {}
 
 
@@ -1940,7 +2130,7 @@ async def list_storage_operations(limit: int = 20) -> dict[str, Any]:
 
 async def monitor_cluster_health_task(single_pass: bool = False) -> None:
   """Authority-only loop that records native MinIO healing when drives need it."""
-  if settings.REGION != settings.SYNC_AUTHORITY_REGION:
+  if _local_region() != str(settings.SYNC_AUTHORITY_REGION).strip().lower():
     logger.info("非权威区域不执行 MinIO 自动自愈监控")
     return
   if not settings.AUTO_HEAL_ENABLED:

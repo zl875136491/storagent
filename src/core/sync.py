@@ -969,7 +969,7 @@ async def build_topology_layout_snapshot() -> dict:
 
 async def bootstrap_topology_layout(client=None) -> bool:
   """Initialize topology layout exactly once, and only from the authority region."""
-  if settings.REGION != settings.SYNC_AUTHORITY_REGION:
+  if str(settings.REGION).strip().lower() != str(settings.SYNC_AUTHORITY_REGION).strip().lower():
     return False
 
   from src.core import etcd_op
@@ -1536,7 +1536,7 @@ async def ensure_bucket_quotas(
 
 async def reconcile_replication_policies_task(single_pass: bool = False):
   """Authority-region loop that repairs missing rules for enabled apps."""
-  if settings.REGION != settings.SYNC_AUTHORITY_REGION:
+  if str(settings.REGION).strip().lower() != str(settings.SYNC_AUTHORITY_REGION).strip().lower():
     logger.info("非权威区域不执行复制策略校准")
     return
 
