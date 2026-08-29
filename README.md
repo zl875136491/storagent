@@ -195,6 +195,21 @@ MinIO 节点启用 Site Replication；MinIO 不允许两种复制模式混用。
 | POST | `/admin/test` | 管理员测试上游模型连接 |
 | POST | `/openai/v1/chat/completions` | 已登录用户的 PageAgent 专用代理 |
 
+## 三仓库关系
+
+Storagent 由三个独立仓库协同交付，完整的调用与任务闭环为：`Frontend -> Backend -> Celery Worker -> Backend -> Frontend`。
+
+| 仓库 | 职责 | 与其他仓库的关系 |
+| --- | --- | --- |
+| Backend（本仓库） | 提供 API、认证与业务编排，并受理异步运维任务。 | 接收 Frontend 的管理和查询请求；向 Celery Worker 投递区域任务，并向 Frontend 提供任务状态和结果。 |
+| Frontend | 提供浏览器中的管理控制台。 | 通过 Backend 的版本化 API 发起操作、查询数据并展示异步任务进度。 |
+| Celery Worker | 执行归档、配额聚合、容量快照和存储运维等后台任务。 | 消费 Backend 投递的本区域任务，并将执行状态和结果持久化，供 Backend 与 Frontend 查询。 |
+
+相关仓库：
+
+- [Storagent Frontend](https://github.com/zl875136491/storagent-frontend)
+- [Storagent Celery Worker](https://github.com/zl875136491/storagent-celery)
+
 ## 项目结构
 
 ```
