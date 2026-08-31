@@ -693,6 +693,81 @@ async def refresh_application_quota_usage(
   return usage
 
 
+async def refresh_application_quota_aggregates_once() -> dict[str, int | str]:
+  """Refresh Etcd logical quota aggregates outside request paths.
+
+  Only the configured authority performs the expensive cross-region scan. The
+  resulting observation is merged into Etcd under the same application lock
+  used by multipart admission, so a scan can never overwrite newer logical
+  upload/delete events with a lower value.
+  """
+  if str(settings.REGION).strip().lower() != str(
+    settings.SYNC_AUTHORITY_REGION,
+  ).strip().lower():
+    return {
+      "status": "skipped",
+      "processed": 0,
+      "succeeded": 0,
+      "failed": 0,
+      "skipped": 0,
+      "deferred": 0,
+    }
+
+  from src.modules.files import quota as upload_quota
+
+  batch_size = min(
+    max(int(settings.APPLICATION_QUOTA_AGGREGATE_BATCH_SIZE), 1),
+    1000,
+  )
+  enabled_count, selected_applications = await asyncio.gather(
+    public_crud.count_enabled_applications(),
+    public_crud.read_quota_refresh_candidates(batch_size),
+  )
+  result: dict[str, int | str] = {
+    "status": "completed",
+    "processed": 0,
+    "succeeded": 0,
+    "failed": 0,
+    "skipped": 0,
+    "deferred": max(int(enabled_count) - len(selected_applications), 0),
+  }
+  for application in selected_applications:
+    result["processed"] = int(result["processed"]) + 1
+    try:
+      usage = await refresh_application_quota_usage(
+        application,
+        force=True,
+        require_all=True,
+      )
+      await upload_quota.reconcile_usage_aggregate(application.name, usage)
+      result["succeeded"] = int(result["succeeded"]) + 1
+    except Exception as error:
+      result["failed"] = int(result["failed"]) + 1
+      logger.warning(
+        "应用配额聚合刷新失败 app=%s error=%s",
+        application.name,
+        type(error).__name__,
+      )
+    finally:
+      # Failed attempts must advance the cursor too, otherwise one broken
+      # application can starve all later candidates in a bounded batch.
+      application.quota_usage_attempted_at = utc_now()
+      try:
+        await application.save()
+      except Exception as error:
+        logger.warning(
+          "应用配额刷新尝试时间写入失败 app=%s error=%s",
+          application.name,
+          type(error).__name__,
+        )
+  if result["deferred"]:
+    logger.info(
+      "应用配额聚合本轮按批次限流，等待后续周期 app_count=%s",
+      result["deferred"],
+    )
+  return result
+
+
 async def _application_response(
   application: Application,
   *,

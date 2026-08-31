@@ -190,6 +190,26 @@ async def multipart_init(
 ) -> files_schema.MultipartInitResponse:
   app_name = app_context["app_name"]
   api_key_id = str(app_context.get("api_key_id") or "")
+
+  # Admission reads the replicated logical counter only. A full
+  # ``mc du --recursive --versions`` scan belongs to the authority Celery
+  # reconciliation task and must never block this request.
+  try:
+    usage_aggregate = await files_quota.get_usage_aggregate(app_name)
+  except CustomException:
+    raise
+  except Exception as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      f"读取应用配额聚合失败，上传已安全拒绝: {error}",
+    ) from error
+  if not usage_aggregate.get("admission_ready"):
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "应用配额聚合尚未初始化，请稍后重试",
+    )
+  usage_bytes = max(int(usage_aggregate.get("usage_bytes") or 0), 0)
+
   source_server, client = await _get_minio_client_with_server()
   object_key = gen_object_key()
 
@@ -211,20 +231,6 @@ async def multipart_init(
       block_percent = 100
     return max(int(quota_bytes * block_percent / 100), 1)
 
-  async def usage_loader() -> int:
-    _quota_bytes, usage_bytes = await public_service.get_application_quota_usage(
-      app_name,
-      force=True,
-      require_all=True,
-    )
-    return usage_bytes
-
-  quota_bytes, usage_bytes = await public_service.get_application_quota_usage(
-    app_name,
-    force=True,
-    require_all=True,
-  )
-
   reservation = await files_quota.reserve_upload(
     app_name=app_name,
     api_key_id=api_key_id,
@@ -233,7 +239,7 @@ async def multipart_init(
     declared_size_bytes=size_bytes,
     content_type=content_type,
     quota_loader=quota_loader,
-    usage_loader=usage_loader,
+    usage_loader=None,
   )
   headers = {"Content-Type": content_type}
 

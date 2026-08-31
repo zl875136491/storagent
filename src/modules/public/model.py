@@ -37,6 +37,9 @@ class Application(Document):
   # Usage is a node-local cache. The quota itself is synchronized through Etcd.
   quota_usage_bytes: int = Field(default=0, ge=0)
   quota_usage_updated_at: datetime | None = Field(default=None)
+  # Track attempts separately so one application with a broken MinIO region
+  # cannot monopolize every bounded background refresh batch.
+  quota_usage_attempted_at: datetime | None = Field(default=None)
   # Browser Origins allowed to call the data plane directly from this app.
   domains: List[str] = Field(default_factory=list)
   # regions: List[Link[Region]] = Field(default=[])
@@ -56,6 +59,7 @@ class Application(Document):
     indexes = [
       IndexModel(["name"], unique=True),
       IndexModel(["shown_name"], unique=True),
+      IndexModel([("enabled", 1), ("quota_usage_attempted_at", 1), ("name", 1)]),
     ]
 
 class APIKey(Document):

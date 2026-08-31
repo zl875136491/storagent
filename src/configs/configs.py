@@ -129,6 +129,10 @@ class Settings(BaseSettings):
   MINIO_OPERATION_TIMEOUT_SECONDS: float = 20.0
   APPLICATION_QUOTA_USAGE_CACHE_SECONDS: float = 60.0
   APPLICATION_QUOTA_USAGE_MAX_CONCURRENCY: int = 4
+  # The authority Celery worker periodically seeds/reconciles the Etcd
+  # logical quota aggregate. Request-time admission never performs this scan.
+  APPLICATION_QUOTA_AGGREGATE_INTERVAL_SECONDS: int = 3600
+  APPLICATION_QUOTA_AGGREGATE_BATCH_SIZE: int = 50
   APPLICATION_QUOTA_RESERVATION_TTL_SECONDS: int = 86400
   APPLICATION_QUOTA_MAX_ACTIVE_RESERVATIONS: int = 1000
   APPLICATION_UPLOAD_MAX_PART_BYTES: int = 64 * 1024 ** 2
