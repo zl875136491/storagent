@@ -831,14 +831,48 @@ async def sync_api_keys_to_mongo(api_keys_data: dict):
       logger.warning(f"同步 API Key 失败: {e}")
 
 
-async def sync_region_to_mongo(region_data: dict):
+async def _get_or_create_region_from_control_plane(
+  region_name: str,
+  shown_name: str,
+):
+  """Project an Etcd region idempotently when multiple nodes start together."""
+  from pymongo.errors import DuplicateKeyError
+  from src.core.exception import CustomException, ErrorDesc
   from src.modules.public import crud as public_crud
+
+  region_obj = await public_crud.read_region_by_name(region_name)
+  if region_obj is not None:
+    return region_obj, False
+
+  try:
+    region_obj = await public_crud.create_region(region_name, shown_name)
+  except DuplicateKeyError:
+    region_obj = await public_crud.read_region_by_name(region_name)
+    if region_obj is None:
+      raise
+    return region_obj, False
+  except CustomException as error:
+    # ``create_region`` can observe the winner after its own pre-read but
+    # before the insert. Re-read only the expected uniqueness conflict.
+    if error.error_desc is not ErrorDesc.NAME_EXISTED:
+      raise
+    region_obj = await public_crud.read_region_by_name(region_name)
+    if region_obj is None:
+      raise
+    return region_obj, False
+
+  return region_obj, True
+
+
+async def sync_region_to_mongo(region_data: dict):
   from src.modules.public.model import Region
 
   for region_value, region_name in region_data.items():
-    region_obj = await public_crud.read_region_by_name(region_value)
-    if not region_obj:
-      await public_crud.create_region(region_value, region_name)
+    region_obj, created = await _get_or_create_region_from_control_plane(
+      region_value,
+      region_name,
+    )
+    if created:
       logger.info(f"Etcd sync: 创建 Region {region_value}")
     elif region_obj.shown_name != region_name:
       region_obj.shown_name = region_name
@@ -856,7 +890,7 @@ async def sync_region_to_mongo(region_data: dict):
 
 
 async def sync_servers_to_mongo(servers_data: dict) -> list[str]:
-  from src.modules.public import crud as public_crud
+  from pymongo.errors import DuplicateKeyError
   from src.modules.storage import crud as storage_crud
 
   new_servers: list[str] = []
@@ -870,27 +904,37 @@ async def sync_servers_to_mongo(servers_data: dict) -> list[str]:
       "host", "server_port", "minio_port", "access_key", "secret_key", "replicate_weight"
     )):
       continue
-    region_obj = await public_crud.read_region_by_name(server_region_name)
-    if not region_obj:
-      region_obj = await public_crud.create_region(server_region_name, server_region_name)
+    region_obj, _created_region = await _get_or_create_region_from_control_plane(
+      server_region_name,
+      server_region_name,
+    )
     server_obj = await storage_crud.read_minio_server_by_region(region_obj)
     host = server_data.get("host", settings.SERVER_HOST)
     domain = str(server_data.get("domain", "") or settings.PUBLIC_DOMAIN or "").strip().lower()
     if not server_obj:
-      await storage_crud.create_minio_server(
-        region=region_obj,
-        name=server_region_name,
-        domain=domain,
-        host=host,
-        server_port=server_data["server_port"],
-        minio_port=server_data["minio_port"],
-        access_key=server_data["access_key"],
-        secret_key=server_data["secret_key"],
-        replicate_weight=server_data["replicate_weight"],
-      )
-      new_servers.append(server_region_name)
-      logger.info(f"Etcd sync: 创建 MinIO 服务器 {server_region_name}")
-    else:
+      try:
+        await storage_crud.create_minio_server(
+          region=region_obj,
+          name=server_region_name,
+          domain=domain,
+          host=host,
+          server_port=server_data["server_port"],
+          minio_port=server_data["minio_port"],
+          access_key=server_data["access_key"],
+          secret_key=server_data["secret_key"],
+          replicate_weight=server_data["replicate_weight"],
+        )
+      except DuplicateKeyError:
+        # A concurrent backend may have projected the same region first.
+        server_obj = await storage_crud.read_minio_server_by_region(region_obj)
+        if server_obj is None:
+          raise
+      else:
+        new_servers.append(server_region_name)
+        logger.info(f"Etcd sync: 创建 MinIO 服务器 {server_region_name}")
+        continue
+
+    if server_obj:
       await storage_crud.update_minio_server(
         minio_server=server_obj,
         domain=domain,
@@ -1241,6 +1285,24 @@ async def setup_mc_aliases(servers_data: dict):
     )
     if not success:
       logger.warning(f"mc alias 设置失败 {server_region_name}: {res}")
+
+
+async def ensure_mc_aliases_from_etcd() -> int:
+  """Refresh local ``mc`` aliases from the shared server registry on demand."""
+  from src.core import etcd_op
+
+  client = await etcd_op.get_etcd_client()
+  try:
+    servers_data = await etcd_op.pull_from_etcd_by_key(
+      ETCD_KEY_SERVERS,
+      client=client,
+    )
+    if not isinstance(servers_data, dict) or not servers_data:
+      return 0
+    await setup_mc_aliases(servers_data)
+    return len(servers_data)
+  finally:
+    await client.close()
 
 
 class ReplicationPolicyError(RuntimeError):

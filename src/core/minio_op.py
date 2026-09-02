@@ -3,13 +3,64 @@ import asyncio
 import re
 import shlex
 import subprocess
-from time import perf_counter
+from time import monotonic, perf_counter
 from minio import Minio
 from typing import Any, List
 
 from src.core.exception import CustomException, ErrorDesc
 from src.utils.helpers import build_file_tree
 from src.modules.public.crud import create_shell_command_log
+
+
+_MC_ALIAS_REFRESH_INTERVAL_SECONDS = 30.0
+_MC_ALIAS_RETRY_INTERVAL_SECONDS = 5.0
+_mc_alias_refresh_deadline = 0.0
+
+
+async def _refresh_mc_aliases_if_due(*, force: bool = False) -> bool:
+  """Keep per-process ``mc`` aliases aligned with the shared server registry."""
+  global _mc_alias_refresh_deadline
+
+  now = monotonic()
+  if not force and now < _mc_alias_refresh_deadline:
+    return True
+
+  try:
+    from src.core import sync as sync_module
+
+    await sync_module.ensure_mc_aliases_from_etcd()
+  except Exception:
+    # Keep a usable cached alias available when Etcd is temporarily unavailable.
+    _mc_alias_refresh_deadline = monotonic() + _MC_ALIAS_RETRY_INTERVAL_SECONDS
+    return False
+
+  _mc_alias_refresh_deadline = monotonic() + _MC_ALIAS_REFRESH_INTERVAL_SECONDS
+  return True
+
+
+async def _run_shell_command(cmd: str) -> tuple[bool, str, str]:
+  try:
+    result = await asyncio.to_thread(
+      subprocess.run,
+      cmd,
+      shell=True,
+      check=False,
+      capture_output=True,
+      text=True,
+    )
+  except Exception as error:
+    return False, "", str(error)
+  return result.returncode == 0, result.stdout, result.stderr
+
+
+def _looks_like_missing_mc_alias(output: str) -> bool:
+  lowered = output.lower()
+  return (
+    "/app/" in lowered
+    or "alias does not exist" in lowered
+    or "unable to initialize new alias" in lowered
+  )
+
 
 async def _run_cmd(cmd):
   """
@@ -24,20 +75,27 @@ async def _run_cmd(cmd):
     False: 执行失败
     str: 执行结果
   """
-  try:
-    result = await asyncio.to_thread(
-      subprocess.run,
-      cmd,
-      shell=True,
-      check=True,
-      capture_output=True,
-      text=True,
-    )
-    await create_shell_command_log(cmd, result.stdout, result.stderr)
-    return True, result.stdout
-  except subprocess.CalledProcessError as e:
-    await create_shell_command_log(cmd, e.stdout or "", e.stderr or "")
-    return False, e.stderr or e.stdout or str(e)
+  stripped = cmd.lstrip()
+  is_mc_command = stripped.startswith("mc ")
+  is_alias_command = stripped.startswith("mc alias ")
+  if is_mc_command and not is_alias_command:
+    await _refresh_mc_aliases_if_due()
+
+  success, stdout, stderr = await _run_shell_command(cmd)
+  output = f"{stderr}\n{stdout}"
+  if (
+    not success
+    and is_mc_command
+    and not is_alias_command
+    and _looks_like_missing_mc_alias(output)
+  ):
+    await _refresh_mc_aliases_if_due(force=True)
+    success, stdout, stderr = await _run_shell_command(cmd)
+
+  await create_shell_command_log(cmd, stdout, stderr)
+  if success:
+    return True, stdout
+  return False, stderr or stdout or "MinIO 命令执行失败"
 
 
 def _mc_error_message(items: list[dict[str, Any]], fallback: str) -> str:

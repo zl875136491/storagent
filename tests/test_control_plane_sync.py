@@ -1,9 +1,11 @@
 """Cross-region identity and topology control-plane synchronization."""
+import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from pymongo.errors import DuplicateKeyError
 
 from src.core import etcd_op
 from src.core import sync as sync_module
@@ -49,6 +51,83 @@ def test_authority_role_definition_replaces_older_same_origin_entry(monkeypatch)
     "origin_region": "beijing",
   }
   assert sync_module._prefer_authority_entry(current, upgraded) is True
+
+
+@pytest.mark.asyncio
+async def test_region_projection_recovers_duplicate_insert(monkeypatch):
+  store = {}
+  initial_reads = 0
+  release_initial_reads = asyncio.Event()
+
+  async def read_region(name):
+    nonlocal initial_reads
+    if name in store:
+      return store[name]
+    initial_reads += 1
+    if initial_reads <= 2:
+      if initial_reads == 2:
+        release_initial_reads.set()
+      await asyncio.wait_for(release_initial_reads.wait(), timeout=1)
+      return None
+    return store.get(name)
+
+  async def create_region(name, shown_name):
+    if name in store:
+      raise DuplicateKeyError("duplicate region name")
+    region = SimpleNamespace(name=name, shown_name=shown_name)
+    store[name] = region
+    return region
+
+  monkeypatch.setattr(public_crud, "read_region_by_name", read_region)
+  monkeypatch.setattr(public_crud, "create_region", create_region)
+
+  results = await asyncio.gather(
+    sync_module._get_or_create_region_from_control_plane("beijing", "Beijing"),
+    sync_module._get_or_create_region_from_control_plane("beijing", "Beijing"),
+  )
+
+  assert set(store) == {"beijing"}
+  assert results[0][0] is store["beijing"]
+  assert results[1][0] is store["beijing"]
+  assert sum(created for _region, created in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_alias_refresh_reads_shared_server_registry(monkeypatch):
+  calls = []
+
+  class FakeClient:
+    async def close(self):
+      calls.append("close")
+
+  client = FakeClient()
+  servers = {
+    "beijing": {"host": "minio-a"},
+    "shenzhen": {"host": "minio-b"},
+  }
+
+  async def get_client():
+    calls.append("connect")
+    return client
+
+  async def pull(key, *, client):
+    calls.append(("pull", key, client))
+    return servers
+
+  async def setup_aliases(data):
+    calls.append(("aliases", data))
+
+  monkeypatch.setattr(etcd_op, "get_etcd_client", get_client)
+  monkeypatch.setattr(etcd_op, "pull_from_etcd_by_key", pull)
+  monkeypatch.setattr(sync_module, "setup_mc_aliases", setup_aliases)
+
+  assert await sync_module.ensure_mc_aliases_from_etcd() == 2
+  assert calls == [
+    "connect",
+    ("pull", sync_module.ETCD_KEY_SERVERS, client),
+    ("aliases", servers),
+    "close",
+  ]
 
 
 def test_user_entry_encrypts_password_hash_and_uses_role_names(monkeypatch):
