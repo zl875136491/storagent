@@ -7,6 +7,7 @@ from typing import Iterable
 
 from fastapi import Request
 
+from src.configs.configs import settings
 from src.core.exception import CustomException, ErrorDesc
 from src.modules.files import crud, quota
 from src.modules.files import service as v1_service
