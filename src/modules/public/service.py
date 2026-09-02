@@ -736,7 +736,9 @@ async def refresh_application_quota_aggregates_once() -> dict[str, int | str]:
       await upload_quota.reconcile_usage_aggregate(
         application.name,
         usage,
-        quota_bytes=int(application.quota_bytes),
+        quota_bytes=int(
+          getattr(application, "quota_bytes", DEFAULT_APPLICATION_QUOTA_BYTES),
+        ),
       )
       result["succeeded"] = int(result["succeeded"]) + 1
     except Exception as error:

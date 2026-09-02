@@ -270,7 +270,7 @@ async def test_quota_aggregate_refresh_seeds_enabled_apps_on_authority(monkeypat
 
   applications = [Application(name="uno", enabled=True, quota_usage_attempted_at=None)]
   refreshed: list[tuple[str, bool, bool]] = []
-  reconciled: list[tuple[str, int]] = []
+  reconciled: list[tuple[str, int, int]] = []
 
   async def count_enabled():
     return 1
@@ -283,8 +283,8 @@ async def test_quota_aggregate_refresh_seeds_enabled_apps_on_authority(monkeypat
     refreshed.append((application.name, force, require_all))
     return 957
 
-  async def reconcile(app_name, observed_usage):
-    reconciled.append((app_name, observed_usage))
+  async def reconcile(app_name, observed_usage, *, quota_bytes):
+    reconciled.append((app_name, observed_usage, quota_bytes))
     return {"initialized": True}
 
   monkeypatch.setattr(public_service.settings, "REGION", "authority")
@@ -305,7 +305,7 @@ async def test_quota_aggregate_refresh_seeds_enabled_apps_on_authority(monkeypat
     "deferred": 0,
   }
   assert refreshed == [("uno", True, True)]
-  assert reconciled == [("uno", 957)]
+  assert reconciled == [("uno", 957, 100 * 1024 ** 3)]
 
 
 @pytest.mark.asyncio
