@@ -733,7 +733,11 @@ async def refresh_application_quota_aggregates_once() -> dict[str, int | str]:
         force=True,
         require_all=True,
       )
-      await upload_quota.reconcile_usage_aggregate(application.name, usage)
+      await upload_quota.reconcile_usage_aggregate(
+        application.name,
+        usage,
+        quota_bytes=int(application.quota_bytes),
+      )
       result["succeeded"] = int(result["succeeded"]) + 1
     except Exception as error:
       result["failed"] = int(result["failed"]) + 1
@@ -1084,6 +1088,13 @@ async def update_application_quota(
             quota_bytes,
           )
           authoritative_committed = True
+          # Keep the compact request-time admission document in lockstep with
+          # the authoritative quota. The helper is a no-op before the
+          # authority worker has migrated this application.
+          await upload_quota.set_admission_quota(
+            application_name,
+            quota_bytes,
+          )
           upload_quota.raise_if_quota_lock_lost()
         except BaseException as error:
           compensation_errors = []

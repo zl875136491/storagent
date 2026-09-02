@@ -17,7 +17,6 @@ from src.modules.files import schema as files_schema
 from src.modules.files import locate as files_locate
 from src.modules.files import quota as files_quota
 from src.modules.files import crud as files_crud
-from src.modules.public import service as public_service
 from src.modules.usage.service import record_transfer
 
 _READ_CHUNK = 1024 * 1024
@@ -32,7 +31,7 @@ async def _upload_quota_warning(
   declared_size_bytes: int,
 ) -> dict | None:
   """Best-effort alerting must never make a valid upload unavailable."""
-  try:
+  async def evaluate() -> dict | None:
     from src.modules.public import crud, quota_alert
     application = await crud.read_application_by_name(app_name)
     if application:
@@ -41,10 +40,50 @@ async def _upload_quota_warning(
         usage_bytes=usage_bytes,
         declared_size_bytes=declared_size_bytes,
       )
+
+  try:
+    timeout = max(float(settings.QUOTA_ALERT_REQUEST_TIMEOUT_SECONDS), 0.01)
+    return await asyncio.wait_for(evaluate(), timeout=timeout)
+  except TimeoutError:
+    from src.core import metrics as metrics_mod
+    metrics_mod.incr("multipart_init_quota_warning_timeouts_total")
+    from src.utils.logger import logger
+    logger.warning(
+      "上传前配额告警检查超时 app=%s timeout=%.3fs",
+      app_name,
+      timeout,
+    )
   except Exception as error:
     from src.utils.logger import logger
     logger.warning("上传前配额告警检查失败 app=%s: %s", app_name, error)
   return None
+
+
+async def _admission_block_percent() -> int:
+  """Read the global block policy within a strict request-time budget."""
+  try:
+    from src.modules.public import quota_alert
+    timeout = max(float(settings.QUOTA_ADMISSION_RULE_TIMEOUT_SECONDS), 0.01)
+    rule = await asyncio.wait_for(quota_alert.get_rule(), timeout=timeout)
+    block_percent = int(rule.block_percent)
+  except CollectionWasNotInitialized:
+    # Isolated upload-admission tests intentionally omit database setup.
+    return 100
+  except TimeoutError as error:
+    from src.core import metrics as metrics_mod
+    metrics_mod.incr("multipart_init_admission_policy_timeouts_total")
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      "全局配额阻断规则读取超时，上传已安全拒绝",
+    ) from error
+  except Exception as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      f"全局配额阻断规则读取失败，上传已安全拒绝: {error}",
+    ) from error
+  if not 1 <= block_percent <= 100:
+    raise CustomException(ErrorDesc.SYNC_FAILED, "全局配额阻断规则无效")
+  return block_percent
 
 
 def _upload_part_semaphore() -> asyncio.Semaphore:
@@ -175,106 +214,79 @@ async def multipart_init(
   app_name = app_context["app_name"]
   api_key_id = str(app_context.get("api_key_id") or "")
 
-  # Admission reads the replicated logical counter only. A full
-  # ``mc du --recursive --versions`` scan belongs to the authority Celery
-  # reconciliation task and must never block this request.
-  try:
-    usage_aggregate = await files_quota.get_usage_aggregate(app_name)
-  except CustomException:
-    raise
-  except Exception as error:
-    raise CustomException(
-      ErrorDesc.SYNC_FAILED,
-      f"读取应用配额聚合失败，上传已安全拒绝: {error}",
-    ) from error
-  if not usage_aggregate.get("admission_ready"):
-    raise CustomException(
-      ErrorDesc.SYNC_FAILED,
-      "应用配额聚合尚未初始化，请稍后重试",
-    )
-  usage_bytes = max(int(usage_aggregate.get("usage_bytes") or 0), 0)
-
-  source_server, client = await _get_minio_client_with_server()
+  # Request-time admission reads and CAS-writes only the compact Etcd state.
+  # The authority Celery task owns the expensive five-region MinIO scan and
+  # creates the compact state before this endpoint accepts traffic.
+  block_percent = await _admission_block_percent()
   object_key = gen_object_key()
-
-  async def quota_loader(quota_client) -> int:
-    quota_bytes = await public_service.get_application_quota_limit(
-      app_name,
+  source_server = str(settings.REGION)
+  async with files_quota.quota_request_client() as quota_client:
+    reservation = await files_quota.reserve_upload(
+      app_name=app_name,
+      api_key_id=api_key_id,
+      object_key=object_key,
+      source_server=source_server,
+      declared_size_bytes=size_bytes,
+      content_type=content_type,
+      block_percent=block_percent,
+      use_compact_admission=True,
       client=quota_client,
     )
-    # The global rule may intentionally reserve headroom below the physical
-    # application quota. It is evaluated under the same distributed quota lock
-    # as the reservation, so concurrent uploads cannot bypass the threshold.
-    from src.modules.public import quota_alert
     try:
-      rule = await quota_alert.get_rule()
-      block_percent = rule.block_percent
-    except CollectionWasNotInitialized:
-      # Isolated admission tests intentionally omit database initialization.
-      # Keep the historical full-quota admission limit in that context.
-      block_percent = 100
-    return max(int(quota_bytes * block_percent / 100), 1)
+      _resolved_source_server, client = await _get_minio_client_with_server()
+      headers = {"Content-Type": content_type}
 
-  reservation = await files_quota.reserve_upload(
-    app_name=app_name,
-    api_key_id=api_key_id,
-    object_key=object_key,
-    source_server=source_server,
-    declared_size_bytes=size_bytes,
-    content_type=content_type,
-    quota_loader=quota_loader,
-    usage_loader=None,
-  )
-  headers = {"Content-Type": content_type}
+      def _create():
+        return client._create_multipart_upload(app_name, object_key, headers)
 
-  def _create():
-    return client._create_multipart_upload(app_name, object_key, headers)
+      upload_id, cancellation = await _run_thread_to_completion(_create)
+    except BaseException as error:
+      await files_quota.cancel_reservation(reservation, client=quota_client)
+      if isinstance(error, asyncio.CancelledError):
+        raise
+      _raise_minio_write_error(error)
 
-  try:
-    upload_id, cancellation = await _run_thread_to_completion(_create)
-  except BaseException as error:
-    await files_quota.cancel_reservation(reservation)
-    if isinstance(error, asyncio.CancelledError):
+    if cancellation is not None:
+      try:
+        await asyncio.to_thread(
+          client._abort_multipart_upload,
+          app_name,
+          object_key,
+          upload_id,
+        )
+      finally:
+        await files_quota.cancel_reservation(reservation, client=quota_client)
+      raise cancellation
+
+    try:
+      await files_quota.activate_reservation(
+        reservation,
+        upload_id,
+        client=quota_client,
+      )
+    except BaseException:
+      try:
+        await asyncio.to_thread(
+          client._abort_multipart_upload,
+          app_name,
+          object_key,
+          upload_id,
+        )
+      except Exception:
+        pass
+      await files_quota.cancel_reservation(reservation, client=quota_client)
       raise
-    _raise_minio_write_error(error)
 
-  if cancellation is not None:
-    try:
-      await asyncio.to_thread(
-        client._abort_multipart_upload,
+    return files_schema.MultipartInitResponse(
+      upload_id=upload_id,
+      bucket=app_name,
+      object_key=object_key,
+      quota_warning=await _upload_quota_warning(
         app_name,
-        object_key,
-        upload_id,
-      )
-    finally:
-      await files_quota.cancel_reservation(reservation)
-    raise cancellation
-
-  try:
-    await files_quota.activate_reservation(reservation, upload_id)
-  except BaseException:
-    try:
-      await asyncio.to_thread(
-        client._abort_multipart_upload,
-        app_name,
-        object_key,
-        upload_id,
-      )
-    except Exception:
-      pass
-    await files_quota.cancel_reservation(reservation)
-    raise
-
-  return files_schema.MultipartInitResponse(
-    upload_id=upload_id,
-    bucket=app_name,
-    object_key=object_key,
-    quota_warning=await _upload_quota_warning(
-      app_name,
-      usage_bytes=usage_bytes,
-      declared_size_bytes=size_bytes,
-    ),
-  )
+        usage_bytes=reservation.admission_usage_bytes,
+        declared_size_bytes=size_bytes,
+      ),
+    )
 
 
 async def multipart_upload_part(

@@ -184,6 +184,37 @@ async def _read_quota_key(state, key):
   return await etcd_op.pull_from_etcd_by_key(key, client=client)
 
 
+async def _seed_compact_admission(
+  state,
+  *,
+  app_name="test-app",
+  quota_bytes=100,
+  active_usage_bytes=0,
+  compact_reserved_bytes=0,
+  compact_reservation_count=0,
+  logical_usage_initialized=True,
+):
+  client = _FakeEtcd(state)
+  await etcd_op.push_to_etcd(
+    f"quota/admission/apps/{app_name}",
+    {
+      "version": 1,
+      "quota_bytes": quota_bytes,
+      "observed_usage_bytes": active_usage_bytes,
+      "active_usage_bytes": active_usage_bytes,
+      "logical_usage_initialized": logical_usage_initialized,
+      "observed_usage_updated_at": utc_now().isoformat(),
+      "legacy_reserved_bytes": 0,
+      "legacy_reservation_count": 0,
+      "compact_reserved_bytes": compact_reserved_bytes,
+      "compact_reservation_count": compact_reservation_count,
+      "reserved_bytes": compact_reserved_bytes,
+      "reservation_count": compact_reservation_count,
+    },
+    client=client,
+  )
+
+
 def _quota_key_item(state, key):
   return state.items[f"{etcd_op.ETCD_PREFIX}{key}".encode()]
 
@@ -925,47 +956,24 @@ async def test_quota_update_uses_authoritative_enabled_state(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_multipart_init_prechecks_declared_size(monkeypatch, quota_etcd):
-  seed = _FakeEtcd(quota_etcd)
-  await etcd_op.merge_update_etcd_key(
-    "quota/apps/test-app",
-    lambda _raw: {
-      "version": 1,
-      "observed_usage_bytes": 90,
-      "active_usage_bytes": 90,
-      "logical_usage_initialized": True,
-      "observed_usage_updated_at": utc_now().isoformat(),
-      "reservations": {},
-    },
-    client=seed,
+  await _seed_compact_admission(
+    quota_etcd,
+    active_usage_bytes=90,
   )
 
   class Client:
     def _create_multipart_upload(self, *_args, **_kwargs):
       pytest.fail("MinIO upload must not start when quota admission fails")
 
-  async def local_client():
-    return "beijing", Client()
+  async def unexpected_client():
+    pytest.fail("MinIO client must not be opened when quota admission fails")
 
-  async def quota_limit(_app_name, *, client):
-    assert client is not None
+  async def admission_policy():
     return 100
 
-  async def aggregate(_app_name):
-    return {
-      "usage_bytes": 90,
-      "active_usage_bytes": 90,
-      "initialized": True,
-      "admission_ready": True,
-    }
-
-  async def unexpected_usage(*_args, **_kwargs):
-    pytest.fail("multipart/init must not refresh five-region MinIO usage")
-
-  monkeypatch.setattr(files_service, "_get_minio_client_with_server", local_client)
+  monkeypatch.setattr(files_service, "_get_minio_client_with_server", unexpected_client)
   monkeypatch.setattr(files_service, "gen_object_key", lambda: "object-over-limit")
-  monkeypatch.setattr(files_service.public_service, "get_application_quota_limit", quota_limit)
-  monkeypatch.setattr(files_service.files_quota, "get_usage_aggregate", aggregate)
-  monkeypatch.setattr(files_service.public_service, "get_application_quota_usage", unexpected_usage)
+  monkeypatch.setattr(files_service, "_admission_block_percent", admission_policy)
 
   with pytest.raises(CustomException) as exc_info:
     await files_service.multipart_init(
@@ -980,18 +988,9 @@ async def test_multipart_init_prechecks_declared_size(monkeypatch, quota_etcd):
 
 @pytest.mark.asyncio
 async def test_multipart_init_uses_etcd_aggregate_without_minio_scan(monkeypatch, quota_etcd):
-  seed = _FakeEtcd(quota_etcd)
-  await etcd_op.merge_update_etcd_key(
-    "quota/apps/test-app",
-    lambda _raw: {
-      "version": 1,
-      "observed_usage_bytes": 10,
-      "active_usage_bytes": 10,
-      "logical_usage_initialized": True,
-      "observed_usage_updated_at": utc_now().isoformat(),
-      "reservations": {},
-    },
-    client=seed,
+  await _seed_compact_admission(
+    quota_etcd,
+    active_usage_bytes=10,
   )
 
   class Client:
@@ -1001,20 +1000,15 @@ async def test_multipart_init_uses_etcd_aggregate_without_minio_scan(monkeypatch
   async def local_client():
     return "beijing", Client()
 
-  async def quota_limit(_app_name, *, client):
-    assert client is not None
-    return 100
-
-  async def unexpected_usage(*_args, **_kwargs):
-    pytest.fail("multipart/init must not call the MinIO usage refresh path")
-
   async def warning(*_args, **_kwargs):
     return None
 
+  async def admission_policy():
+    return 100
+
   monkeypatch.setattr(files_service, "_get_minio_client_with_server", local_client)
   monkeypatch.setattr(files_service, "gen_object_key", lambda: "object-aggregate")
-  monkeypatch.setattr(files_service.public_service, "get_application_quota_limit", quota_limit)
-  monkeypatch.setattr(files_service.public_service, "get_application_quota_usage", unexpected_usage)
+  monkeypatch.setattr(files_service, "_admission_block_percent", admission_policy)
   monkeypatch.setattr(files_service, "_upload_quota_warning", warning)
 
   result = await files_service.multipart_init(
@@ -1024,9 +1018,15 @@ async def test_multipart_init_uses_etcd_aggregate_without_minio_scan(monkeypatch
   )
 
   assert result.upload_id == "upload-aggregate"
-  state = await _read_quota_key(quota_etcd, "quota/apps/test-app")
-  assert state["reservations"]["object-aggregate"]["status"] == "active"
-  assert state["reservations"]["object-aggregate"]["declared_size_bytes"] == 20
+  state = await _read_quota_key(quota_etcd, "quota/admission/apps/test-app")
+  assert state["reserved_bytes"] == 20
+  assert state["reservation_count"] == 1
+  session = await _read_quota_key(
+    quota_etcd,
+    "quota/uploads/test-app/object-aggregate",
+  )
+  assert session["status"] == "active"
+  assert session["quota_generation"] == 2
 
 
 @pytest.mark.asyncio
@@ -1034,57 +1034,24 @@ async def test_multipart_init_counts_active_reservation_without_minio_scan(
   monkeypatch,
   quota_etcd,
 ):
-  now = utc_now()
-  seed = _FakeEtcd(quota_etcd)
-  await etcd_op.merge_update_etcd_key(
-    "quota/apps/test-app",
-    lambda _raw: {
-      "version": 1,
-      "observed_usage_bytes": 0,
-      "active_usage_bytes": 0,
-      "logical_usage_initialized": True,
-      "observed_usage_updated_at": now.isoformat(),
-      "reservations": {
-        "existing-object": {
-          "api_key_id": "existing-key",
-          "object_key": "existing-object",
-          "upload_id": "existing-upload",
-          "source_server": "beijing",
-          "declared_size_bytes": 100,
-          "status": "active",
-          "expires_at": (now + timedelta(hours=1)).isoformat(),
-        },
-      },
-    },
-    client=seed,
+  await _seed_compact_admission(
+    quota_etcd,
+    compact_reserved_bytes=100,
+    compact_reservation_count=1,
   )
 
   class Client:
     def _create_multipart_upload(self, *_args, **_kwargs):
       pytest.fail("MinIO upload must not start when active reservations fill quota")
 
-  async def local_client():
-    return "beijing", Client()
+  async def unexpected_client():
+    pytest.fail("MinIO client must not be opened when active reservations fill quota")
 
-  async def quota_limit(_app_name, *, client):
-    assert client is not None
+  async def admission_policy():
     return 100
 
-  async def aggregate(_app_name):
-    return {
-      "usage_bytes": 0,
-      "active_usage_bytes": 0,
-      "initialized": True,
-      "admission_ready": True,
-    }
-
-  async def unexpected_usage(*_args, **_kwargs):
-    pytest.fail("multipart/init must not refresh five-region MinIO usage")
-
-  monkeypatch.setattr(files_service, "_get_minio_client_with_server", local_client)
-  monkeypatch.setattr(files_service.public_service, "get_application_quota_limit", quota_limit)
-  monkeypatch.setattr(files_service.files_quota, "get_usage_aggregate", aggregate)
-  monkeypatch.setattr(files_service.public_service, "get_application_quota_usage", unexpected_usage)
+  monkeypatch.setattr(files_service, "_get_minio_client_with_server", unexpected_client)
+  monkeypatch.setattr(files_service, "_admission_block_percent", admission_policy)
 
   with pytest.raises(CustomException) as exc_info:
     await files_service.multipart_init(
@@ -1098,18 +1065,22 @@ async def test_multipart_init_counts_active_reservation_without_minio_scan(
 
 @pytest.mark.asyncio
 async def test_multipart_init_rejects_uninitialized_aggregate_before_minio(monkeypatch):
-  async def aggregate(_app_name):
-    return {
-      "usage_bytes": 0,
-      "initialized": False,
-      "admission_ready": False,
-    }
+  # The request must fail closed when the authority has not seeded the compact
+  # admission key. No legacy migration or MinIO lookup is allowed here.
+  async def get_client():
+    return _FakeEtcd(_EtcdState())
+
+  monkeypatch.setattr(etcd_op, "get_etcd_client", get_client)
 
   async def unexpected_client():
     pytest.fail("MinIO client must not be opened before aggregate readiness")
 
-  monkeypatch.setattr(files_service.files_quota, "get_usage_aggregate", aggregate)
   monkeypatch.setattr(files_service, "_get_minio_client_with_server", unexpected_client)
+
+  async def admission_policy():
+    return 100
+
+  monkeypatch.setattr(files_service, "_admission_block_percent", admission_policy)
 
   with pytest.raises(CustomException) as exc_info:
     await files_service.multipart_init(
@@ -1123,8 +1094,206 @@ async def test_multipart_init_rejects_uninitialized_aggregate_before_minio(monke
 
 
 @pytest.mark.asyncio
+async def test_compact_admission_does_not_read_legacy_state(monkeypatch, quota_etcd):
+  await _seed_compact_admission(
+    quota_etcd,
+    app_name="compact-app",
+    active_usage_bytes=10,
+  )
+  original_read = files_quota._read_dict_with_rev
+
+  async def guarded_read(key, client):
+    assert not key.startswith("quota/apps/"), (
+      "compact admission must not read the legacy APP document"
+    )
+    return await original_read(key, client)
+
+  monkeypatch.setattr(files_quota, "_read_dict_with_rev", guarded_read)
+
+  async def fail_quota_loader(_client):
+    pytest.fail("compact admission must not load quota from applications")
+
+  reservation = await files_quota.reserve_upload(
+    app_name="compact-app",
+    api_key_id="key-owner",
+    object_key="object-compact",
+    source_server="beijing",
+    declared_size_bytes=20,
+    quota_loader=fail_quota_loader,
+    use_compact_admission=True,
+  )
+
+  assert reservation.quota_generation == 2
+  assert reservation.admission_usage_bytes == 10
+  state = await _read_quota_key(
+    quota_etcd,
+    "quota/admission/apps/compact-app",
+  )
+  assert state["reserved_bytes"] == 20
+  assert state["reservation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_admission_missing_state_fails_without_legacy_or_quota_reads(
+  monkeypatch,
+  quota_etcd,
+):
+  del quota_etcd
+
+  async def fail_legacy_read(*_args, **_kwargs):
+    pytest.fail("compact admission must not migrate the legacy APP document")
+
+  async def fail_quota_read(*_args, **_kwargs):
+    pytest.fail("compact admission must not load quota from applications")
+
+  monkeypatch.setattr(files_quota, "_read_dict", fail_legacy_read)
+
+  with pytest.raises(CustomException) as exc_info:
+    await files_quota.reserve_upload(
+      app_name="not-migrated",
+      api_key_id="key-owner",
+      object_key="object-not-migrated",
+      source_server="beijing",
+      declared_size_bytes=1,
+      quota_loader=fail_quota_read,
+      use_compact_admission=True,
+    )
+
+  assert exc_info.value.code == ErrorDesc.SYNC_FAILED.code
+  assert "聚合尚未初始化" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+async def test_compact_admission_missing_limit_fails_closed_without_quota_loader(
+  quota_etcd,
+):
+  await _seed_compact_admission(
+    quota_etcd,
+    app_name="no-limit",
+    quota_bytes=0,
+  )
+
+  async def fail_quota_loader(_client):
+    pytest.fail("compact admission must not fetch quota in the request path")
+
+  with pytest.raises(CustomException) as exc_info:
+    await files_quota.reserve_upload(
+      app_name="no-limit",
+      api_key_id="key-owner",
+      object_key="object-no-limit",
+      source_server="beijing",
+      declared_size_bytes=1,
+      quota_loader=fail_quota_loader,
+      use_compact_admission=True,
+    )
+
+  assert exc_info.value.code == ErrorDesc.SYNC_FAILED.code
+  assert "聚合尚未初始化" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+async def test_compact_admission_cas_prevents_oversell(quota_etcd):
+  await _seed_compact_admission(quota_etcd, app_name="concurrent-app")
+
+  async def quota_loader(_client):
+    return 100
+
+  async def reserve(index):
+    return await files_quota.reserve_upload(
+      app_name="concurrent-app",
+      api_key_id="key-owner",
+      object_key=f"object-{index}",
+      source_server="beijing",
+      declared_size_bytes=60,
+      quota_loader=quota_loader,
+      use_compact_admission=True,
+    )
+
+  results = await asyncio.gather(
+    reserve(1),
+    reserve(2),
+    return_exceptions=True,
+  )
+  assert sum(
+    isinstance(result, files_quota.UploadReservation) for result in results
+  ) == 1
+  assert sum(
+    isinstance(result, CustomException)
+    and result.code == ErrorDesc.APP_STORAGE_QUOTA_EXCEEDED.code
+    for result in results
+  ) == 1
+  state = await _read_quota_key(
+    quota_etcd,
+    "quota/admission/apps/concurrent-app",
+  )
+  assert state["reserved_bytes"] == 60
+  assert state["reservation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_admission_applies_global_block_threshold(quota_etcd):
+  await _seed_compact_admission(
+    quota_etcd,
+    app_name="block-threshold-app",
+    active_usage_bytes=70,
+  )
+
+  with pytest.raises(CustomException) as exc_info:
+    await files_quota.reserve_upload(
+      app_name="block-threshold-app",
+      api_key_id="key-owner",
+      object_key="object-block-threshold",
+      source_server="beijing",
+      declared_size_bytes=11,
+      block_percent=80,
+      use_compact_admission=True,
+    )
+
+  assert exc_info.value.code == ErrorDesc.APP_STORAGE_QUOTA_EXCEEDED.code
+
+
+@pytest.mark.asyncio
+async def test_compact_finalize_updates_usage_once(quota_etcd):
+  await _seed_compact_admission(
+    quota_etcd,
+    app_name="finalize-app",
+    active_usage_bytes=5,
+  )
+
+  async def quota_loader(_client):
+    return 100
+
+  reservation = await files_quota.reserve_upload(
+    app_name="finalize-app",
+    api_key_id="key-owner",
+    object_key="object-finalize",
+    source_server="beijing",
+    declared_size_bytes=20,
+    quota_loader=quota_loader,
+    use_compact_admission=True,
+  )
+  reservation = await files_quota.activate_reservation(reservation, "upload-1")
+  client = _FakeEtcd(quota_etcd)
+  await files_quota.finalize_completed_session(client, reservation)
+  await files_quota.finalize_completed_session(client, reservation)
+
+  state = await _read_quota_key(
+    quota_etcd,
+    "quota/admission/apps/finalize-app",
+  )
+  assert state["active_usage_bytes"] == 25
+  assert state["reserved_bytes"] == 0
+  assert state["reservation_count"] == 0
+  session = await _read_quota_key(
+    quota_etcd,
+    "quota/uploads/finalize-app/object-finalize",
+  )
+  assert session["quota_finalized"] is True
+
+
+@pytest.mark.asyncio
 async def test_quota_aggregate_refresh_is_authority_only_and_batched(monkeypatch):
-  app = _Application()
+  app = _Application(quota_bytes=100)
   app.name = "aggregate-app"
   calls = []
 
@@ -1139,8 +1308,8 @@ async def test_quota_aggregate_refresh_is_authority_only_and_batched(monkeypatch
     calls.append((application.name, force, require_all))
     return 42
 
-  async def reconcile(app_name, observed):
-    assert (app_name, observed) == ("aggregate-app", 42)
+  async def reconcile(app_name, observed, *, quota_bytes):
+    assert (app_name, observed, quota_bytes) == ("aggregate-app", 42, 100)
     return {"usage_bytes": 42, "initialized": True}
 
   monkeypatch.setattr(public_service.settings, "REGION", "beijing")

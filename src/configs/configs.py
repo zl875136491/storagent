@@ -196,6 +196,12 @@ class Settings(BaseSettings):
   # Quota warnings are evaluated at upload admission; duplicate OA messages
   # for an unchanged threshold are suppressed for this interval.
   QUOTA_ALERT_COOLDOWN_SECONDS: int = 86400
+  # Admission still honors the global block threshold, but a slow MongoDB
+  # policy lookup must fail closed quickly instead of extending upload latency.
+  QUOTA_ADMISSION_RULE_TIMEOUT_SECONDS: float = 0.25
+  # Warning delivery is advisory and must not hold a successful multipart/init
+  # response behind MongoDB or OA delivery work.
+  QUOTA_ALERT_REQUEST_TIMEOUT_SECONDS: float = 0.25
   CAPACITY_SNAPSHOT_INTERVAL_SECONDS: int = 3600
   CAPACITY_SNAPSHOT_MAX_CONCURRENCY: int = 3
   # Caller diagnostics must consume persisted aggregates, never trigger a
