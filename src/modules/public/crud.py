@@ -214,14 +214,18 @@ async def read_application_list() -> List[Application]:
 
 
 async def count_enabled_applications() -> int:
-  """Count enabled applications without loading author links for a refresh run."""
-  return await Application.find(Application.enabled == True).count()  # noqa: E712
+  """Count enabled applications without hydrating author links."""
+  # Beanie 1.30 with Pydantic 2.11 does not expose Document fields as class
+  # attributes until an expression-field proxy is installed.  A plain Mongo
+  # filter is equivalent and works both before and after Beanie initialises
+  # the collection.
+  return await Application.find({"enabled": True}).count()
 
 
 async def read_quota_refresh_candidates(limit: int) -> List[Application]:
-  """Return the least-recently-attempted enabled applications in one batch."""
+  """Select the least-recently attempted enabled applications for refresh."""
   return await Application.find(
-    Application.enabled == True,  # noqa: E712
+    {"enabled": True},
   ).sort(
     "+quota_usage_attempted_at",
     "+name",

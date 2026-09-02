@@ -25,6 +25,9 @@ _STATE_PREFIX = "quota/apps"
 _SESSION_PREFIX = "quota/uploads"
 _LOCK_PREFIX = "/storagent/locks/quota"
 _QUOTA_EXCEEDED_REASON = "APP 存储超出限额，请联系管理员处理"
+_QUOTA_AGGREGATE_NOT_READY_REASON = (
+  "应用配额聚合尚未初始化，请稍后重试"
+)
 
 
 @dataclass(frozen=True)
@@ -284,7 +287,12 @@ async def get_observed_usage_bytes(app_name: str, client: Any = None) -> int:
 
 
 async def get_usage_aggregate(app_name: str, client: Any = None) -> dict[str, Any]:
-  """Read the replicated logical-usage aggregate without contacting MinIO."""
+  """Read the application logical usage without contacting MinIO.
+
+  The returned state is only a snapshot. Admission must still re-read it under
+  ``application_quota_lock`` in ``reserve_upload`` so concurrent regions share
+  one compare-and-swap decision.
+  """
   own_client = client is None
   if own_client:
     client = await etcd_op.get_etcd_client()
@@ -293,13 +301,22 @@ async def get_usage_aggregate(app_name: str, client: Any = None) -> dict[str, An
     active = max(int(state.get("active_usage_bytes") or 0), 0)
     observed = max(int(state.get("observed_usage_bytes") or 0), 0)
     initialized = bool(state.get("logical_usage_initialized"))
+    updated_at = _parse_datetime(state.get("observed_usage_updated_at"))
     return {
       "usage_bytes": active if initialized else observed,
       "active_usage_bytes": active,
       "observed_usage_bytes": observed,
-      "deleted_retained_bytes": max(int(state.get("deleted_retained_bytes") or 0), 0),
-      "updated_at": _parse_datetime(state.get("observed_usage_updated_at")),
+      "deleted_retained_bytes": max(
+        int(state.get("deleted_retained_bytes") or 0),
+        0,
+      ),
+      "updated_at": updated_at,
       "initialized": initialized,
+      # An observed snapshot without an initialized logical counter is not
+      # sufficient for admission: completing a new upload must not replace
+      # that sampled value with only the new object's size. The authority
+      # worker must seed ``active_usage_bytes`` before uploads are accepted.
+      "admission_ready": initialized,
     }
   finally:
     if own_client:
@@ -310,11 +327,11 @@ async def reconcile_usage_aggregate(
   app_name: str,
   observed_usage: int,
 ) -> dict[str, Any]:
-  """Seed or reconcile the logical quota aggregate from a worker observation.
+  """Reconcile an Etcd aggregate from a completed background observation.
 
-  This function deliberately does not discover usage itself. The caller is a
-  scheduled authority worker that has already completed a full MinIO scan, so
-  request-time diagnostics can remain aggregate-only.
+  The caller is the authority Celery task and has already performed the
+  potentially expensive cross-region MinIO scan. Keeping that work outside
+  this function makes it safe to use from request paths for reads only.
   """
   async with application_quota_lock(app_name) as client:
     state, cleaned = await _reconcile_state_locked(
@@ -488,13 +505,20 @@ async def _reconcile_state_locked(
     value for value in current["reservations"].values()
     if isinstance(value, dict) and _reservation_needs_cleanup(value, now)
   ]
-  must_refresh = bool(cleanup_now) or not _usage_is_fresh(current, now)
+  # Expired multipart sessions can be cleaned up by aborting their known
+  # upload IDs; that cleanup does not require a full bucket scan. Callers that
+  # still provide a legacy usage loader may use it as a cleanup barrier, while
+  # multipart/init passes no loader and therefore never scans MinIO here.
+  must_refresh = (
+    not current["logical_usage_initialized"]
+    and not _usage_is_fresh(current, now)
+  ) or (bool(cleanup_now) and usage_loader is not None)
   refreshed_usage = observed_usage
   if must_refresh and refreshed_usage is None:
     if usage_loader is None:
       raise CustomException(
         ErrorDesc.MINIO_ACCESS_FAILED,
-        "存储用量尚未刷新，无法安全清理上传预留",
+        _QUOTA_AGGREGATE_NOT_READY_REASON,
       )
     refreshed_usage = max(int(await usage_loader()), 0)
 
@@ -593,7 +617,7 @@ async def reserve_upload(
   declared_size_bytes: int,
   content_type: str = "application/octet-stream",
   quota_loader: Callable[[Any], Awaitable[int]],
-  usage_loader: Callable[[], Awaitable[int]],
+  usage_loader: Callable[[], Awaitable[int]] | None = None,
 ) -> UploadReservation:
   if declared_size_bytes <= 0:
     raise CustomException(ErrorDesc.INVALID_PARAMS, "size_bytes 必须大于 0")

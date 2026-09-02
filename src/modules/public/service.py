@@ -707,6 +707,7 @@ async def refresh_application_quota_aggregates_once() -> dict[str, int | str]:
       "succeeded": 0,
       "failed": 0,
       "skipped": 0,
+      "deferred": 0,
     }
 
   from src.modules.files import quota as upload_quota
