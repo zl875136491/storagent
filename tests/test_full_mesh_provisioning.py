@@ -351,6 +351,36 @@ def _patch_authorization_dependencies(monkeypatch, app, provision):
   monkeypatch.setattr(public_service.storage_crud, "bulk_create_minio_bucket", bulk_create)
   monkeypatch.setattr(public_service.minio_op, "check_server_bucket_existed", bucket_exists)
   monkeypatch.setattr(public_service.minio_op, "enable_bucket_versioning", enable_versioning)
+  async def seed_quota(_app):
+    return {"status": "skipped"}
+  monkeypatch.setattr(public_service, "seed_application_quota_aggregate", seed_quota)
+
+
+@pytest.mark.asyncio
+async def test_authorization_seeds_quota_aggregate_after_enable(monkeypatch):
+  app = _FakeApplication()
+  seeded = []
+
+  async def provision(_bucket, _servers):
+    return {"complete": True, "expected_rule_count": 2, "actual_rule_count": 2}
+
+  async def seed_quota(application):
+    assert application.enabled is True
+    seeded.append(application.name)
+    return {"status": "ready"}
+
+  _patch_authorization_dependencies(monkeypatch, app, provision)
+  monkeypatch.setattr(public_service, "seed_application_quota_aggregate", seed_quota)
+  events = await _collect_sse(
+    public_service.enable_application("app-id", SimpleNamespace(username="admin"))
+  )
+
+  assert app.enabled is True
+  assert seeded == ["test-app"]
+  assert any(
+    event.get("step") == "quota_aggregate" and event.get("status") == "ok"
+    for event in events
+  )
 
 
 @pytest.mark.asyncio

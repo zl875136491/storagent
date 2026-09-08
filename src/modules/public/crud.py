@@ -433,12 +433,17 @@ async def update_system_config_by_key(key: str, value: str | int | float | bool)
 async def create_shell_command_log(
   command: str,
   stdout: str = "",
-  stderr: str = "") -> ShellCommandLog:
+  stderr: str = "") -> ShellCommandLog | None:
   """
-  创建Shell命令日志（命令中的凭证已脱敏）
+  创建Shell命令日志（命令中的凭证已脱敏）。
+
+  SHELL_COMMAND_LOG_ENABLED=false 时直接跳过，不写 Mongo。
   """
+  from src.configs.configs import settings
   from src.core.crypto import redact_shell_command
 
+  if not settings.SHELL_COMMAND_LOG_ENABLED:
+    return None
   if command == "mc alias list --json":
     return None
   shell_command_log = ShellCommandLog(

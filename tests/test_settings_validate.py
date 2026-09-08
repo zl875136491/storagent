@@ -70,4 +70,6 @@ def test_validate_rejects_invalid_celery_queue_contract(monkeypatch):
 def test_docs_and_reload_defaults():
   from src.configs.configs import settings
   assert hasattr(settings, "ENABLE_DOCS")
+  assert hasattr(settings, "SHELL_COMMAND_LOG_ENABLED")
+  assert settings.SHELL_COMMAND_LOG_ENABLED is False
   assert isinstance(settings.RELOAD, bool)

@@ -34,6 +34,85 @@ def test_etcd_routes_are_registered_for_both_versions():
       assert f"{prefix}{suffix}" in paths
 
 
+@pytest.mark.asyncio
+async def test_prefix_stats_use_count_only_range(monkeypatch):
+  captured = {}
+
+  class Request:
+    count_only = False
+
+  class Stub:
+    async def Range(self, request, timeout=None, metadata=None):
+      captured["count_only"] = request.count_only
+      captured["timeout"] = timeout
+      return SimpleNamespace(header=SimpleNamespace(revision=42), count=7)
+
+  class Client:
+    kvstub = Stub()
+    _timeout = 3
+    metadata = (("token", "x"),)
+
+    @staticmethod
+    def _build_get_range_request(key, range_end=None):
+      captured["key"] = key
+      captured["range_end"] = range_end
+      return Request()
+
+    async def get(self, _key):
+      raise AssertionError("single-key get is only a fallback")
+
+    async def get_range(self, *_args, **_kwargs):
+      raise AssertionError("full prefix get_range must not be used")
+
+  revision, count = await service._storagent_prefix_stats(Client())
+  assert revision == 42
+  assert count == 7
+  assert captured["count_only"] is True
+  assert captured["key"] == b"/storagent/"
+  assert captured["range_end"] == b"/storagent/\xff"
+
+
+@pytest.mark.asyncio
+async def test_check_endpoint_stays_reachable_when_revision_read_fails(monkeypatch):
+  class Status:
+    version = "3.6.11"
+    db_size = 1024
+    leader = SimpleNamespace(id="1")
+    raft_index = 9
+    raft_term = 2
+    member_id = "1"
+
+  class Client:
+    async def status(self):
+      return Status()
+
+    async def members(self):
+      if False:
+        yield None
+
+    async def list_alarms(self):
+      if False:
+        yield None
+
+    async def close(self):
+      return None
+
+  async def boom(_client):
+    raise RuntimeError("Received message larger than max (6470000 vs. 4194304)")
+
+  monkeypatch.setattr(service, "_make_client", lambda host, port: Client())
+  monkeypatch.setattr(service, "_store_revision", boom)
+  result = await service._check_endpoint("etcd-2", "10.32.129.241", 2379)
+  assert result.reachable is True
+  assert result.status == "healthy"
+  assert result.revision == 0
+
+
+def test_message_too_large_is_not_reported_as_unreachable():
+  error = RuntimeError("Received message larger than max (6470000 vs. 4194304)")
+  assert service._endpoint_check_failure_reason(error) == "Etcd 响应超过 gRPC 消息上限"
+
+
 def test_blank_endpoint_setting_uses_complete_default_cluster(monkeypatch):
   monkeypatch.setattr(service.settings, "ETCD_ENDPOINTS", "")
   endpoints = service._endpoint_list()

@@ -105,15 +105,55 @@ def _status_fields(status: Any) -> dict[str, Any]:
   }
 
 
+_STORAGENT_PREFIX = b"/storagent/"
+_STORAGENT_PREFIX_END = _STORAGENT_PREFIX + b"\xff"
+
+
+async def _storagent_prefix_stats(client: Any) -> tuple[int, int]:
+  """Return (revision, key_count) for /storagent/ without loading values.
+
+  aetcd's public get_range() always returns every key and value. Production
+  prefixes are larger than the 4MiB gRPC default, which made the operations
+  page mark every healthy member unreachable.
+  """
+  build = getattr(client, "_build_get_range_request", None)
+  kvstub = getattr(client, "kvstub", None)
+  if kvstub is None and hasattr(client, "connect"):
+    await client.connect()
+    kvstub = getattr(client, "kvstub", None)
+  if callable(build) and kvstub is not None:
+    request = build(key=_STORAGENT_PREFIX, range_end=_STORAGENT_PREFIX_END)
+    request.count_only = True
+    response = await kvstub.Range(
+      request,
+      timeout=getattr(client, "_timeout", None),
+      metadata=getattr(client, "metadata", None),
+    )
+    header = _value(response, "header", default=None)
+    return (
+      _as_int(_value(header, "revision", "Revision", default=0)),
+      _as_int(_value(response, "count", default=0)),
+    )
+  probe = await client.get(b"/storagent/region")
+  header = _value(probe, "header", default=None) if probe is not None else None
+  return _as_int(_value(header, "revision", "Revision", default=0)), 0
+
+
 async def _store_revision(client: Any) -> int:
   """Read the MVCC revision from a range header.
 
   aetcd's Status object exposes raft fields but not the v3 response header;
   the range header is the authoritative revision used by compaction choices.
   """
-  result = await client.get_range(b"/storagent/", b"/storagent/" + b"\xff")
-  header = _value(result, "header", default=None)
-  return _as_int(_value(header, "revision", "Revision", default=0))
+  revision, _count = await _storagent_prefix_stats(client)
+  return revision
+
+
+def _endpoint_check_failure_reason(error: BaseException) -> str:
+  text = str(error).lower()
+  if "larger than max" in text:
+    return "Etcd 响应超过 gRPC 消息上限"
+  return "端点不可达或认证失败"
 
 
 async def _check_endpoint(name: str, host: str, port: int) -> schema.EtcdEndpointStatus:
@@ -125,7 +165,10 @@ async def _check_endpoint(name: str, host: str, port: int) -> schema.EtcdEndpoin
     status = await asyncio.wait_for(client.status(), timeout=max(float(settings.ETCD_HEALTH_TIMEOUT_SECONDS), 0.5))
     fields = _status_fields(status)
     if not fields["revision"]:
-      fields["revision"] = await _store_revision(client)
+      try:
+        fields["revision"] = await _store_revision(client)
+      except Exception as error:
+        logger.warning(f"etcd revision 读取失败 {endpoint}: {error}")
     applied_index = _value(status, "raft_applied_index", "raftAppliedIndex", default=None)
     members = []
     async for member in client.members():
@@ -184,7 +227,7 @@ async def _check_endpoint(name: str, host: str, port: int) -> schema.EtcdEndpoin
       status="critical",
       latency_ms=latency,
       error=str(error),
-      reasons=["端点不可达或认证失败"],
+      reasons=[_endpoint_check_failure_reason(error)],
     )
   finally:
     if client is not None:
@@ -346,11 +389,14 @@ async def keyspace(actor: str = "system") -> schema.EtcdOperationResponse:
   client = await _client(host, port)
   created = utc_now()
   try:
-    prefix = b"/storagent/"
-    end = prefix + b"\xff"
-    result = await client.get_range(prefix, end)
-    sizes = [len(item.key) + len(item.value) for item in result.kvs]
-    detail = {"endpoint": f"{host}:{port}", "key_count": len(result.kvs), "bytes": sum(sizes), "revision": int(getattr(result.header, "revision", 0) or 0)}
+    revision, key_count = await _storagent_prefix_stats(client)
+    detail = {
+      "endpoint": f"{host}:{port}",
+      "key_count": key_count,
+      "bytes": 0,
+      "revision": revision,
+      "values_omitted": True,
+    }
     await _record("keyspace", "succeeded", actor, endpoint=name, revision=detail["revision"], detail=detail)
     return schema.EtcdOperationResponse(kind="keyspace", status="succeeded", message="Key 空间检查完成", detail=detail, created_at=created)
   finally:

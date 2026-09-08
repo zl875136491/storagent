@@ -5,6 +5,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import random
 import secrets
 import weakref
 from contextlib import asynccontextmanager
@@ -962,7 +963,8 @@ async def _reserve_upload_compact(
   admission_key = _admission_state_key(app_name)
   session_key = _session_key(app_name, object_key)
 
-  for attempt in range(etcd_op.CAS_MAX_RETRIES):
+  compact_retries = max(int(etcd_op.CAS_MAX_RETRIES), 24)
+  for attempt in range(compact_retries):
     admission, admission_revision = await _read_admission_state(app_name, client)
     if admission is None:
       # Never migrate the large legacy APP document in a request. The
@@ -1065,8 +1067,11 @@ async def _reserve_upload_compact(
     existing, existing_revision = await _read_dict_with_rev(session_key, client)
     if existing_revision is not None and isinstance(existing, dict):
       raise CustomException(ErrorDesc.RES_ALREADY_EXISTS, "上传预留已存在")
-    await asyncio.sleep(0.05 * (attempt + 1))
-  raise RuntimeError("无法原子创建上传配额预留")
+    await asyncio.sleep(0.02 * (attempt + 1) + random.random() * 0.04)
+  raise CustomException(
+    ErrorDesc.RATE_LIMITED,
+    "上传预留竞争过多，请稍后重试",
+  )
 
 
 async def reserve_upload(

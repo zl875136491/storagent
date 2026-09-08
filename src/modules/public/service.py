@@ -698,6 +698,32 @@ async def refresh_application_quota_usage(
   return usage
 
 
+async def seed_application_quota_aggregate(application) -> dict[str, object]:
+  """Create the compact Etcd admission record as soon as an APP is enabled.
+
+  multipart/init refuses traffic until this record exists. Waiting for the
+  hourly Celery pass would leave a newly approved application unable to
+  upload for up to APPLICATION_QUOTA_AGGREGATE_INTERVAL_SECONDS.
+  """
+  if str(settings.REGION).strip().lower() != str(settings.SYNC_AUTHORITY_REGION).strip().lower():
+    return {"status": "skipped", "reason": "not-authority"}
+  from src.modules.files import quota as upload_quota
+
+  usage = await refresh_application_quota_usage(
+    application,
+    force=True,
+    require_all=False,
+  )
+  result = await upload_quota.reconcile_usage_aggregate(
+    application.name,
+    usage,
+    quota_bytes=int(
+      getattr(application, "quota_bytes", DEFAULT_APPLICATION_QUOTA_BYTES),
+    ),
+  )
+  return {"status": "ready", "usage": usage, "aggregate": result}
+
+
 async def refresh_application_quota_aggregates_once() -> dict[str, int | str]:
   """Refresh the authoritative quota aggregate outside caller request paths."""
   if str(settings.REGION).strip().lower() != str(settings.SYNC_AUTHORITY_REGION).strip().lower():
@@ -1397,6 +1423,37 @@ async def enable_application(
         "message": "应用已启用并同步到所有节点",
       }):
         yield chunk
+
+      failure_step = "quota_aggregate"
+      async for chunk in _emit({
+        "step": "quota_aggregate",
+        "server_name": None,
+        "status": "running",
+        "message": "初始化应用配额准入聚合，避免新应用上传被小时级任务阻塞",
+      }):
+        yield chunk
+      try:
+        await seed_application_quota_aggregate(application_obj)
+        async for chunk in _emit({
+          "step": "quota_aggregate",
+          "server_name": None,
+          "status": "ok",
+          "message": "应用配额准入聚合已就绪",
+        }):
+          yield chunk
+      except Exception as seed_error:
+        logger.warning(
+          "应用授权后配额聚合初始化失败 %s: %s",
+          application_obj.name,
+          seed_error,
+        )
+        async for chunk in _emit({
+          "step": "quota_aggregate",
+          "server_name": None,
+          "status": "warning",
+          "message": f"配额聚合尚未就绪，上传可能短暂不可用: {seed_error}",
+        }):
+          yield chunk
 
   except sync_module.ReplicationLockBusyError as e:
     async for chunk in _emit({

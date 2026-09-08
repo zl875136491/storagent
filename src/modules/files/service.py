@@ -388,6 +388,9 @@ async def multipart_complete(
   ]
   key = object_key.strip()
 
+  # Mark the session completing under the app lock, then release it before
+  # MinIO I/O. Holding the lock across complete serialized every object in the
+  # same application and caused lock-wait STATUS_ERR under modest concurrency.
   async with files_quota.application_quota_lock(app_name) as quota_client:
     prepared = await files_quota.prepare_completion(
       quota_client,
@@ -410,64 +413,67 @@ async def multipart_complete(
         version_id=saved_result.get("version_id"),
       )
 
-    client = await _get_minio_client_for_server(
-      prepared.reservation.source_server
+  client = await _get_minio_client_for_server(
+    prepared.reservation.source_server
+  )
+
+  def _complete():
+    return client._complete_multipart_upload(
+      app_name,
+      key,
+      upload_id,
+      submitted_parts,
     )
 
-    def _complete():
-      return client._complete_multipart_upload(
-        app_name,
-        key,
-        upload_id,
-        submitted_parts,
-      )
+  saved_result = None
+  cancellation = None
+  minio_error = None
+  if prepared.recovering:
+    saved_result = await _recover_completed_result(
+      client,
+      app_name,
+      key,
+      prepared.reservation.declared_size_bytes,
+    )
+  if saved_result is None:
+    try:
+      result, cancellation = await _run_thread_to_completion(_complete)
+      saved_result = {
+        "etag": result.etag,
+        "version_id": result.version_id,
+      }
+    except BaseException as error:
+      if isinstance(error, asyncio.CancelledError):
+        raise
+      minio_error = error
+      if _is_no_such_upload(error):
+        saved_result = await _recover_completed_result(
+          client,
+          app_name,
+          key,
+          prepared.reservation.declared_size_bytes,
+        )
 
-    saved_result = None
-    cancellation = None
-    if prepared.recovering:
-      saved_result = await _recover_completed_result(
-        client,
-        app_name,
-        key,
-        prepared.reservation.declared_size_bytes,
-      )
+  async with files_quota.application_quota_lock(app_name) as quota_client:
     if saved_result is None:
-      try:
-        result, cancellation = await _run_thread_to_completion(_complete)
-        saved_result = {
-          "etag": result.etag,
-          "version_id": result.version_id,
-        }
-      except BaseException as error:
-        if isinstance(error, asyncio.CancelledError):
-          raise
-        if _is_no_such_upload(error):
-          saved_result = await _recover_completed_result(
-            client,
-            app_name,
-            key,
-            prepared.reservation.declared_size_bytes,
-          )
-          if saved_result is None:
-            await files_quota.record_aborted_session(
-              quota_client,
-              prepared.reservation,
-            )
-            await files_quota.finalize_aborted_session(
-              quota_client,
-              prepared.reservation,
-            )
-            raise CustomException(
-              ErrorDesc.MINIO_ACCESS_FAILED,
-              {"operation": "multipart_complete", "category": "operation", "reason": "upload_session_missing"},
-            ) from error
-        if saved_result is None:
-          await files_quota.restore_active_session(
-            quota_client,
-            prepared.reservation,
-          )
-          _raise_minio_write_error(error)
-
+      if minio_error is not None and _is_no_such_upload(minio_error):
+        await files_quota.record_aborted_session(
+          quota_client,
+          prepared.reservation,
+        )
+        await files_quota.finalize_aborted_session(
+          quota_client,
+          prepared.reservation,
+        )
+        raise CustomException(
+          ErrorDesc.MINIO_ACCESS_FAILED,
+          {"operation": "multipart_complete", "category": "operation", "reason": "upload_session_missing"},
+        ) from minio_error
+      await files_quota.restore_active_session(
+        quota_client,
+        prepared.reservation,
+      )
+      _raise_minio_write_error(minio_error)
     try:
       await files_quota.record_completed_session(
         quota_client,

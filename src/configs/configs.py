@@ -164,6 +164,10 @@ class Settings(BaseSettings):
   # 管理员应急下载链接；运行时还会限制在 30-900 秒内。
   ONE_TIME_DOWNLOAD_TTL_SECONDS: int = 300
   MINIO_OPERATION_TIMEOUT_SECONDS: float = 20.0
+  # Persist mc/shell invocations to Mongo `shell_command`. Default off: the
+  # collection grows with every control-plane MinIO call and is not required
+  # for request correctness. Set true only when debugging mc failures.
+  SHELL_COMMAND_LOG_ENABLED: bool = False
   # Soft-deleted objects remain recoverable until restore_until. Once that
   # deadline is reached they are copied to this internal bucket, then removed
   # from the application bucket by the local archive worker.
