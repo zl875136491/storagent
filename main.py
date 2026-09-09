@@ -7,7 +7,7 @@ from src.core.database import init_db, close_db
 from src.configs.configs import settings
 from src.utils.logger import setup_logging
 from src.core.initialization import init_project, init_service
-from src.core.etcd_op import get_etcd_client, watch_etcd_task
+from src.core.etcd_op import close_shared_etcd_client, get_etcd_client, watch_etcd_task
 from src.core.cors_origins import allowlist, load_allowlist_from_mongo
 from src.core.exception import register_exception
 from src.core.middleware import RequestContextMiddleware, UploadBodyLimitMiddleware
@@ -52,8 +52,9 @@ async def lifespan(app: FastAPI):
     from src.utils.logger import logger
     logger.warning(f"加载应用来源白名单失败: {e}")
   
-  # 5. Etcd 监听
-  etcd_client = await get_etcd_client()
+  # 5. Etcd 监听。Watch uses a dedicated connection so reconnect can close
+  # it without dropping the request-path pooled client.
+  etcd_client = await get_etcd_client(dedicated=True)
   watch_job = asyncio.create_task(watch_etcd_task(etcd_client))
 
   # 周期维护、长耗时运维和 Etcd 全量校准由 Celery Beat/Worker 承担。
@@ -64,6 +65,10 @@ async def lifespan(app: FastAPI):
   await shutdown_background_operations()
   try:
     await etcd_client.close()
+  except Exception:
+    pass
+  try:
+    await close_shared_etcd_client()
   except Exception:
     pass
   try:

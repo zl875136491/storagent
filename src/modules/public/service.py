@@ -572,10 +572,13 @@ async def delete_application(
 async def get_application_list() -> dict[str, List[Application]]:
   """
   获取应用列表
+
+  Request traffic returns the persisted quota fields. Live MinIO / Etcd
+  usage refresh belongs to the authority worker, not this list endpoint.
   """
   application_objs = await public_crud.read_application_list()
   data = await asyncio.gather(*(
-    _application_response(application)
+    _application_response(application, refresh_usage=False)
     for application in application_objs
   ))
   return {"data": list(data)}
@@ -800,6 +803,7 @@ async def _application_response(
   *,
   force_usage: bool = False,
   require_all_usage: bool = False,
+  refresh_usage: bool = True,
 ) -> dict:
   author = application.author
   # Mongo projections created by the cross-region sync worker can retain a
@@ -815,11 +819,14 @@ async def _application_response(
       ErrorDesc.RES_NOT_FOUND,
       "应用创建者信息暂时不可用，请稍后刷新重试",
     )
-  usage = await refresh_application_quota_usage(
-    application,
-    force=force_usage,
-    require_all=require_all_usage,
-  )
+  if refresh_usage:
+    usage = await refresh_application_quota_usage(
+      application,
+      force=force_usage,
+      require_all=require_all_usage,
+    )
+  else:
+    usage = max(int(getattr(application, "quota_usage_bytes", 0) or 0), 0)
   quota = max(int(application.quota_bytes), 1)
   return {
     "id": application.id,

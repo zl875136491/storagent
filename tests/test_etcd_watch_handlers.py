@@ -15,6 +15,7 @@ def test_watch_handlers_exist():
   assert callable(etcd_op._handle_etcd_delete)
   src = inspect.getsource(etcd_op.watch_etcd_task)
   assert 'kind == "DELETE"' in src
+  assert "get_etcd_client(dedicated=True)" in src
 
 
 def test_watch_ignores_runtime_lock_and_quota_keys():

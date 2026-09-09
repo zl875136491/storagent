@@ -203,6 +203,10 @@ class Settings(BaseSettings):
   # Admission still honors the global block threshold, but a slow MongoDB
   # policy lookup must fail closed quickly instead of extending upload latency.
   QUOTA_ADMISSION_RULE_TIMEOUT_SECONDS: float = 0.25
+  # Compact Etcd admission must not stall multipart/init. On timeout or a
+  # missing aggregate the request uses Application.quota_usage_bytes /
+  # quota_bytes instead of waiting for the control plane.
+  QUOTA_ETCD_ADMISSION_TIMEOUT_SECONDS: float = 1.5
   # Warning delivery is advisory and must not hold a successful multipart/init
   # response behind MongoDB or OA delivery work.
   QUOTA_ALERT_REQUEST_TIMEOUT_SECONDS: float = 0.25

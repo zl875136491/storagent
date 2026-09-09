@@ -20,22 +20,99 @@ _WATCH_IGNORED_PREFIXES = (
   f"{ETCD_PREFIX}object_archive_policy",
 )
 
+_pool_lock: asyncio.Lock | None = None
+_pool_lock_loop: asyncio.AbstractEventLoop | None = None
+_shared_inner: aetcd.Client | None = None
+_shared_wrapper: "_PooledEtcdClient | None" = None
+_shared_loop: asyncio.AbstractEventLoop | None = None
+
+
+class _PooledEtcdClient:
+  """Share one authenticated gRPC channel across request-path Etcd calls.
+
+  Callers historically create-and-close a client per request. Closing the
+  pooled inner client would force every subsequent upload to Authenticate
+  again, which on a loaded WAN cluster costs seconds.
+  """
+
+  def __init__(self, inner: aetcd.Client):
+    self._inner = inner
+
+  def __getattr__(self, name: str):
+    return getattr(self._inner, name)
+
+  async def close(self) -> None:
+    return None
+
 
 def _is_runtime_etcd_key(key: str) -> bool:
   """Return whether a key is ephemeral runtime state, not control-plane data."""
   return key.startswith(_WATCH_IGNORED_PREFIXES)
 
 
-async def get_etcd_client() -> aetcd.Client:
-  """
-  获取 Etcd 客户端
-  """
+def _etcd_client_options() -> dict[str, Any]:
   options: dict[str, Any] = {"host": settings.ETCD_HOST, "port": settings.ETCD_PORT}
   username = str(getattr(settings, "ETCD_USERNAME", "") or "")
   password = str(getattr(settings, "ETCD_PASSWORD", "") or "")
   if username or password:
     options.update(username=username, password=password)
-  return aetcd.Client(**options)
+  return options
+
+
+def _current_pool_lock() -> asyncio.Lock:
+  global _pool_lock, _pool_lock_loop
+  loop = asyncio.get_running_loop()
+  if _pool_lock is None or _pool_lock_loop is not loop:
+    _pool_lock = asyncio.Lock()
+    _pool_lock_loop = loop
+  return _pool_lock
+
+
+async def close_shared_etcd_client() -> None:
+  """Drop the request-path pool. Watch connections are owned separately."""
+  global _shared_inner, _shared_wrapper, _shared_loop
+  async with _current_pool_lock():
+    inner = _shared_inner
+    _shared_inner = None
+    _shared_wrapper = None
+    _shared_loop = None
+  if inner is None:
+    return
+  try:
+    await inner.close()
+  except Exception:
+    pass
+
+
+async def get_etcd_client(*, dedicated: bool = False) -> aetcd.Client:
+  """Return an Etcd client.
+
+  Request traffic reuses one authenticated connection. Pass dedicated=True
+  for the watch loop so a reconnect can close that stream without dropping
+  in-flight compact admission CAS.
+  """
+  if dedicated:
+    return aetcd.Client(**_etcd_client_options())
+
+  loop = asyncio.get_running_loop()
+  async with _current_pool_lock():
+    global _shared_inner, _shared_wrapper, _shared_loop
+    if (
+      _shared_inner is not None
+      and _shared_wrapper is not None
+      and _shared_loop is loop
+    ):
+      return _shared_wrapper
+    stale = _shared_inner
+    _shared_inner = aetcd.Client(**_etcd_client_options())
+    _shared_wrapper = _PooledEtcdClient(_shared_inner)
+    _shared_loop = loop
+  if stale is not None:
+    try:
+      await stale.close()
+    except Exception:
+      pass
+  return _shared_wrapper
 
 
 async def _handle_etcd_put(key: str, value: str):
@@ -138,7 +215,7 @@ async def watch_etcd_task(client: aetcd.Client):
       except Exception:
         pass
       try:
-        client = await get_etcd_client()
+        client = await get_etcd_client(dedicated=True)
       except Exception as ce:
         logger.warning(f"Etcd 客户端重建失败: {ce}")
 

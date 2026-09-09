@@ -171,6 +171,7 @@ class _FakeEtcd:
 @pytest.fixture
 def quota_etcd(monkeypatch):
   state = _EtcdState()
+  files_quota.reset_application_fallback_sessions()
 
   async def get_client():
     return _FakeEtcd(state)
@@ -1091,6 +1092,198 @@ async def test_multipart_init_rejects_uninitialized_aggregate_before_minio(monke
 
   assert exc_info.value.code == ErrorDesc.SYNC_FAILED.code
   assert "尚未初始化" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+async def test_multipart_init_uses_application_quota_when_aggregate_missing(
+  monkeypatch,
+  quota_etcd,
+):
+  files_quota.reset_application_fallback_sessions()
+
+  class ApplicationQuota:
+    quota_bytes = 1000
+    quota_usage_bytes = 10
+
+  async def read_app(_name):
+    return ApplicationQuota()
+
+  class Client:
+    def _create_multipart_upload(self, *_args, **_kwargs):
+      return "upload-mongo-fallback"
+
+  async def local_client():
+    return "beijing", Client()
+
+  async def warning(*_args, **_kwargs):
+    return None
+
+  async def admission_policy():
+    return 100
+
+  monkeypatch.setattr(
+    "src.modules.public.crud.read_application_by_name",
+    read_app,
+  )
+  monkeypatch.setattr(files_service, "_get_minio_client_with_server", local_client)
+  monkeypatch.setattr(files_service, "gen_object_key", lambda: "object-mongo-fallback")
+  monkeypatch.setattr(files_service, "_admission_block_percent", admission_policy)
+  monkeypatch.setattr(files_service, "_upload_quota_warning", warning)
+
+  result = await files_service.multipart_init(
+    {"app_name": "test-app", "api_key_id": "key-owner"},
+    "application/octet-stream",
+    size_bytes=20,
+  )
+
+  assert result.upload_id == "upload-mongo-fallback"
+  session = files_quota._FALLBACK_SESSIONS[
+    "quota/uploads/test-app/object-mongo-fallback"
+  ]
+  assert session["quota_generation"] == 3
+  assert session["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_multipart_init_falls_back_to_application_quota_when_etcd_hangs(
+  monkeypatch,
+):
+  files_quota.reset_application_fallback_sessions()
+  monkeypatch.setattr(files_quota.settings, "QUOTA_ETCD_ADMISSION_TIMEOUT_SECONDS", 0.05)
+
+  class HangingEtcd:
+    async def get(self, _key):
+      await asyncio.sleep(30)
+
+    async def close(self):
+      return None
+
+    async def transaction(self, **_kwargs):
+      await asyncio.sleep(30)
+      return False, []
+
+    async def lease(self, _ttl):
+      await asyncio.sleep(30)
+
+  async def get_client():
+    return HangingEtcd()
+
+  class ApplicationQuota:
+    quota_bytes = 1000
+    quota_usage_bytes = 10
+
+  async def read_app(_name):
+    return ApplicationQuota()
+
+  class Client:
+    def _create_multipart_upload(self, *_args, **_kwargs):
+      return "upload-timeout-fallback"
+
+  async def local_client():
+    return "beijing", Client()
+
+  async def warning(*_args, **_kwargs):
+    return None
+
+  async def admission_policy():
+    return 100
+
+  monkeypatch.setattr(etcd_op, "get_etcd_client", get_client)
+  monkeypatch.setattr(
+    "src.modules.public.crud.read_application_by_name",
+    read_app,
+  )
+  monkeypatch.setattr(files_service, "_get_minio_client_with_server", local_client)
+  monkeypatch.setattr(files_service, "gen_object_key", lambda: "object-timeout-fallback")
+  monkeypatch.setattr(files_service, "_admission_block_percent", admission_policy)
+  monkeypatch.setattr(files_service, "_upload_quota_warning", warning)
+
+  started = asyncio.get_running_loop().time()
+  result = await files_service.multipart_init(
+    {"app_name": "test-app", "api_key_id": "key-owner"},
+    "application/octet-stream",
+    size_bytes=20,
+  )
+  elapsed = asyncio.get_running_loop().time() - started
+
+  assert result.upload_id == "upload-timeout-fallback"
+  assert elapsed < 2
+  reservation = files_quota._reservation_from_dict(
+    "test-app",
+    files_quota._FALLBACK_SESSIONS["quota/uploads/test-app/object-timeout-fallback"],
+  )
+  assert reservation.quota_generation == 3
+
+
+@pytest.mark.asyncio
+async def test_multipart_init_fallback_still_enforces_application_quota(monkeypatch):
+  files_quota.reset_application_fallback_sessions()
+  monkeypatch.setattr(files_quota.settings, "QUOTA_ETCD_ADMISSION_TIMEOUT_SECONDS", 0.05)
+
+  class HangingEtcd:
+    async def get(self, _key):
+      await asyncio.sleep(30)
+
+    async def close(self):
+      return None
+
+  async def get_client():
+    return HangingEtcd()
+
+  class ApplicationQuota:
+    quota_bytes = 100
+    quota_usage_bytes = 90
+
+  async def read_app(_name):
+    return ApplicationQuota()
+
+  async def unexpected_client():
+    pytest.fail("MinIO must not start when application quota is already full")
+
+  async def admission_policy():
+    return 100
+
+  monkeypatch.setattr(etcd_op, "get_etcd_client", get_client)
+  monkeypatch.setattr(
+    "src.modules.public.crud.read_application_by_name",
+    read_app,
+  )
+  monkeypatch.setattr(files_service, "_get_minio_client_with_server", unexpected_client)
+  monkeypatch.setattr(files_service, "_admission_block_percent", admission_policy)
+
+  with pytest.raises(CustomException) as exc_info:
+    await files_service.multipart_init(
+      {"app_name": "test-app", "api_key_id": "key-owner"},
+      "application/octet-stream",
+      size_bytes=20,
+    )
+
+  assert exc_info.value.code == ErrorDesc.APP_STORAGE_QUOTA_EXCEEDED.code
+
+
+@pytest.mark.asyncio
+async def test_application_list_returns_cached_quota_without_live_refresh(monkeypatch):
+  first = _Application(usage=25)
+  first.name = "alpha"
+  first.quota_usage_updated_at = None
+  second = _Application(usage=40)
+  second.name = "beta"
+  second.quota_usage_updated_at = None
+
+  async def read_list():
+    return [first, second]
+
+  async def boom(*_args, **_kwargs):
+    raise AssertionError("application list must not refresh live quota usage")
+
+  monkeypatch.setattr(public_service.public_crud, "read_application_list", read_list)
+  monkeypatch.setattr(public_service, "refresh_application_quota_usage", boom)
+
+  result = await public_service.get_application_list()
+  assert [item["name"] for item in result["data"]] == ["alpha", "beta"]
+  assert result["data"][0]["quota_usage_bytes"] == 25
+  assert result["data"][1]["quota_usage_bytes"] == 40
+  assert result["data"][0]["quota_usage_ratio"] == 0.025
 
 
 @pytest.mark.asyncio

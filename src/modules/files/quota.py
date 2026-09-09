@@ -35,7 +35,73 @@ _SESSION_PREFIX = "quota/uploads"
 _LOCK_PREFIX = "/storagent/locks/quota"
 _QUOTA_EXCEEDED_REASON = "APP 存储超出限额，请联系管理员处理"
 _COMPACT_QUOTA_GENERATION = 2
+_APPLICATION_FALLBACK_GENERATION = 3
 _QUOTA_AGGREGATE_NOT_READY_REASON = "应用配额聚合尚未初始化，请稍后重试"
+_FALLBACK_SESSIONS: dict[str, dict[str, Any]] = {}
+_fallback_lock: asyncio.Lock | None = None
+_fallback_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+class EtcdAdmissionUnavailable(Exception):
+  """Compact Etcd admission did not complete within the request budget."""
+
+
+class _LocalLease:
+  def __init__(self, ttl: int = 60):
+    self.ttl = ttl
+
+  async def revoke(self) -> None:
+    return None
+
+
+class _NullEtcdClient:
+  """Stand-in when the pooled Etcd client itself cannot be obtained in time."""
+
+  async def get(self, _key: bytes):
+    return None
+
+  async def delete(self, _key: bytes):
+    return None
+
+  async def lease(self, ttl: int):
+    return _LocalLease(ttl)
+
+  async def close(self) -> None:
+    return None
+
+
+def _etcd_admission_timeout_seconds() -> float:
+  return max(float(settings.QUOTA_ETCD_ADMISSION_TIMEOUT_SECONDS), 0.05)
+
+
+def _fallback_session_lock() -> asyncio.Lock:
+  global _fallback_lock, _fallback_lock_loop
+  loop = asyncio.get_running_loop()
+  if _fallback_lock is None or _fallback_lock_loop is not loop:
+    _fallback_lock = asyncio.Lock()
+    _fallback_lock_loop = loop
+  return _fallback_lock
+
+
+def reset_application_fallback_sessions() -> None:
+  _FALLBACK_SESSIONS.clear()
+
+
+async def _await_etcd(awaitable):
+  try:
+    return await asyncio.wait_for(awaitable, timeout=_etcd_admission_timeout_seconds())
+  except asyncio.TimeoutError as error:
+    raise EtcdAdmissionUnavailable("etcd admission timed out") from error
+
+
+def _should_use_application_quota_fallback(error: BaseException) -> bool:
+  if isinstance(error, EtcdAdmissionUnavailable):
+    return True
+  if not isinstance(error, CustomException):
+    return False
+  if error.code != ErrorDesc.SYNC_FAILED.code:
+    return False
+  return _QUOTA_AGGREGATE_NOT_READY_REASON in str(error.reason or "")
 
 
 @dataclass(frozen=True)
@@ -236,6 +302,7 @@ def _reservation_from_dict(app_name: str, data: dict) -> UploadReservation:
     content_type=str(data.get("content_type") or "application/octet-stream"),
     status=str(data.get("status") or "active"),
     quota_generation=max(int(data.get("quota_generation") or 1), 1),
+    admission_usage_bytes=max(int(data.get("admission_usage_bytes") or 0), 0),
   )
 
 
@@ -372,8 +439,18 @@ async def upload_part_lock(
 
 @asynccontextmanager
 async def quota_request_client() -> AsyncIterator[Any]:
-  """Keep multipart init's compact admission on one Etcd connection."""
-  client = await etcd_op.get_etcd_client()
+  """Keep multipart init's compact admission on one Etcd connection.
+
+  The request-path client is pooled; close() is a no-op so this context
+  still owns the caller's use without forcing Authenticate on the next init.
+  If the pool itself cannot be obtained in time, yield a null client so
+  compact admission can fall back to the application quota fields.
+  """
+  try:
+    client = await _await_etcd(etcd_op.get_etcd_client())
+  except EtcdAdmissionUnavailable:
+    logger.warning("Etcd 客户端获取超时，上传准入将使用应用配额字段")
+    client = _NullEtcdClient()
   try:
     yield client
   finally:
@@ -381,14 +458,25 @@ async def quota_request_client() -> AsyncIterator[Any]:
 
 
 async def _read_dict(key: str, client: Any) -> dict:
-  return await etcd_op.pull_from_etcd_by_key(key, client=client)
+  fallback = _FALLBACK_SESSIONS.get(key)
+  if fallback is not None:
+    return dict(fallback)
+  try:
+    return await _await_etcd(etcd_op.pull_from_etcd_by_key(key, client=client))
+  except EtcdAdmissionUnavailable:
+    return {}
 
 
 async def _read_dict_with_rev(
   key: str,
   client: Any,
 ) -> tuple[dict, int | None]:
-  return await etcd_op.pull_from_etcd_by_key_with_rev(key, client=client)
+  fallback = _FALLBACK_SESSIONS.get(key)
+  if fallback is not None:
+    return dict(fallback), 1
+  return await _await_etcd(
+    etcd_op.pull_from_etcd_by_key_with_rev(key, client=client),
+  )
 
 
 async def _cas_put_many(
@@ -409,12 +497,51 @@ async def _cas_put_many(
       operations.append(client.transactions.put(full_key, payload))
     else:
       operations.append(client.transactions.put(full_key, payload, lease=lease))
-  status, _ = await client.transaction(
+  status, _ = await _await_etcd(client.transaction(
     compare=compares,
     success=operations,
     failure=[],
-  )
+  ))
   return bool(status)
+
+
+async def _merge_quota_session(
+  key: str,
+  mutator: Callable[[dict], dict],
+  *,
+  client: Any = None,
+  lease: Any = None,
+) -> dict:
+  async with _fallback_session_lock():
+    if key in _FALLBACK_SESSIONS:
+      updated = mutator(dict(_FALLBACK_SESSIONS[key]))
+      _FALLBACK_SESSIONS[key] = updated
+      return updated
+  return await etcd_op.merge_update_etcd_key(
+    key,
+    mutator,
+    client=client,
+    lease=lease,
+  )
+
+
+async def _finalize_application_fallback(
+  reservation: UploadReservation,
+  *,
+  completed: bool,
+) -> None:
+  key = _session_key(reservation.app_name, reservation.object_key)
+  async with _fallback_session_lock():
+    session = _FALLBACK_SESSIONS.get(key)
+    if isinstance(session, dict):
+      session["quota_finalized"] = True
+      session["status"] = "completed" if completed else "aborted"
+      session["expires_at"] = _new_expiry().isoformat()
+  if completed:
+    await _bump_application_quota_usage(
+      reservation.app_name,
+      reservation.declared_size_bytes,
+    )
 
 
 async def _read_admission_state(
@@ -631,12 +758,23 @@ async def reconcile_usage_aggregate(
 
 
 async def _delete_key(key: str, client: Any) -> None:
-  await client.delete(_full_key(key))
+  if key in _FALLBACK_SESSIONS:
+    _FALLBACK_SESSIONS.pop(key, None)
+    return
+  try:
+    await _await_etcd(client.delete(_full_key(key)))
+  except EtcdAdmissionUnavailable:
+    return
 
 
 async def _new_session_lease(client: Any):
   ttl = max(int(settings.APPLICATION_QUOTA_RESERVATION_TTL_SECONDS), 60)
-  return await client.lease(ttl)
+  if isinstance(client, _NullEtcdClient):
+    return _LocalLease(ttl)
+  try:
+    return await _await_etcd(client.lease(ttl))
+  except (EtcdAdmissionUnavailable, AttributeError):
+    return _LocalLease(ttl)
 
 
 def _is_no_such_upload_error(error: Exception) -> bool:
@@ -1074,6 +1212,136 @@ async def _reserve_upload_compact(
   )
 
 
+def _fallback_reserved_bytes(app_name: str) -> tuple[int, int]:
+  reserved = 0
+  count = 0
+  for session in _FALLBACK_SESSIONS.values():
+    if str(session.get("app_name") or "") != app_name:
+      continue
+    if bool(session.get("quota_finalized")):
+      continue
+    if str(session.get("status") or "") in {"cancelled", "aborted", "completed"}:
+      continue
+    reserved += max(int(session.get("declared_size_bytes") or 0), 0)
+    count += 1
+  return reserved, count
+
+
+async def _application_quota_fields(app_name: str) -> tuple[int, int]:
+  from src.modules.public import crud as public_crud
+
+  try:
+    application = await public_crud.read_application_by_name(app_name)
+  except CustomException:
+    raise
+  except Exception as error:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      _QUOTA_AGGREGATE_NOT_READY_REASON,
+    ) from error
+  if application is None:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      _QUOTA_AGGREGATE_NOT_READY_REASON,
+    )
+  quota_bytes = max(int(getattr(application, "quota_bytes", 0) or 0), 0)
+  usage_bytes = max(int(getattr(application, "quota_usage_bytes", 0) or 0), 0)
+  if quota_bytes <= 0:
+    raise CustomException(
+      ErrorDesc.SYNC_FAILED,
+      _QUOTA_AGGREGATE_NOT_READY_REASON,
+    )
+  return quota_bytes, usage_bytes
+
+
+async def _bump_application_quota_usage(app_name: str, size_bytes: int) -> None:
+  from beanie.exceptions import CollectionWasNotInitialized
+  from src.modules.public import crud as public_crud
+
+  try:
+    application = await public_crud.read_application_by_name(app_name)
+  except (CollectionWasNotInitialized, Exception) as error:
+    logger.warning("降级完成上传后未能回写应用用量 app=%s: %s", app_name, error)
+    return
+  if application is None:
+    return
+  application.quota_usage_bytes = (
+    max(int(getattr(application, "quota_usage_bytes", 0) or 0), 0)
+    + max(int(size_bytes), 0)
+  )
+  application.quota_usage_updated_at = utc_now()
+  await application.save()
+
+
+async def _reserve_upload_from_application(
+  *,
+  app_name: str,
+  api_key_id: str,
+  object_key: str,
+  source_server: str,
+  declared_size_bytes: int,
+  content_type: str,
+  block_percent: int,
+) -> UploadReservation:
+  if not 1 <= int(block_percent) <= 100:
+    raise CustomException(ErrorDesc.SYNC_FAILED, "全局配额阻断规则无效")
+  quota_bytes, usage_bytes = await _application_quota_fields(app_name)
+  admission_limit = max(int(quota_bytes * int(block_percent) / 100), 1)
+  now = utc_now()
+  expires_at = _new_expiry(now)
+  session_key = _session_key(app_name, object_key)
+  async with _fallback_session_lock():
+    reserved_bytes, reservation_count = _fallback_reserved_bytes(app_name)
+    if reservation_count >= max(
+      int(settings.APPLICATION_QUOTA_MAX_ACTIVE_RESERVATIONS),
+      1,
+    ):
+      raise CustomException(
+        ErrorDesc.STATUS_ERR,
+        "当前 APP 的活动上传任务过多，请稍后重试",
+      )
+    if usage_bytes + reserved_bytes + declared_size_bytes > admission_limit:
+      raise CustomException(
+        ErrorDesc.APP_STORAGE_QUOTA_EXCEEDED,
+        _QUOTA_EXCEEDED_REASON,
+      )
+    if session_key in _FALLBACK_SESSIONS:
+      raise CustomException(ErrorDesc.RES_ALREADY_EXISTS, "上传预留已存在")
+    created = {
+      "version": _STATE_VERSION,
+      "quota_generation": _APPLICATION_FALLBACK_GENERATION,
+      "app_name": app_name,
+      "api_key_id": api_key_id,
+      "object_key": object_key,
+      "upload_id": "",
+      "source_server": source_server,
+      "declared_size_bytes": int(declared_size_bytes),
+      "content_type": content_type or "application/octet-stream",
+      "status": "initializing",
+      "parts": {},
+      "quota_finalized": False,
+      "admission_usage_bytes": usage_bytes,
+      "created_at": now.isoformat(),
+      "expires_at": expires_at.isoformat(),
+    }
+    _FALLBACK_SESSIONS[session_key] = created
+  from src.core import metrics as metrics_mod
+  metrics_mod.incr("multipart_init_application_quota_fallback_total")
+  logger.warning(
+    "Etcd 准入不可用，已使用应用配额字段降级预留 app=%s usage=%s quota=%s size=%s",
+    app_name,
+    usage_bytes,
+    quota_bytes,
+    declared_size_bytes,
+  )
+  return UploadReservation(
+    **{
+      **_reservation_from_dict(app_name, created).__dict__,
+      "admission_usage_bytes": usage_bytes,
+    }
+  )
+
+
 async def reserve_upload(
   *,
   app_name: str,
@@ -1095,7 +1363,19 @@ async def reserve_upload(
   if use_compact_admission:
     own_client = client is None
     if own_client:
-      client = await etcd_op.get_etcd_client()
+      try:
+        client = await _await_etcd(etcd_op.get_etcd_client())
+      except EtcdAdmissionUnavailable:
+        logger.warning("Etcd 客户端获取超时，上传准入将使用应用配额字段")
+        return await _reserve_upload_from_application(
+          app_name=app_name,
+          api_key_id=api_key_id,
+          object_key=object_key,
+          source_server=source_server,
+          declared_size_bytes=declared_size_bytes,
+          content_type=content_type,
+          block_percent=block_percent,
+        )
     try:
       return await _reserve_upload_compact(
         app_name=app_name,
@@ -1108,6 +1388,18 @@ async def reserve_upload(
         usage_loader=usage_loader,
         block_percent=block_percent,
         client=client,
+      )
+    except (EtcdAdmissionUnavailable, CustomException) as error:
+      if not _should_use_application_quota_fallback(error):
+        raise
+      return await _reserve_upload_from_application(
+        app_name=app_name,
+        api_key_id=api_key_id,
+        object_key=object_key,
+        source_server=source_server,
+        declared_size_bytes=declared_size_bytes,
+        content_type=content_type,
+        block_percent=block_percent,
       )
     finally:
       if own_client:
@@ -1191,6 +1483,41 @@ async def activate_reservation(
   now = utc_now()
   expires_at = _new_expiry(now)
   app_name = reservation.app_name
+  if reservation.quota_generation == _APPLICATION_FALLBACK_GENERATION:
+    key = _session_key(app_name, reservation.object_key)
+    async with _fallback_session_lock():
+      session = _FALLBACK_SESSIONS.get(key)
+      if not isinstance(session, dict):
+        raise CustomException(ErrorDesc.STATUS_ERR, "上传预留不存在或已过期")
+      if (
+        str(session.get("api_key_id") or "") != reservation.api_key_id
+        or str(session.get("object_key") or "") != reservation.object_key
+      ):
+        raise CustomException(ErrorDesc.STATUS_ERR, "上传预留不存在或已过期")
+      status = str(session.get("status") or "")
+      current_upload_id = str(session.get("upload_id") or "")
+      if status == "active" and current_upload_id == upload_id:
+        return UploadReservation(
+          **{
+            **reservation.__dict__,
+            "upload_id": upload_id,
+            "expires_at": _parse_datetime(session.get("expires_at")) or expires_at,
+            "status": "active",
+          }
+        )
+      if status != "initializing" or current_upload_id:
+        raise CustomException(ErrorDesc.STATUS_ERR, "上传预留当前状态不允许激活")
+      session["upload_id"] = upload_id
+      session["status"] = "active"
+      session["expires_at"] = expires_at.isoformat()
+    return UploadReservation(
+      **{
+        **reservation.__dict__,
+        "upload_id": upload_id,
+        "expires_at": expires_at,
+        "status": "active",
+      }
+    )
   if reservation.quota_generation == _COMPACT_QUOTA_GENERATION:
     own_client = client is None
     if own_client:
@@ -1258,7 +1585,7 @@ async def activate_reservation(
   }
   async with application_quota_lock(app_name) as client:
     try:
-      await etcd_op.merge_update_etcd_key(
+      await _merge_quota_session(
         _session_key(app_name, reservation.object_key),
         lambda current: session if not current else current,
         client=client,
@@ -1308,6 +1635,12 @@ async def cancel_reservation(
   *,
   client: Any = None,
 ) -> None:
+  if reservation.quota_generation == _APPLICATION_FALLBACK_GENERATION:
+    _FALLBACK_SESSIONS.pop(
+      _session_key(reservation.app_name, reservation.object_key),
+      None,
+    )
+    return
   if reservation.quota_generation == _COMPACT_QUOTA_GENERATION:
     own_client = client is None
     if own_client:
@@ -1443,6 +1776,20 @@ async def _touch_state_reservation(
   reservation: UploadReservation,
   expires_at: datetime,
 ) -> None:
+  if reservation.quota_generation == _APPLICATION_FALLBACK_GENERATION:
+    key = _session_key(reservation.app_name, reservation.object_key)
+    async with _fallback_session_lock():
+      session = _FALLBACK_SESSIONS.get(key)
+      if not isinstance(session, dict):
+        raise CustomException(ErrorDesc.STATUS_ERR, "上传预留不存在或已过期")
+      _validate_identity(
+        session,
+        api_key_id=reservation.api_key_id,
+        object_key=reservation.object_key,
+        upload_id=reservation.upload_id,
+      )
+      session["expires_at"] = expires_at.isoformat()
+    return
   if reservation.quota_generation == _COMPACT_QUOTA_GENERATION:
     key = _session_key(reservation.app_name, reservation.object_key)
     for attempt in range(etcd_op.CAS_MAX_RETRIES):
@@ -1542,7 +1889,7 @@ async def prepare_part(
     stored_session.update(session)
     return session
 
-  await etcd_op.merge_update_etcd_key(
+  await _merge_quota_session(
     _session_key(app_name, object_key),
     mutator,
     client=client,
@@ -1577,7 +1924,7 @@ async def commit_part(
     session["expires_at"] = expires_at.isoformat()
     return session
 
-  await etcd_op.merge_update_etcd_key(
+  await _merge_quota_session(
     _session_key(reservation.app_name, reservation.object_key),
     mutator,
     client=client,
@@ -1617,7 +1964,7 @@ async def rollback_part(
     return session
 
   try:
-    await etcd_op.merge_update_etcd_key(
+    await _merge_quota_session(
       _session_key(reservation.app_name, reservation.object_key),
       mutator,
       client=client,
@@ -1716,7 +2063,7 @@ async def prepare_completion(
     prepared.update(session)
     return session
 
-  await etcd_op.merge_update_etcd_key(
+  await _merge_quota_session(
     _session_key(app_name, object_key),
     mutator,
     client=client,
@@ -1737,7 +2084,7 @@ async def restore_active_session(client: Any, reservation: UploadReservation) ->
       session["status"] = "active"
     return session
 
-  await etcd_op.merge_update_etcd_key(
+  await _merge_quota_session(
     _session_key(reservation.app_name, reservation.object_key),
     mutator,
     client=client,
@@ -1765,7 +2112,7 @@ async def record_completed_session(
     session["expires_at"] = _new_expiry().isoformat()
     return session
 
-  await etcd_op.merge_update_etcd_key(
+  await _merge_quota_session(
     _session_key(reservation.app_name, reservation.object_key),
     mutator,
     client=client,
@@ -1855,6 +2202,9 @@ async def finalize_completed_session(
   client: Any,
   reservation: UploadReservation,
 ) -> None:
+  if reservation.quota_generation == _APPLICATION_FALLBACK_GENERATION:
+    await _finalize_application_fallback(reservation, completed=True)
+    return
   if reservation.quota_generation == _COMPACT_QUOTA_GENERATION:
     await _finalize_compact_reservation(client, reservation, completed=True)
     return
@@ -2060,7 +2410,7 @@ async def prepare_abort(
     prepared.update(session)
     return session
 
-  await etcd_op.merge_update_etcd_key(
+  await _merge_quota_session(
     _session_key(app_name, object_key),
     mutator,
     client=client,
@@ -2080,7 +2430,7 @@ async def restore_aborted_session(client: Any, reservation: UploadReservation) -
       session["status"] = "active"
     return session
 
-  await etcd_op.merge_update_etcd_key(
+  await _merge_quota_session(
     _session_key(reservation.app_name, reservation.object_key),
     mutator,
     client=client,
@@ -2103,7 +2453,7 @@ async def record_aborted_session(client: Any, reservation: UploadReservation) ->
     session["expires_at"] = _new_expiry().isoformat()
     return session
 
-  await etcd_op.merge_update_etcd_key(
+  await _merge_quota_session(
     _session_key(reservation.app_name, reservation.object_key),
     mutator,
     client=client,
@@ -2112,6 +2462,9 @@ async def record_aborted_session(client: Any, reservation: UploadReservation) ->
 
 
 async def finalize_aborted_session(client: Any, reservation: UploadReservation) -> None:
+  if reservation.quota_generation == _APPLICATION_FALLBACK_GENERATION:
+    await _finalize_application_fallback(reservation, completed=False)
+    return
   if reservation.quota_generation == _COMPACT_QUOTA_GENERATION:
     await _finalize_compact_reservation(client, reservation, completed=False)
     return
