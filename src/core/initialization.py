@@ -1,5 +1,6 @@
 from src.utils.logger import logger
 
+
 async def init_project():
   """
   初始化项目
@@ -17,63 +18,97 @@ async def init_project():
   updated_users = await user_crud.recompute_all_user_permissions()
   logger.info(f"System roles initialized; normalized {updated_users} users.")
 
+
 async def init_service():
+  """Register this node and pull control-plane state.
+
+  Etcd/lock slowness must not block process startup. Each step is bounded,
+  busy user locks are skipped, and ``mc`` aliases can fall back to Mongo.
   """
-  初始化服务：注册本节点到 Etcd，并从 Etcd 全量同步到 MongoDB
-  """
+  import asyncio
+
   from src.configs.configs import settings
-  from src.core.exception import CustomException, ErrorDesc
   from src.core import etcd_op, minio_op, sync as sync_module
 
-  etcd_client = await etcd_op.get_etcd_client()
+  overall = max(float(getattr(settings, "INIT_SERVICE_TIMEOUT_SECONDS", 20.0) or 20.0), 1.0)
+  step = max(float(getattr(settings, "INIT_SERVICE_STEP_TIMEOUT_SECONDS", 8.0) or 8.0), 0.5)
+
+  async def _run_step(name: str, coro) -> None:
+    try:
+      await asyncio.wait_for(coro, timeout=step)
+    except Exception as error:
+      logger.warning(
+        f"init_service 步骤 {name} 未完成: {type(error).__name__}: {error}"
+      )
+
+  async def _body() -> None:
+    etcd_client = await asyncio.wait_for(etcd_op.get_etcd_client(), timeout=step)
+    try:
+      await _run_step(
+        "minio-probe",
+        asyncio.to_thread(
+          minio_op.test_minio_server,
+          host=settings.MINIO_HOST,
+          port=settings.MINIO_PORT,
+          access_key=settings.MINIO_ACCESS_KEY,
+          secret_key=settings.MINIO_SECRET_KEY,
+        ),
+      )
+
+      await _run_step(
+        "register-region",
+        etcd_op.merge_update_etcd_key(
+          sync_module.ETCD_KEY_REGION,
+          lambda data: {**data, settings.REGION: settings.REGION_NAME},
+          client=etcd_client,
+        ),
+      )
+
+      from src.core.crypto import encrypt_server_entry
+      entry = encrypt_server_entry({
+        "domain": settings.PUBLIC_DOMAIN,
+        "host": settings.SERVER_HOST,
+        "server_port": settings.SERVER_PORT,
+        "minio_port": settings.MINIO_PORT,
+        "access_key": settings.MINIO_ACCESS_KEY,
+        "secret_key": settings.MINIO_SECRET_KEY,
+        "replicate_weight": settings.MINIO_REPLICATE_WEIGHT,
+      })
+      await _run_step(
+        "register-server",
+        etcd_op.merge_update_etcd_key(
+          sync_module.ETCD_KEY_SERVERS,
+          lambda data: {**data, settings.REGION: entry},
+          client=etcd_client,
+        ),
+      )
+
+      await _run_step("publish-roles", sync_module.publish_roles(client=etcd_client))
+      await _run_step("publish-users", sync_module.publish_local_users(client=etcd_client))
+      await _run_step(
+        "bootstrap-topology",
+        sync_module.bootstrap_topology_layout(client=etcd_client),
+      )
+      await _run_step(
+        "backfill-quotas",
+        sync_module.backfill_application_quotas(client=etcd_client),
+      )
+      await _run_step(
+        "pull-sync",
+        sync_module.pull_all_and_sync(client=etcd_client, user_lock_timeout=0),
+      )
+      logger.info(f"Service Initialized: {settings.REGION_NAME} ({settings.REGION}).")
+    finally:
+      try:
+        await etcd_client.close()
+      except Exception:
+        pass
+
   try:
-    minio_op.test_minio_server(
-      host=settings.MINIO_HOST,
-      port=settings.MINIO_PORT,
-      access_key=settings.MINIO_ACCESS_KEY,
-      secret_key=settings.MINIO_SECRET_KEY
-    )
-    logger.info(f"Minio Server Tested: {settings.MINIO_HOST}:{settings.MINIO_PORT}.")
+    await asyncio.wait_for(_body(), timeout=overall)
+  except asyncio.TimeoutError:
+    logger.warning("init_service 总体超时，继续绑定端口")
+  except Exception as error:
+    logger.warning(f"init_service 失败（服务仍可启动）: {error}")
 
-    # 1. 注册本节点 Region 到 Etcd（CAS 合并）
-    await etcd_op.merge_update_etcd_key(
-      sync_module.ETCD_KEY_REGION,
-      lambda data: {**data, settings.REGION: settings.REGION_NAME},
-      client=etcd_client,
-    )
-
-    # 2. 注册本节点 MinIO Server 到 Etcd（凭证加密 + CAS）
-    from src.core.crypto import encrypt_server_entry
-    entry = encrypt_server_entry({
-      # Published separately from the MinIO host so external consumers always
-      # use the host Nginx gateway rather than an internal IP address.
-      "domain": settings.PUBLIC_DOMAIN,
-      "host": settings.SERVER_HOST,
-      "server_port": settings.SERVER_PORT,
-      "minio_port": settings.MINIO_PORT,
-      "access_key": settings.MINIO_ACCESS_KEY,
-      "secret_key": settings.MINIO_SECRET_KEY,
-      "replicate_weight": settings.MINIO_REPLICATE_WEIGHT,
-    })
-    await etcd_op.merge_update_etcd_key(
-      sync_module.ETCD_KEY_SERVERS,
-      lambda data: {**data, settings.REGION: entry},
-      client=etcd_client,
-    )
-
-    # 3. 合并本地身份数据。用户按 username 合并，不会覆盖其他区域独有用户。
-    await sync_module.publish_roles(client=etcd_client)
-    await sync_module.publish_local_users(client=etcd_client)
-
-    # 4. 拓扑布局仅首次由权威区域写入；后续所有区域均走共享 CAS 更新。
-    await sync_module.bootstrap_topology_layout(client=etcd_client)
-
-    # 任一节点都可用确定性默认值原子补齐历史应用，不覆盖合法自定义配额。
-    await sync_module.backfill_application_quotas(client=etcd_client)
-
-    # 5. 全量同步 Etcd -> MongoDB（含身份、应用、API Key、拓扑布局）
-    await sync_module.pull_all_and_sync(client=etcd_client)
-
-    logger.info(f"Service Initialized: {settings.REGION_NAME} ({settings.REGION}).")
-  finally:
-    await etcd_client.close()
+  await _run_step("mc-aliases-mongo", sync_module.ensure_mc_aliases_from_mongo())

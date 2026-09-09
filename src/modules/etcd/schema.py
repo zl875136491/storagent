@@ -6,6 +6,14 @@ from pydantic import BaseModel, Field
 
 
 EtcdStatus = Literal["healthy", "warning", "critical", "unknown"]
+EtcdAlertSeverity = Literal["warning", "critical"]
+
+
+class EtcdAlert(BaseModel):
+  severity: EtcdAlertSeverity
+  code: str
+  message: str
+  endpoint: str = ""
 
 
 class EtcdEndpointStatus(BaseModel):
@@ -25,6 +33,10 @@ class EtcdEndpointStatus(BaseModel):
   raft_applied_index: int = 0
   raft_lag: int = 0
   db_size_bytes: int = 0
+  quota_bytes: int = 0
+  quota_used_ratio: float = 0
+  rss_bytes: int = 0
+  nospace: bool = False
   revision: int = 0
   alarms: list[str] = Field(default_factory=list)
   error: str = ""
@@ -52,9 +64,12 @@ class EtcdClusterStatusResponse(BaseModel):
   leader_endpoint: str = ""
   versions: list[str] = Field(default_factory=list)
   database_size_bytes: int = 0
+  quota_bytes: int = 0
+  quota_used_ratio: float = 0
   revision: int = 0
   alarms: list[str] = Field(default_factory=list)
   members: list[EtcdEndpointStatus] = Field(default_factory=list)
+  alerts: list[EtcdAlert] = Field(default_factory=list)
   sync: EtcdSyncStatus
   reasons: list[str] = Field(default_factory=list)
   metadata: dict[str, Any] = Field(default_factory=dict)

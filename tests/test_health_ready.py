@@ -53,6 +53,26 @@ def test_ready_ok_when_ping_succeeds():
   assert resp.json()["status"] == "ready"
 
 
+def test_ready_retries_after_invalid_auth_token():
+  mock_client = MagicMock()
+  mock_client.admin.command = AsyncMock(return_value={"ok": 1})
+  stale = MagicMock()
+  stale.status = AsyncMock(side_effect=RuntimeError("etcdserver: invalid auth token"))
+  stale.close = AsyncMock()
+  fresh = MagicMock()
+  fresh.status = AsyncMock(return_value=MagicMock())
+  fresh.close = AsyncMock()
+  refresh = AsyncMock()
+  with patch("src.core.database.get_motor_client", return_value=mock_client), patch(
+    "src.core.etcd_op.get_etcd_client", new=AsyncMock(side_effect=[stale, fresh])
+  ), patch("src.core.etcd_op.refresh_shared_etcd_client", refresh):
+    client = TestClient(_app())
+    resp = client.get("/ready")
+  assert resp.status_code == 200
+  assert resp.json()["status"] == "ready"
+  refresh.assert_awaited()
+
+
 def test_health_always_ok():
   client = TestClient(_app())
   resp = client.get("/health")

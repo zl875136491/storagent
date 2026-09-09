@@ -44,6 +44,10 @@ SYNC_USER_PLACEHOLDER = "__sync__"
 ROLE_ORDER = (ROLE_USER, "应用管理员", "运维管理员", "用户管理员", ROLE_SUPERADMIN)
 
 
+def is_sync_authority_region() -> bool:
+  return str(settings.REGION).strip().lower() == str(settings.SYNC_AUTHORITY_REGION).strip().lower()
+
+
 def _ordered_role_names(names: Any) -> list[str]:
   unique = {str(name) for name in names if name}
   rank = {name: index for index, name in enumerate(ROLE_ORDER)}
@@ -415,12 +419,12 @@ async def _sync_user_to_mongo_locked(username: str, data: dict):
   return user
 
 
-async def sync_users_to_mongo(users_data: dict) -> None:
+async def sync_users_to_mongo(users_data: dict, *, lock_timeout: int = 30) -> None:
   for username, data in users_data.items():
     if not username or not isinstance(data, dict):
       continue
     try:
-      async with user_role_update_lock(username, timeout=30):
+      async with user_role_update_lock(username, timeout=lock_timeout):
         await _sync_user_to_mongo_locked(username, data)
     except UserIdentityUpdateLockBusyError:
       logger.warning(f"Etcd sync: User {username} 正在更新，将由周期校准重试")
@@ -1013,7 +1017,7 @@ async def build_topology_layout_snapshot() -> dict:
 
 async def bootstrap_topology_layout(client=None) -> bool:
   """Initialize topology layout exactly once, and only from the authority region."""
-  if str(settings.REGION).strip().lower() != str(settings.SYNC_AUTHORITY_REGION).strip().lower():
+  if not is_sync_authority_region():
     return False
 
   from src.core import etcd_op
@@ -1303,6 +1307,45 @@ async def ensure_mc_aliases_from_etcd() -> int:
     return len(servers_data)
   finally:
     await client.close()
+
+
+async def ensure_mc_aliases_from_mongo() -> int:
+  """Refresh local ``mc`` aliases from Mongo when Etcd is slow or empty."""
+  from src.modules.storage import crud as storage_crud
+  from src.core import minio_op
+
+  try:
+    servers = await storage_crud.read_minio_server_list()
+  except Exception as error:
+    logger.warning(f"mc alias Mongo 回退读取失败: {error}")
+    return 0
+
+  configured = 0
+  for server in servers:
+    region_name = (
+      getattr(getattr(server, "region", None), "name", None)
+      or getattr(server, "name", "")
+    )
+    if not region_name:
+      continue
+    try:
+      access_key, secret_key = storage_crud.plain_minio_credentials(server)
+    except Exception as error:
+      logger.warning(f"mc alias Mongo 凭证解密失败 {region_name}: {error}")
+      continue
+    success, res = await minio_op.set_site_alias(
+      site_name=region_name,
+      endpoint=f"{server.host}:{server.minio_port}",
+      admin_user=access_key,
+      admin_password=secret_key,
+    )
+    if not success:
+      logger.warning(f"mc alias Mongo 回退失败 {region_name}: {res}")
+      continue
+    configured += 1
+  if configured:
+    logger.info(f"已从 Mongo 补齐 {configured} 个 mc alias")
+  return configured
 
 
 class ReplicationPolicyError(RuntimeError):
@@ -1905,7 +1948,7 @@ async def publish_server_entry(
   await etcd_op.merge_update_etcd_key(ETCD_KEY_SERVERS, mutator)
 
 
-async def pull_all_and_sync(client=None):
+async def pull_all_and_sync(client=None, *, user_lock_timeout: int = 0):
   from src.core import etcd_op
 
   own_client = client is None
@@ -1918,7 +1961,7 @@ async def pull_all_and_sync(client=None):
 
     users_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_USERS, client=client)
     if users_data:
-      await sync_users_to_mongo(users_data)
+      await sync_users_to_mongo(users_data, lock_timeout=user_lock_timeout)
 
     region_data = await etcd_op.pull_from_etcd_by_key(ETCD_KEY_REGION, client=client)
     if region_data:

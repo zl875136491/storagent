@@ -52,6 +52,9 @@ class Settings(BaseSettings):
   BACKEND_CORS_MAX_AGE_SECONDS: int = 86400
   TIMEZONE: str = "Asia/Shanghai"
   INIT_SERVICE: bool = True
+  # Bounded startup: Etcd/lock slowness must not prevent bind.
+  INIT_SERVICE_TIMEOUT_SECONDS: float = 20.0
+  INIT_SERVICE_STEP_TIMEOUT_SECONDS: float = 8.0
   RELOAD: bool = False
   # 生产默认关闭 OpenAPI；DEBUG=true 时仍开启
   ENABLE_DOCS: bool = False
@@ -147,6 +150,14 @@ class Settings(BaseSettings):
   ETCD_HEALTH_CACHE_TTL_SECONDS: float = 30.0
   ETCD_RAFT_LAG_WARNING: int = 100
   ETCD_RAFT_LAG_CRITICAL: int = 1000
+  # Matches etcd --quota-backend-bytes (upstream default 2 GiB).
+  ETCD_QUOTA_BACKEND_BYTES: int = 2 * 1024 ** 3
+  ETCD_QUOTA_WARNING_RATIO: float = 0.8
+  ETCD_QUOTA_CRITICAL_RATIO: float = 0.9
+  ETCD_METRICS_PORT: int = 2381
+  # 0 disables RSS occupancy alerts; bytes are still scraped when reachable.
+  ETCD_RSS_WARNING_BYTES: int = 0
+  ETCD_RSS_CRITICAL_BYTES: int = 0
   ETCD_SNAPSHOT_DIR: str = "/tmp/storagent-etcd-snapshots"
   ETCD_SNAPSHOT_MAX_BYTES: int = 1024 ** 3
 
@@ -155,6 +166,7 @@ class Settings(BaseSettings):
   # initialization, every region may update the shared layout through Etcd CAS.
   SYNC_AUTHORITY_REGION: str = "beijing"
   SYNC_RECONCILE_INTERVAL_SECONDS: float = 30.0
+  SYNC_RECONCILE_LOCK_TTL_SECONDS: int = 45
   REPLICATION_RECONCILE_INTERVAL_SECONDS: float = 300.0
   REPLICATION_LOCK_TTL_SECONDS: int = 120
   REPLICATION_LOCK_TIMEOUT_SECONDS: int = 10

@@ -31,8 +31,9 @@ async def get_celery_overview(
 async def get_celery_history(
   request: Request,
   limit: int = Query(50, ge=1, le=200),
+  offset: int = Query(0, ge=0),
   current_user: User = Depends(get_current_user),
 ):
   await check_permissions(current_user, ["storage_operations_manage"])
   rate_limit_celery_history(request, current_user.username)
-  return await service.get_history(limit=limit)
+  return await service.get_history(limit=limit, offset=offset)

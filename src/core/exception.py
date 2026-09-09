@@ -179,12 +179,21 @@ class CustomException(HTTPException):
 
 def v2_error_response(exc: CustomException, request_id: str = "") -> dict:
   code, retryable = V2_ERROR_CODES.get(exc.error_desc, ("system.internal", False))
+  if isinstance(exc.reason, dict):
+    details = exc.reason
+    message = exc.message
+  elif isinstance(exc.reason, str) and exc.reason not in ("", "无详细描述"):
+    details = {}
+    message = exc.reason
+  else:
+    details = {}
+    message = exc.message
   return {
     "error": {
       "code": code,
-      "message": exc.message,
+      "message": message,
       "retryable": retryable,
-      "details": exc.reason if isinstance(exc.reason, dict) else {},
+      "details": details,
     },
     "request_id": request_id,
   }

@@ -868,9 +868,10 @@ async def _cleanup_expired_compact_sessions_locked(
 ) -> int:
   """Abort expired compact sessions from the background authority worker.
 
-  This function is deliberately never called by multipart/init.  Listing the
-  per-session prefix is bounded to the worker's maintenance cadence and keeps
-  request latency independent of the number of open uploads.
+  Multipart/init does not list sessions on the hot path. The only request-time
+  caller is compact admission after the live reservation counter is already at
+  the cap, so leaked expired sessions can be reclaimed without paying this cost
+  on every upload.
   """
   admission, _ = await _read_admission_state(app_name, client)
   if admission is None:
@@ -1102,6 +1103,7 @@ async def _reserve_upload_compact(
   session_key = _session_key(app_name, object_key)
 
   compact_retries = max(int(etcd_op.CAS_MAX_RETRIES), 24)
+  reclaimed = False
   for attempt in range(compact_retries):
     admission, admission_revision = await _read_admission_state(app_name, client)
     if admission is None:
@@ -1145,6 +1147,14 @@ async def _reserve_upload_compact(
       int(settings.APPLICATION_QUOTA_MAX_ACTIVE_RESERVATIONS),
       1,
     ):
+      # Compact init never lists sessions on the hot path. If the counter is
+      # already at the cap, reclaim expired compact sessions once so leaked
+      # stress-test or crashed-client reservations do not block every caller.
+      if not reclaimed:
+        reclaimed = True
+        cleaned = await _cleanup_expired_compact_sessions_locked(app_name, client)
+        if cleaned:
+          continue
       raise CustomException(
         ErrorDesc.STATUS_ERR,
         "当前 APP 的活动上传任务过多，请稍后重试",

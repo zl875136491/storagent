@@ -63,6 +63,148 @@ def _as_int(value: Any) -> int:
     return 0
 
 
+def _quota_backend_bytes() -> int:
+  return max(int(getattr(settings, "ETCD_QUOTA_BACKEND_BYTES", 0) or 0), 0)
+
+
+def _alarm_is_nospace(alarm: Any) -> bool:
+  if alarm is None:
+    return False
+  if isinstance(alarm, int):
+    return alarm == 1
+  text = str(alarm).strip().lower()
+  if "nospace" in text:
+    return True
+  # etcd protobuf AlarmType.NOSPACE == 1
+  return text in {"1", "alarmtype.1", "alarm_type.1"}
+
+
+def _worse_status(current: schema.EtcdStatus, candidate: schema.EtcdStatus) -> schema.EtcdStatus:
+  rank = {"healthy": 0, "unknown": 1, "warning": 2, "critical": 3}
+  return candidate if rank.get(candidate, 0) > rank.get(current, 0) else current
+
+
+def _append_reason(member: schema.EtcdEndpointStatus, text: str) -> None:
+  if text and text not in member.reasons:
+    member.reasons.append(text)
+
+
+def apply_capacity_status(member: schema.EtcdEndpointStatus) -> schema.EtcdEndpointStatus:
+  """Annotate quota occupancy, NOSPACE, and optional RSS onto one member."""
+  quota = _quota_backend_bytes()
+  member.quota_bytes = quota
+  if quota > 0 and member.db_size_bytes > 0:
+    member.quota_used_ratio = round(member.db_size_bytes / quota, 4)
+  else:
+    member.quota_used_ratio = 0.0
+  member.nospace = any(_alarm_is_nospace(item) for item in member.alarms)
+  warning_ratio = float(getattr(settings, "ETCD_QUOTA_WARNING_RATIO", 0.8) or 0.8)
+  critical_ratio = float(getattr(settings, "ETCD_QUOTA_CRITICAL_RATIO", 0.9) or 0.9)
+  rss_warning = int(getattr(settings, "ETCD_RSS_WARNING_BYTES", 0) or 0)
+  rss_critical = int(getattr(settings, "ETCD_RSS_CRITICAL_BYTES", 0) or 0)
+
+  if member.nospace:
+    member.status = "critical"
+    _append_reason(member, "etcd NOSPACE（存储配额已满）")
+  elif quota > 0 and member.quota_used_ratio >= critical_ratio:
+    member.status = _worse_status(member.status, "critical")
+    _append_reason(member, f"etcd 数据库占用 {member.quota_used_ratio:.0%} 配额")
+  elif quota > 0 and member.quota_used_ratio >= warning_ratio:
+    member.status = _worse_status(member.status, "warning")
+    _append_reason(member, f"etcd 数据库占用 {member.quota_used_ratio:.0%} 配额")
+
+  if member.rss_bytes and rss_critical and member.rss_bytes >= rss_critical:
+    member.status = _worse_status(member.status, "critical")
+    _append_reason(member, "etcd 进程 RSS 超过临界阈值")
+  elif member.rss_bytes and rss_warning and member.rss_bytes >= rss_warning:
+    member.status = _worse_status(member.status, "warning")
+    _append_reason(member, "etcd 进程 RSS 超过告警阈值")
+  return member
+
+
+def build_cluster_alerts(members: list[schema.EtcdEndpointStatus]) -> list[schema.EtcdAlert]:
+  warning_ratio = float(getattr(settings, "ETCD_QUOTA_WARNING_RATIO", 0.8) or 0.8)
+  critical_ratio = float(getattr(settings, "ETCD_QUOTA_CRITICAL_RATIO", 0.9) or 0.9)
+  raft_warning = int(getattr(settings, "ETCD_RAFT_LAG_WARNING", 100) or 100)
+  raft_critical = int(getattr(settings, "ETCD_RAFT_LAG_CRITICAL", 1000) or 1000)
+  rss_warning = int(getattr(settings, "ETCD_RSS_WARNING_BYTES", 0) or 0)
+  rss_critical = int(getattr(settings, "ETCD_RSS_CRITICAL_BYTES", 0) or 0)
+  alerts: list[schema.EtcdAlert] = []
+  for member in members:
+    if member.nospace:
+      alerts.append(schema.EtcdAlert(
+        severity="critical",
+        code="etcd_nospace",
+        message=f"{member.name} 触发 NOSPACE",
+        endpoint=member.endpoint,
+      ))
+    elif member.quota_bytes and member.quota_used_ratio >= critical_ratio:
+      alerts.append(schema.EtcdAlert(
+        severity="critical",
+        code="etcd_quota_critical",
+        message=f"{member.name} 数据库占用 {member.quota_used_ratio:.0%} 配额",
+        endpoint=member.endpoint,
+      ))
+    elif member.quota_bytes and member.quota_used_ratio >= warning_ratio:
+      alerts.append(schema.EtcdAlert(
+        severity="warning",
+        code="etcd_quota_warning",
+        message=f"{member.name} 数据库占用 {member.quota_used_ratio:.0%} 配额",
+        endpoint=member.endpoint,
+      ))
+    if member.raft_lag >= raft_critical:
+      alerts.append(schema.EtcdAlert(
+        severity="critical",
+        code="etcd_raft_lag_critical",
+        message=f"{member.name} Raft 延迟 {member.raft_lag}",
+        endpoint=member.endpoint,
+      ))
+    elif member.raft_lag >= raft_warning:
+      alerts.append(schema.EtcdAlert(
+        severity="warning",
+        code="etcd_raft_lag_warning",
+        message=f"{member.name} Raft 延迟 {member.raft_lag}",
+        endpoint=member.endpoint,
+      ))
+    if member.rss_bytes and rss_critical and member.rss_bytes >= rss_critical:
+      alerts.append(schema.EtcdAlert(
+        severity="critical",
+        code="etcd_rss_critical",
+        message=f"{member.name} 进程 RSS 超过临界阈值",
+        endpoint=member.endpoint,
+      ))
+    elif member.rss_bytes and rss_warning and member.rss_bytes >= rss_warning:
+      alerts.append(schema.EtcdAlert(
+        severity="warning",
+        code="etcd_rss_warning",
+        message=f"{member.name} 进程 RSS 超过告警阈值",
+        endpoint=member.endpoint,
+      ))
+  return alerts
+
+
+async def _read_process_rss_bytes(host: str) -> int:
+  """Best-effort scrape of etcd process_resident_memory_bytes."""
+  port = int(getattr(settings, "ETCD_METRICS_PORT", 2381) or 2381)
+  url = f"http://{host}:{port}/metrics"
+
+  def _fetch() -> int:
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=0.4) as response:
+      body = response.read().decode("utf-8", "replace")
+    for line in body.splitlines():
+      if line.startswith("process_resident_memory_bytes") and not line.startswith(
+        "process_resident_memory_bytes{"
+      ):
+        return max(int(float(line.split()[-1])), 0)
+    return 0
+
+  try:
+    return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=0.5)
+  except Exception:
+    return 0
+
+
 def _endpoint_list() -> list[tuple[str, str, int]]:
   """Return configured endpoints, preserving the complete default cluster."""
   raw = str(getattr(settings, "ETCD_ENDPOINTS", "") or "")
@@ -188,6 +330,7 @@ async def _check_endpoint(name: str, host: str, port: int) -> schema.EtcdEndpoin
     async for alarm in client.list_alarms():
       alarm_name = _value(alarm, "alarm", "alarm_type", "alarmType", default=alarm)
       alarms.append(str(alarm_name))
+    rss_bytes = await _read_process_rss_bytes(host)
     # aetcd 1.0.0rc3 does not expose applied index. Do not turn an
     # unavailable optional field into a false critical lag alarm.
     lag = max(fields["raft_index"] - _as_int(applied_index), 0) if applied_index is not None else 0
@@ -206,7 +349,7 @@ async def _check_endpoint(name: str, host: str, port: int) -> schema.EtcdEndpoin
       result = "warning"
       reasons.append(f"Raft applied index 落后 {lag}")
     latency = round((time.perf_counter() - started) * 1000, 2)
-    return schema.EtcdEndpointStatus(
+    member = schema.EtcdEndpointStatus(
       name=name,
       endpoint=endpoint,
       status=result,
@@ -215,9 +358,11 @@ async def _check_endpoint(name: str, host: str, port: int) -> schema.EtcdEndpoin
       latency_ms=latency,
       **fields,
       raft_lag=lag,
+      rss_bytes=rss_bytes,
       alarms=alarms,
       reasons=reasons,
     )
+    return apply_capacity_status(member)
   except Exception as error:
     latency = round((time.perf_counter() - started) * 1000, 2)
     logger.warning(f"etcd 状态检查失败 {endpoint}: {error}")
@@ -291,11 +436,24 @@ async def get_status(*, force_refresh: bool = False) -> schema.EtcdClusterStatus
       status = "warning"
       reasons.extend(reason for item in reachable for reason in item.reasons)
 
+    for item in members:
+      apply_capacity_status(item)
+    alerts = build_cluster_alerts(members)
+    if any(alert.severity == "critical" for alert in alerts):
+      status = "critical"
+    elif status == "healthy" and any(alert.severity == "warning" for alert in alerts):
+      status = "warning"
+    for alert in alerts:
+      if alert.message not in reasons:
+        reasons.append(alert.message)
+
     sync = _sync_status()
     if sync.watch_status == "warning" and status == "healthy":
       status = "warning"
       reasons.append("Storagent Etcd Watch 曾发生重连")
     versions = sorted({item.version for item in reachable if item.version})
+    quota_bytes = _quota_backend_bytes()
+    quota_used_ratio = max((item.quota_used_ratio for item in reachable), default=0.0)
     snapshot = schema.EtcdClusterStatusResponse(
       status=status,
       checked_at=datetime.now(timezone.utc),
@@ -306,13 +464,21 @@ async def get_status(*, force_refresh: bool = False) -> schema.EtcdClusterStatus
       leader_endpoint=leader_endpoint,
       versions=versions,
       database_size_bytes=sum(item.db_size_bytes for item in reachable),
+      quota_bytes=quota_bytes,
+      quota_used_ratio=quota_used_ratio,
       revision=max((item.revision for item in reachable), default=0),
       alarms=list(dict.fromkeys(alarm for item in reachable for alarm in item.alarms)),
       members=members,
+      alerts=alerts,
       sync=sync,
       reasons=list(dict.fromkeys(reasons)),
       metadata={"source": "configured_endpoints", "multi_endpoint": configured > 1},
     )
+    metrics.set_gauge("etcd_db_size_bytes", float(snapshot.database_size_bytes))
+    metrics.set_gauge("etcd_quota_used_ratio", float(snapshot.quota_used_ratio))
+    metrics.set_gauge("etcd_max_raft_lag", float(max((item.raft_lag for item in reachable), default=0)))
+    metrics.set_gauge("etcd_member_rss_bytes", float(max((item.rss_bytes for item in reachable), default=0)))
+    metrics.set_gauge("etcd_nospace", 1.0 if any(item.nospace for item in members) else 0.0)
     _cached_snapshot = snapshot
     _cached_at = time.monotonic()
     await _record(

@@ -47,6 +47,7 @@ class CeleryQueueStatus(BaseModel):
 class CeleryTaskExecution(BaseModel):
   id: str
   name: str
+  display_name: str = ""
   status: str
   worker: str = ""
   region: str = ""
@@ -98,5 +99,8 @@ class CeleryHistoryResponse(BaseModel):
   generated_at: datetime
   available: bool
   data: list[CeleryTaskExecution] = Field(default_factory=list)
+  total: int = 0
+  limit: int = 50
+  offset: int = 0
   legacy_record_count: int = 0
   message: str = ""

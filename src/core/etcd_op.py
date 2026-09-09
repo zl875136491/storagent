@@ -1,5 +1,6 @@
 import aetcd
 import asyncio
+import inspect
 import time
 from copy import deepcopy
 from typing import Any, Callable
@@ -27,19 +28,62 @@ _shared_wrapper: "_PooledEtcdClient | None" = None
 _shared_loop: asyncio.AbstractEventLoop | None = None
 
 
+def is_stale_etcd_auth_error(error: BaseException) -> bool:
+  """True when a pooled channel's auth token was invalidated (rolling restart)."""
+  text = " ".join(str(error).split()).lower()
+  return "invalid auth token" in text
+
+
+def is_recoverable_etcd_pool_error(error: BaseException) -> bool:
+  """True when replacing the pooled channel is likely to restore Etcd access."""
+  if is_stale_etcd_auth_error(error):
+    return True
+  text = " ".join(str(error).split()).lower()
+  markers = (
+    "connection refused",
+    "connection reset",
+    "failed to connect",
+    "socket closed",
+    "unavailable",
+    "statuscode.unavailable",
+    "connecterror",
+    "goaway",
+  )
+  return any(item in text for item in markers)
+
+
 class _PooledEtcdClient:
   """Share one authenticated gRPC channel across request-path Etcd calls.
 
   Callers historically create-and-close a client per request. Closing the
   pooled inner client would force every subsequent upload to Authenticate
   again, which on a loaded WAN cluster costs seconds.
+
+  After a rolling Etcd restart the cached token becomes ``invalid auth token``.
+  Unary RPCs retry once on a freshly authenticated inner client.
   """
 
   def __init__(self, inner: aetcd.Client):
     self._inner = inner
 
   def __getattr__(self, name: str):
-    return getattr(self._inner, name)
+    attr = getattr(self._inner, name)
+    if inspect.isasyncgenfunction(attr):
+      return attr
+    if not inspect.iscoroutinefunction(attr):
+      return attr
+
+    async def _wrapped(*args, **kwargs):
+      try:
+        return await getattr(self._inner, name)(*args, **kwargs)
+      except Exception as error:
+        if not is_recoverable_etcd_pool_error(error):
+          raise
+        logger.warning("etcd 连接池失效，重建请求路径连接: {}", error)
+        await refresh_shared_etcd_client()
+        return await getattr(self._inner, name)(*args, **kwargs)
+
+    return _wrapped
 
   async def close(self) -> None:
     return None
@@ -82,6 +126,25 @@ async def close_shared_etcd_client() -> None:
     await inner.close()
   except Exception:
     pass
+
+
+async def refresh_shared_etcd_client() -> "_PooledEtcdClient":
+  """Replace the pooled inner client and keep existing wrapper references."""
+  global _shared_inner, _shared_wrapper, _shared_loop
+  async with _current_pool_lock():
+    stale = _shared_inner
+    _shared_inner = aetcd.Client(**_etcd_client_options())
+    _shared_loop = asyncio.get_running_loop()
+    if _shared_wrapper is None:
+      _shared_wrapper = _PooledEtcdClient(_shared_inner)
+    else:
+      _shared_wrapper._inner = _shared_inner
+  if stale is not None:
+    try:
+      await stale.close()
+    except Exception:
+      pass
+  return _shared_wrapper
 
 
 async def get_etcd_client(*, dedicated: bool = False) -> aetcd.Client:
@@ -174,13 +237,15 @@ async def _handle_etcd_delete(key: str):
     logger.info(f"未处理的 Etcd DELETE: {short_key}")
 
 
-async def watch_etcd_task(client: aetcd.Client):
+async def watch_etcd_task(client: aetcd.Client | None = None):
   """
   增量更新订阅：监听 Etcd 变更并同步到 MongoDB（断线自动重连）
   """
   backoff = 1.0
   while True:
     try:
+      if client is None:
+        client = await get_etcd_client(dedicated=True)
       encoded_prefix = ETCD_PREFIX.encode()
       logger.info(
         "Etcd watch 已启动（roles / users / region / servers / applications / "
@@ -211,25 +276,44 @@ async def watch_etcd_task(client: aetcd.Client):
       await asyncio.sleep(backoff)
       backoff = min(backoff * 2, 30.0)
       try:
-        await client.close()
+        if client is not None:
+          await client.close()
       except Exception:
         pass
+      client = None
       try:
         client = await get_etcd_client(dedicated=True)
       except Exception as ce:
         logger.warning(f"Etcd 客户端重建失败: {ce}")
 
 
+def _reconcile_lock_key() -> bytes:
+  region = str(settings.REGION).strip().lower() or "unknown"
+  return f"/storagent/locks/etcd-reconcile/{region}".encode()
+
+
 async def reconcile_etcd_once() -> dict[str, str]:
   """Run one bounded Etcd-to-Mongo reconciliation pass."""
   client = None
+  lock = None
+  acquired = False
   try:
       client = await get_etcd_client()
-      await sync_module.publish_roles(client=client)
-      await sync_module.publish_local_users(client=client)
-      await sync_module.bootstrap_topology_layout(client=client)
-      await sync_module.backfill_application_quotas(client=client)
-      await sync_module.pull_all_and_sync(client=client)
+      lock = client.lock(
+        _reconcile_lock_key(),
+        ttl=max(int(getattr(settings, "SYNC_RECONCILE_LOCK_TTL_SECONDS", 45) or 45), 5),
+      )
+      acquired = await lock.acquire(timeout=0)
+      if not acquired:
+        from src.core import metrics as metrics_mod
+        metrics_mod.incr("sync_reconcile_skipped_total")
+        return {"status": "skipped", "reason": "already-running"}
+      if sync_module.is_sync_authority_region():
+        await sync_module.publish_roles(client=client)
+        await sync_module.publish_local_users(client=client)
+        await sync_module.bootstrap_topology_layout(client=client)
+        await sync_module.backfill_application_quotas(client=client)
+      await sync_module.pull_all_and_sync(client=client, user_lock_timeout=0)
       from src.core import metrics as metrics_mod
       metrics_mod.incr("sync_reconcile_runs_total")
       metrics_mod.set_gauge("sync_last_success_timestamp_seconds", time.time())
@@ -241,6 +325,11 @@ async def reconcile_etcd_once() -> dict[str, str]:
       logger.warning(f"Etcd 周期全量校准失败: {e}")
       raise
   finally:
+    if acquired and lock is not None:
+      try:
+        await lock.release()
+      except Exception:
+        pass
     if client is not None:
       try:
         await client.close()

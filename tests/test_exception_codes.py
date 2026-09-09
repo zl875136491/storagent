@@ -66,6 +66,19 @@ def test_v2_error_response_uses_stable_string_code_and_request_id():
   }
 
 
+def test_v2_error_response_prefers_string_reason_as_message():
+  exc = CustomException(ErrorDesc.STATUS_ERR, "当前 APP 的活动上传任务过多，请稍后重试")
+  assert v2_error_response(exc, "req_2") == {
+    "error": {
+      "code": "request.conflict",
+      "message": "当前 APP 的活动上传任务过多，请稍后重试",
+      "retryable": False,
+      "details": {},
+    },
+    "request_id": "req_2",
+  }
+
+
 def test_v2_minio_auth_error_is_not_retryable():
   exc = CustomException(
     ErrorDesc.MINIO_AUTH_FAILED,

@@ -102,6 +102,9 @@ async def test_check_endpoint_stays_reachable_when_revision_read_fails(monkeypat
 
   monkeypatch.setattr(service, "_make_client", lambda host, port: Client())
   monkeypatch.setattr(service, "_store_revision", boom)
+  async def no_rss(_host):
+    return 0
+  monkeypatch.setattr(service, "_read_process_rss_bytes", no_rss)
   result = await service._check_endpoint("etcd-2", "10.32.129.241", 2379)
   assert result.reachable is True
   assert result.status == "healthy"
@@ -111,6 +114,13 @@ async def test_check_endpoint_stays_reachable_when_revision_read_fails(monkeypat
 def test_message_too_large_is_not_reported_as_unreachable():
   error = RuntimeError("Received message larger than max (6470000 vs. 4194304)")
   assert service._endpoint_check_failure_reason(error) == "Etcd 响应超过 gRPC 消息上限"
+
+
+def test_alarm_type_one_is_nospace():
+  assert service._alarm_is_nospace(1) is True
+  assert service._alarm_is_nospace("1") is True
+  assert service._alarm_is_nospace("AlarmType.NOSPACE") is True
+  assert service._alarm_is_nospace("CORRUPT") is False
 
 
 def test_blank_endpoint_setting_uses_complete_default_cluster(monkeypatch):
@@ -145,6 +155,55 @@ async def test_status_reports_quorum_and_watch_state(monkeypatch):
   assert result.configured_endpoint_count == 3
   assert result.reachable_endpoint_count == 3
   assert result.sync.watch_status == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_status_flags_quota_warning_and_nospace(monkeypatch):
+  service.clear_cache()
+  monkeypatch.setattr(service.settings, "ETCD_ENDPOINTS", "http://etcd-a:2379")
+  monkeypatch.setattr(service.settings, "ETCD_QUOTA_BACKEND_BYTES", 1000)
+  monkeypatch.setattr(service.settings, "ETCD_QUOTA_WARNING_RATIO", 0.8)
+  monkeypatch.setattr(service.settings, "ETCD_QUOTA_CRITICAL_RATIO", 0.9)
+  monkeypatch.setattr(service.metrics, "snapshot", lambda: {"counters": {}, "gauges": {}})
+
+  async def warning_member(name, host, port):
+    return service.schema.EtcdEndpointStatus(
+      name=name,
+      endpoint=f"http://{host}:{port}",
+      status="healthy",
+      reachable=True,
+      is_leader=True,
+      leader_id="1",
+      member_id="1",
+      db_size_bytes=850,
+    )
+
+  monkeypatch.setattr(service, "_check_endpoint", warning_member)
+  warned = await service.get_status(force_refresh=True)
+  assert warned.status == "warning"
+  assert warned.quota_used_ratio == 0.85
+  assert any(alert.code == "etcd_quota_warning" for alert in warned.alerts)
+
+  service.clear_cache()
+
+  async def nospace_member(name, host, port):
+    return service.schema.EtcdEndpointStatus(
+      name=name,
+      endpoint=f"http://{host}:{port}",
+      status="healthy",
+      reachable=True,
+      is_leader=True,
+      leader_id="1",
+      member_id="1",
+      db_size_bytes=100,
+      alarms=["AlarmType.NOSPACE"],
+    )
+
+  monkeypatch.setattr(service, "_check_endpoint", nospace_member)
+  critical = await service.get_status(force_refresh=True)
+  assert critical.status == "critical"
+  assert any(alert.code == "etcd_nospace" for alert in critical.alerts)
+  assert critical.members[0].nospace is True
 
 
 @pytest.mark.asyncio

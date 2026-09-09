@@ -83,3 +83,36 @@ def test_lifespan_keeps_watch_off_the_request_pool():
   text = (Path(__file__).resolve().parents[1] / "main.py").read_text()
   assert "get_etcd_client(dedicated=True)" in text
   assert "close_shared_etcd_client" in text
+  assert "wait_for" in text
+
+
+def test_stale_auth_error_detection():
+  assert etcd_op.is_stale_etcd_auth_error(RuntimeError("etcdserver: invalid auth token"))
+  assert not etcd_op.is_stale_etcd_auth_error(RuntimeError("etcd down"))
+  assert etcd_op.is_recoverable_etcd_pool_error(RuntimeError("etcdserver: invalid auth token"))
+  assert etcd_op.is_recoverable_etcd_pool_error(RuntimeError("failed to connect: connection refused"))
+  assert not etcd_op.is_recoverable_etcd_pool_error(RuntimeError("etcd down"))
+
+
+@pytest.mark.asyncio
+async def test_pooled_status_retries_after_invalid_auth_token(reset_etcd_pool, monkeypatch):
+  class AuthFake:
+    created = 0
+
+    def __init__(self, **kwargs):
+      type(self).created += 1
+      self.generation = type(self).created
+
+    async def status(self):
+      if self.generation == 1:
+        raise RuntimeError("etcdserver: invalid auth token")
+      return "ok"
+
+    async def close(self):
+      return None
+
+  monkeypatch.setattr(etcd_op, "aetcd", type("A", (), {"Client": AuthFake}))
+  pooled = await etcd_op.get_etcd_client()
+  assert await pooled.status() == "ok"
+  assert AuthFake.created == 2
+  assert pooled._inner.generation == 2

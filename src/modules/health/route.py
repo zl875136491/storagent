@@ -26,7 +26,6 @@ async def readiness_check():
   就绪探针：MongoDB / Etcd 不可用时返回 HTTP 503，便于编排摘流
   """
   from src.core.database import get_motor_client
-  from src.core.etcd_op import get_etcd_client
 
   client = get_motor_client()
   if client is None:
@@ -44,8 +43,21 @@ async def readiness_check():
 
   etcd = None
   try:
+    from src.core.etcd_op import (
+      get_etcd_client,
+      is_recoverable_etcd_pool_error,
+      refresh_shared_etcd_client,
+    )
+
     etcd = await get_etcd_client()
-    await etcd.status()
+    try:
+      await etcd.status()
+    except Exception as error:
+      if not is_recoverable_etcd_pool_error(error):
+        raise
+      await refresh_shared_etcd_client()
+      etcd = await get_etcd_client()
+      await etcd.status()
   except Exception as e:
     return JSONResponse(
       status_code=503,
@@ -71,6 +83,12 @@ async def metrics_endpoint(format: str = "prometheus"):
   暴露进程内指标。默认 Prometheus text；`?format=json` 返回 JSON。
   """
   from src.core import metrics as metrics_mod
+
+  try:
+    from src.modules.etcd import service as etcd_service
+    await etcd_service.get_status()
+  except Exception:
+    pass
 
   if format == "json":
     return JSONResponse(

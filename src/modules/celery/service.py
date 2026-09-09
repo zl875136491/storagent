@@ -109,6 +109,11 @@ TASK_CATALOG = (
   },
 )
 
+_TASK_DISPLAY_NAMES = {
+  str(item["name"]): str(item["display_name"]) for item in TASK_CATALOG
+}
+_IN_PROGRESS_STATUSES = {"STARTED", "RETRY"}
+
 _overview_cache_lock = asyncio.Lock()
 _overview_cache_value: schema.CeleryOverviewResponse | None = None
 _overview_cache_at = 0.0
@@ -208,6 +213,13 @@ def clear_overview_cache() -> None:
   _overview_cache_at = 0.0
 
 
+def _task_display_name(name: str) -> str:
+  normalized = str(name or "").strip()
+  if not normalized:
+    return "未知任务"
+  return _TASK_DISPLAY_NAMES.get(normalized) or normalized
+
+
 def task_catalog() -> list[schema.CeleryTaskCatalogItem]:
   rows = []
   for item in TASK_CATALOG:
@@ -262,33 +274,64 @@ async def _inspect_runtime() -> tuple[dict[str, Any], list[str]]:
     return {}, ["inspect: timeout"]
 
 
+def _runtime_payload(raw: Any, scheduled: bool) -> dict[str, Any] | None:
+  if not isinstance(raw, dict):
+    return None
+  nested = raw.get("request") if isinstance(raw.get("request"), dict) else None
+  if scheduled:
+    return nested or raw
+  if nested is None:
+    return raw
+  merged = dict(nested)
+  for key, value in raw.items():
+    if key == "request":
+      continue
+    if key not in merged or merged.get(key) in (None, ""):
+      merged[key] = value
+  return merged
+
+
 def _task_from_runtime(
   raw: Any,
   *,
   worker: str,
   status: str,
   scheduled: bool = False,
+  region: str = "",
 ) -> schema.CeleryTaskExecution | None:
-  request = raw.get("request", {}) if scheduled and isinstance(raw, dict) else raw
-  if not isinstance(request, dict):
+  request = _runtime_payload(raw, scheduled)
+  if request is None:
     return None
-  task_id = str(request.get("id") or "")
-  name = str(request.get("name") or "")
+  task_id = str(
+    request.get("id")
+    or request.get("uuid")
+    or request.get("task_id")
+    or ""
+  ).strip()
+  name = str(
+    request.get("name")
+    or request.get("type")
+    or request.get("task")
+    or ""
+  ).strip()
   if not task_id and not name:
     return None
   delivery = request.get("delivery_info") if isinstance(request.get("delivery_info"), dict) else {}
   headers = request.get("headers") if isinstance(request.get("headers"), dict) else {}
+  display_name = _task_display_name(name)
   return schema.CeleryTaskExecution(
     id=task_id or "-",
     name=name or "未知任务",
+    display_name=display_name,
     status=status,
     worker=worker,
-    queue=str(delivery.get("routing_key") or "celery"),
+    region=region,
+    queue=str(delivery.get("routing_key") or request.get("queue") or "celery"),
     origin_region=str(headers.get("storagent-origin-region") or ""),
     task_protocol=str(headers.get("storagent-task-protocol") or ""),
     retries=_as_int(request.get("retries")),
-    received_at=_as_datetime(request.get("time_start")),
-    started_at=_as_datetime(request.get("time_start")),
+    received_at=_as_datetime(request.get("time_start") or request.get("received_at")),
+    started_at=_as_datetime(request.get("time_start") or request.get("started_at")),
     eta=_as_datetime(raw.get("eta")) if scheduled and isinstance(raw, dict) else None,
     source="runtime",
   )
@@ -351,6 +394,17 @@ async def _load_persistence() -> dict[str, Any]:
       {},
       {"_id": 0, "key": 1, "owner": 1, "expires_at": 1, "updated_at": 1},
     ).to_list(length=100)
+    in_progress_rows = await result_db[settings.CELERY_TASK_HISTORY_COLLECTION].find(
+      {"status": {"$in": list(_IN_PROGRESS_STATUSES)}},
+      {
+        "task_id": 1, "task_name": 1, "status": 1, "worker": 1,
+        "region": 1, "queue": 1, "retries": 1, "received_at": 1,
+        "started_at": 1, "finished_at": 1, "duration_ms": 1,
+        "result_summary": 1, "result_summary_version": 1,
+        "error": 1, "error_summary_version": 1,
+        "origin_region": 1, "task_protocol": 1, "updated_at": 1,
+      },
+    ).sort("updated_at", -1).to_list(length=200)
     return {
       "broker_database": broker_db_name,
       "pending_rows": pending_rows,
@@ -358,6 +412,7 @@ async def _load_persistence() -> dict[str, Any]:
       "queue_rows": queue_rows,
       "heartbeat_rows": heartbeat_rows,
       "beat_lock_rows": beat_lock_rows,
+      "in_progress_rows": in_progress_rows,
     }
   finally:
     broker_client.close()
@@ -517,16 +572,38 @@ def _worker_statuses(
     pool = worker_stats.get("pool") if isinstance(worker_stats.get("pool"), dict) else {}
     total = worker_stats.get("total") if isinstance(worker_stats.get("total"), dict) else {}
     source = "both" if online_from_inspect and heartbeat else "inspect" if online_from_inspect else "heartbeat"
+    worker_active: list[schema.CeleryTaskExecution] = []
+    worker_reserved: list[schema.CeleryTaskExecution] = []
+    worker_scheduled: list[schema.CeleryTaskExecution] = []
+    region = str(heartbeat.get("region") or "")
+    for item in active.get(name) or []:
+      task = _task_from_runtime(item, worker=name, status="STARTED", region=region)
+      if task:
+        worker_active.append(task)
+    for item in reserved.get(name) or []:
+      task = _task_from_runtime(item, worker=name, status="RESERVED", region=region)
+      if task:
+        worker_reserved.append(task)
+    for item in scheduled.get(name) or []:
+      task = _task_from_runtime(
+        item,
+        worker=name,
+        status="SCHEDULED",
+        scheduled=True,
+        region=region,
+      )
+      if task:
+        worker_scheduled.append(task)
     workers.append(schema.CeleryWorkerStatus(
       name=name,
       hostname=str(heartbeat.get("hostname") or name.split("@", 1)[-1]),
-      region=str(heartbeat.get("region") or ""),
+      region=region,
       status=status,
       last_seen=last_seen,
       heartbeat_age_seconds=age,
-      active_count=len(active.get(name) or []),
-      reserved_count=len(reserved.get(name) or []),
-      scheduled_count=len(scheduled.get(name) or []),
+      active_count=len(worker_active),
+      reserved_count=len(worker_reserved),
+      scheduled_count=len(worker_scheduled),
       processed_count=sum(_as_int(value) for value in total.values()),
       concurrency=_as_int(pool.get("max-concurrency")) or _as_int(heartbeat.get("concurrency")) or None,
       registered_task_count=len(registered.get(name) or []),
@@ -535,19 +612,53 @@ def _worker_statuses(
       beat_enabled=bool(heartbeat.get("beat_enabled", False)),
       source=source,
     ))
-    for item in active.get(name) or []:
-      task = _task_from_runtime(item, worker=name, status="STARTED")
-      if task:
-        active_tasks.append(task)
-    for item in reserved.get(name) or []:
-      task = _task_from_runtime(item, worker=name, status="RESERVED")
-      if task:
-        reserved_tasks.append(task)
-    for item in scheduled.get(name) or []:
-      task = _task_from_runtime(item, worker=name, status="SCHEDULED", scheduled=True)
-      if task:
-        scheduled_tasks.append(task)
+    active_tasks.extend(worker_active)
+    reserved_tasks.extend(worker_reserved)
+    scheduled_tasks.extend(worker_scheduled)
   return workers, active_tasks, reserved_tasks, scheduled_tasks
+
+
+def _in_progress_still_running(row: dict[str, Any], online_workers: set[str]) -> bool:
+  worker = str(row.get("worker") or "").strip()
+  if worker and worker in online_workers:
+    return True
+  updated = _as_datetime(row.get("updated_at") or row.get("started_at"))
+  if updated is None:
+    return False
+  stale_after = max(_as_int(settings.CELERY_WORKER_STALE_AFTER_SECONDS), 1)
+  age = (utc_now() - updated).total_seconds()
+  return age <= max(stale_after * 3, 300)
+
+
+def _merge_in_progress_history(
+  workers: list[schema.CeleryWorkerStatus],
+  active_tasks: list[schema.CeleryTaskExecution],
+  reserved_tasks: list[schema.CeleryTaskExecution],
+  rows: list[dict[str, Any]],
+) -> tuple[list[schema.CeleryWorkerStatus], list[schema.CeleryTaskExecution]]:
+  """Celery inspect on Mongo broker can miss running tasks; history STARTED/RETRY fills the gap."""
+  seen = {item.id for item in active_tasks if item.id and item.id != "-"}
+  seen.update(item.id for item in reserved_tasks if item.id and item.id != "-")
+  online_workers = {worker.name for worker in workers if worker.status == "online"}
+  extra: list[schema.CeleryTaskExecution] = []
+  for row in rows:
+    if str(row.get("status") or "") not in _IN_PROGRESS_STATUSES:
+      continue
+    if not _in_progress_still_running(row, online_workers):
+      continue
+    task = _history_item({**row, "source": "history"})
+    if task.id in seen:
+      continue
+    extra.append(task)
+    seen.add(task.id)
+  merged = [*active_tasks, *extra]
+  counts: dict[str, int] = defaultdict(int)
+  for item in merged:
+    if item.worker:
+      counts[item.worker] += 1
+  for worker in workers:
+    worker.active_count = counts.get(worker.name, 0)
+  return workers, merged
 
 
 def _beat_leaders(rows: list[dict[str, Any]]) -> list[schema.CeleryBeatLeader]:
@@ -598,6 +709,12 @@ async def _build_overview() -> schema.CeleryOverviewResponse:
   workers, active_tasks, reserved_tasks, scheduled_tasks = _worker_statuses(
     runtime,
     list(persistence.get("heartbeat_rows") or []),
+  )
+  workers, active_tasks = _merge_in_progress_history(
+    workers,
+    active_tasks,
+    reserved_tasks,
+    list(persistence.get("in_progress_rows") or []),
   )
   queues = _queue_statuses(
     list(persistence.get("pending_rows") or []),
@@ -650,9 +767,11 @@ async def get_overview() -> schema.CeleryOverviewResponse:
 def _history_item(row: dict[str, Any]) -> schema.CeleryTaskExecution:
   has_safe_summary = int(row.get("result_summary_version") or 0) >= 2
   has_safe_error = int(row.get("error_summary_version") or 0) >= 2
+  name = str(row.get("task_name") or "未记录任务名")
   return schema.CeleryTaskExecution(
     id=str(row.get("task_id") or row.get("_id") or "-"),
-    name=str(row.get("task_name") or "未记录任务名"),
+    name=name,
+    display_name=_task_display_name(name) if name != "未记录任务名" else name,
     status=str(row.get("status") or "UNKNOWN"),
     worker=str(row.get("worker") or ""),
     region=str(row.get("region") or ""),
@@ -682,12 +801,27 @@ def _history_item(row: dict[str, Any]) -> schema.CeleryTaskExecution:
   )
 
 
-async def get_history(limit: int = 50) -> schema.CeleryHistoryResponse:
+_HISTORY_PROJECTION = {
+  "task_id": 1, "task_name": 1, "status": 1, "worker": 1,
+  "region": 1, "queue": 1, "retries": 1, "received_at": 1,
+  "started_at": 1, "finished_at": 1, "duration_ms": 1,
+  "result_summary": 1, "result_summary_version": 1,
+  "error": 1, "error_summary_version": 1,
+  "origin_region": 1, "task_protocol": 1,
+}
+
+
+async def get_history(limit: int = 50, offset: int = 0) -> schema.CeleryHistoryResponse:
   generated_at = utc_now()
+  limit = max(int(limit), 1)
+  offset = max(int(offset), 0)
   if not settings.CELERY_ENABLED:
     return schema.CeleryHistoryResponse(
       generated_at=generated_at,
       available=False,
+      total=0,
+      limit=limit,
+      offset=offset,
       message="当前节点未启用 Celery。",
     )
   result = result_backend()
@@ -700,41 +834,30 @@ async def get_history(limit: int = 50) -> schema.CeleryHistoryResponse:
   try:
     await client.admin.command("ping")
     database = client[result_db_name]
-    history_rows = await database[settings.CELERY_TASK_HISTORY_COLLECTION].find(
+    history_collection = database[settings.CELERY_TASK_HISTORY_COLLECTION]
+    total = int(await history_collection.count_documents({}))
+    history_rows = await history_collection.find(
       {},
-      {
-        "task_id": 1, "task_name": 1, "status": 1, "worker": 1,
-        "region": 1, "queue": 1, "retries": 1, "received_at": 1,
-        "started_at": 1, "finished_at": 1, "duration_ms": 1,
-        "result_summary": 1, "result_summary_version": 1,
-        "error": 1, "error_summary_version": 1,
-        "origin_region": 1, "task_protocol": 1,
-      },
-    ).sort("updated_at", -1).limit(limit).to_list(length=limit)
+      _HISTORY_PROJECTION,
+    ).sort("updated_at", -1).skip(offset).limit(limit).to_list(length=limit)
     rows = [_history_item({**row, "source": "history"}) for row in history_rows]
-    seen_ids = {item.id for item in rows}
-    remaining = max(limit - len(rows), 0)
     legacy_count = 0
-    if remaining:
+    if total == 0 and offset == 0:
+      remaining = limit
       legacy_rows = await database[settings.CELERY_MONGODB_RESULT_COLLECTION].find(
         {}, {"status": 1, "result": 1, "traceback": 1, "date_done": 1},
-      ).sort("date_done", -1).limit(limit + len(seen_ids)).to_list(length=limit + len(seen_ids))
+      ).sort("date_done", -1).limit(remaining).to_list(length=remaining)
       for row in legacy_rows:
-        task_id = str(row.get("_id") or "")
-        if task_id in seen_ids:
-          continue
         rows.append(_history_item({**row, "source": "legacy"}))
         legacy_count += 1
-        if len(rows) >= limit:
-          break
-    rows.sort(
-      key=lambda item: item.finished_at or item.started_at or item.received_at or datetime.min.replace(tzinfo=timezone.utc),
-      reverse=True,
-    )
+      total = legacy_count
     return schema.CeleryHistoryResponse(
       generated_at=generated_at,
       available=True,
-      data=rows[:limit],
+      data=rows,
+      total=total,
+      limit=limit,
+      offset=offset,
       legacy_record_count=legacy_count,
       message=(
         "旧版 Celery 结果仅保存状态和结果，不保存任务名、区域或 worker；"
@@ -747,6 +870,9 @@ async def get_history(limit: int = 50) -> schema.CeleryHistoryResponse:
     return schema.CeleryHistoryResponse(
       generated_at=generated_at,
       available=False,
+      total=0,
+      limit=limit,
+      offset=offset,
       message=f"历史记录读取失败: {type(error).__name__}",
     )
   finally:

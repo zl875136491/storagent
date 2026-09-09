@@ -9,6 +9,8 @@ from pymongo.errors import DuplicateKeyError
 
 from src.core import etcd_op
 from src.core import sync as sync_module
+from src.modules.storage import crud as storage_crud
+from src.core import minio_op
 from src.modules.auth import crud as auth_crud
 from src.modules.auth.model import Role
 from src.modules.graph import service as graph_service
@@ -127,6 +129,43 @@ async def test_alias_refresh_reads_shared_server_registry(monkeypatch):
     ("pull", sync_module.ETCD_KEY_SERVERS, client),
     ("aliases", servers),
     "close",
+  ]
+
+
+@pytest.mark.asyncio
+async def test_alias_refresh_falls_back_to_mongo(monkeypatch):
+  calls = []
+  servers = [
+    SimpleNamespace(
+      name="shown",
+      host="10.0.0.8",
+      minio_port=9000,
+      region=SimpleNamespace(name="beijing"),
+    )
+  ]
+
+  async def list_servers():
+    return servers
+
+  def creds(_server):
+    return ("ak", "sk")
+
+  async def set_alias(**kwargs):
+    calls.append(kwargs)
+    return True, "ok"
+
+  monkeypatch.setattr(storage_crud, "read_minio_server_list", list_servers)
+  monkeypatch.setattr(storage_crud, "plain_minio_credentials", creds)
+  monkeypatch.setattr(minio_op, "set_site_alias", set_alias)
+
+  assert await sync_module.ensure_mc_aliases_from_mongo() == 1
+  assert calls == [
+    {
+      "site_name": "beijing",
+      "endpoint": "10.0.0.8:9000",
+      "admin_user": "ak",
+      "admin_password": "sk",
+    }
   ]
 
 

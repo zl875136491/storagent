@@ -167,6 +167,19 @@ class _FakeEtcd:
   async def close(self):
     return None
 
+  async def get_prefix(self, prefix):
+    raw_prefix = prefix if isinstance(prefix, bytes) else str(prefix).encode()
+    kvs = []
+    for key, item in self.state.items.items():
+      raw_key = key if isinstance(key, bytes) else str(key).encode()
+      if not raw_key.startswith(raw_prefix):
+        continue
+      value = item["value"]
+      if isinstance(value, str):
+        value = value.encode()
+      kvs.append(SimpleNamespace(key=raw_key, value=value))
+    return SimpleNamespace(kvs=kvs)
+
 
 @pytest.fixture
 def quota_etcd(monkeypatch):
@@ -1482,6 +1495,60 @@ async def test_compact_finalize_updates_usage_once(quota_etcd):
     "quota/uploads/finalize-app/object-finalize",
   )
   assert session["quota_finalized"] is True
+
+
+@pytest.mark.asyncio
+async def test_compact_admission_reclaims_expired_sessions_at_cap(
+  monkeypatch,
+  quota_etcd,
+):
+  monkeypatch.setattr(
+    files_quota.settings,
+    "APPLICATION_QUOTA_MAX_ACTIVE_RESERVATIONS",
+    1,
+  )
+  await _seed_compact_admission(
+    quota_etcd,
+    app_name="cap-app",
+    compact_reserved_bytes=10,
+    compact_reservation_count=1,
+  )
+  client = _FakeEtcd(quota_etcd)
+  expired = (utc_now() - timedelta(seconds=1)).isoformat()
+  await etcd_op.push_to_etcd(
+    "quota/uploads/cap-app/object-stale",
+    {
+      "version": 1,
+      "quota_generation": 2,
+      "app_name": "cap-app",
+      "api_key_id": "stale-key",
+      "object_key": "object-stale",
+      "upload_id": "",
+      "source_server": "beijing",
+      "declared_size_bytes": 10,
+      "content_type": "application/octet-stream",
+      "status": "initializing",
+      "parts": {},
+      "quota_finalized": False,
+      "created_at": expired,
+      "expires_at": expired,
+    },
+    client=client,
+  )
+
+  reservation = await files_quota.reserve_upload(
+    app_name="cap-app",
+    api_key_id="fresh-key",
+    object_key="object-fresh",
+    source_server="beijing",
+    declared_size_bytes=8,
+    use_compact_admission=True,
+  )
+
+  assert reservation.object_key == "object-fresh"
+  state = await _read_quota_key(quota_etcd, "quota/admission/apps/cap-app")
+  assert state["reservation_count"] == 1
+  assert state["reserved_bytes"] == 8
 
 
 @pytest.mark.asyncio

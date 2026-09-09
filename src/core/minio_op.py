@@ -28,11 +28,18 @@ async def _refresh_mc_aliases_if_due(*, force: bool = False) -> bool:
   try:
     from src.core import sync as sync_module
 
-    await sync_module.ensure_mc_aliases_from_etcd()
+    count = await sync_module.ensure_mc_aliases_from_etcd()
+    if count == 0:
+      await sync_module.ensure_mc_aliases_from_mongo()
   except Exception:
-    # Keep a usable cached alias available when Etcd is temporarily unavailable.
-    _mc_alias_refresh_deadline = monotonic() + _MC_ALIAS_RETRY_INTERVAL_SECONDS
-    return False
+    try:
+      from src.core import sync as sync_module
+
+      await sync_module.ensure_mc_aliases_from_mongo()
+    except Exception:
+      # Keep a usable cached alias available when Etcd is temporarily unavailable.
+      _mc_alias_refresh_deadline = monotonic() + _MC_ALIAS_RETRY_INTERVAL_SECONDS
+      return False
 
   _mc_alias_refresh_deadline = monotonic() + _MC_ALIAS_REFRESH_INTERVAL_SECONDS
   return True

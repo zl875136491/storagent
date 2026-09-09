@@ -49,7 +49,41 @@ def test_runtime_task_never_exposes_args_or_kwargs():
   )
   assert task is not None
   assert task.id == "task-1"
+  assert task.display_name == "存储运维任务执行"
   assert "secret-value" not in task.model_dump_json()
+
+
+def test_runtime_task_accepts_type_uuid_and_nested_request():
+  typed = service._task_from_runtime(
+    {
+      "uuid": "task-2",
+      "type": "storagent.etcd.reconcile",
+      "delivery_info": {"routing_key": "storagent.beijing.v2"},
+    },
+    worker="storagent-test@worker-1",
+    status="STARTED",
+    region="beijing",
+  )
+  nested = service._task_from_runtime(
+    {
+      "acknowledged": True,
+      "request": {
+        "id": "task-3",
+        "name": "storagent.storage.monitor_cluster_health",
+      },
+    },
+    worker="storagent-test@worker-1",
+    status="STARTED",
+  )
+
+  assert typed is not None
+  assert typed.id == "task-2"
+  assert typed.name == "storagent.etcd.reconcile"
+  assert typed.display_name == "Etcd 全量校准"
+  assert typed.region == "beijing"
+  assert nested is not None
+  assert nested.id == "task-3"
+  assert nested.display_name == "MinIO 集群自愈巡检"
 
 
 @pytest.mark.asyncio
@@ -96,7 +130,77 @@ def test_legacy_history_hides_unredacted_result_and_error_payloads():
 
   assert item.result_summary == "历史记录未暴露任务返回内容"
   assert item.error == "历史记录已隐藏未脱敏的失败详情"
+  assert item.display_name == "存储运维任务执行"
   assert "secret-value" not in item.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_history_disabled_includes_pagination_fields(monkeypatch):
+  monkeypatch.setattr(service.settings, "CELERY_ENABLED", False)
+  result = await service.get_history(limit=50, offset=100)
+  assert result.available is False
+  assert result.total == 0
+  assert result.limit == 50
+  assert result.offset == 100
+
+
+def test_merge_in_progress_history_fills_empty_inspect(monkeypatch):
+  monkeypatch.setattr(service.settings, "CELERY_WORKER_STALE_AFTER_SECONDS", 90)
+  now = service.utc_now()
+  workers = [
+    service.schema.CeleryWorkerStatus(name="w1", status="online", active_count=0),
+    service.schema.CeleryWorkerStatus(name="w2", status="offline", active_count=0),
+  ]
+  rows = [
+    {
+      "task_id": "running-1",
+      "task_name": "storagent.etcd.reconcile",
+      "status": "STARTED",
+      "worker": "w1",
+      "updated_at": now,
+    },
+    {
+      "task_id": "stale-1",
+      "task_name": "storagent.etcd.reconcile",
+      "status": "STARTED",
+      "worker": "w2",
+      "updated_at": now - timedelta(hours=2),
+    },
+  ]
+
+  workers, active = service._merge_in_progress_history(workers, [], [], rows)
+
+  assert [item.id for item in active] == ["running-1"]
+  assert active[0].display_name == "Etcd 全量校准"
+  assert workers[0].active_count == 1
+  assert workers[1].active_count == 0
+
+
+def test_merge_in_progress_history_does_not_duplicate_inspect_ids():
+  existing = service.schema.CeleryTaskExecution(
+    id="running-1",
+    name="storagent.etcd.reconcile",
+    display_name="Etcd 全量校准",
+    status="STARTED",
+    worker="w1",
+  )
+  workers = [
+    service.schema.CeleryWorkerStatus(name="w1", status="online", active_count=1),
+  ]
+  rows = [
+    {
+      "task_id": "running-1",
+      "task_name": "storagent.etcd.reconcile",
+      "status": "STARTED",
+      "worker": "w1",
+      "updated_at": service.utc_now(),
+    },
+  ]
+
+  workers, active = service._merge_in_progress_history(workers, [existing], [], rows)
+
+  assert [item.id for item in active] == ["running-1"]
+  assert workers[0].active_count == 1
 
 
 def test_queue_worker_count_is_region_queue_specific(monkeypatch):

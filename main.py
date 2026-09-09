@@ -53,8 +53,17 @@ async def lifespan(app: FastAPI):
     logger.warning(f"加载应用来源白名单失败: {e}")
   
   # 5. Etcd 监听。Watch uses a dedicated connection so reconnect can close
-  # it without dropping the request-path pooled client.
-  etcd_client = await get_etcd_client(dedicated=True)
+  # it without dropping the request-path pooled client. Creation is bounded
+  # so a hung Authenticate cannot block bind.
+  etcd_client = None
+  try:
+    etcd_client = await asyncio.wait_for(
+      get_etcd_client(dedicated=True),
+      timeout=max(float(settings.ETCD_HEALTH_TIMEOUT_SECONDS), 3.0),
+    )
+  except Exception as e:
+    from src.utils.logger import logger
+    logger.warning(f"Etcd watch 客户端创建失败，后台重试: {e}")
   watch_job = asyncio.create_task(watch_etcd_task(etcd_client))
 
   # 周期维护、长耗时运维和 Etcd 全量校准由 Celery Beat/Worker 承担。
@@ -63,10 +72,11 @@ async def lifespan(app: FastAPI):
   
   watch_job.cancel()
   await shutdown_background_operations()
-  try:
-    await etcd_client.close()
-  except Exception:
-    pass
+  if etcd_client is not None:
+    try:
+      await etcd_client.close()
+    except Exception:
+      pass
   try:
     await close_shared_etcd_client()
   except Exception:
