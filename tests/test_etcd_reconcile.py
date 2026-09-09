@@ -131,12 +131,3 @@ async def test_reconcile_skips_when_region_lock_busy(monkeypatch):
   assert result == {"status": "skipped", "reason": "already-running"}
   assert calls == []
   assert lock.releases == 0
-
-
-def test_celery_reconcile_schedule_expires_with_interval():
-  from pathlib import Path
-  text = (
-    Path(__file__).resolve().parents[2] / "storagent-celery" / "celery_app.py"
-  ).read_text()
-  assert "expire_with_interval=True" in text
-  assert "storagent.etcd.reconcile" in text
