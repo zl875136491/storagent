@@ -23,7 +23,7 @@ class _Client:
     self._lock = lock
     self.closed = 0
 
-  def lock(self, key, ttl=45):
+  def lock(self, key, ttl=180):
     self.key = key
     self.ttl = ttl
     return self._lock
@@ -58,7 +58,7 @@ async def test_reconcile_skips_publish_on_non_authority(monkeypatch):
 
   monkeypatch.setattr(etcd_op.settings, "REGION", "nuc-docker-b")
   monkeypatch.setattr(etcd_op.settings, "SYNC_AUTHORITY_REGION", "nuc-docker-a")
-  monkeypatch.setattr(etcd_op.settings, "SYNC_RECONCILE_LOCK_TTL_SECONDS", 45)
+  monkeypatch.setattr(etcd_op.settings, "SYNC_RECONCILE_LOCK_TTL_SECONDS", 180)
   monkeypatch.setattr(etcd_op, "get_etcd_client", get_client)
   monkeypatch.setattr(etcd_op.sync_module, "publish_roles", publish_roles)
   monkeypatch.setattr(etcd_op.sync_module, "publish_local_users", publish_users)
@@ -69,6 +69,7 @@ async def test_reconcile_skips_publish_on_non_authority(monkeypatch):
   result = await etcd_op.reconcile_etcd_once()
   assert result == {"status": "succeeded"}
   assert calls == [("pull", 0, client)]
+  assert client.ttl == 180
   assert lock.timeout == 0
   assert lock.releases == 1
 

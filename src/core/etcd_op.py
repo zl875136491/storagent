@@ -301,7 +301,7 @@ async def reconcile_etcd_once() -> dict[str, str]:
       client = await get_etcd_client()
       lock = client.lock(
         _reconcile_lock_key(),
-        ttl=max(int(getattr(settings, "SYNC_RECONCILE_LOCK_TTL_SECONDS", 45) or 45), 5),
+        ttl=max(int(getattr(settings, "SYNC_RECONCILE_LOCK_TTL_SECONDS", 180) or 180), 5),
       )
       acquired = await lock.acquire(timeout=0)
       if not acquired:

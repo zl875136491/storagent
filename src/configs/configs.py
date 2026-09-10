@@ -165,8 +165,10 @@ class Settings(BaseSettings):
   # The authority is used only for the first topology-layout snapshot. After
   # initialization, every region may update the shared layout through Etcd CAS.
   SYNC_AUTHORITY_REGION: str = "beijing"
-  SYNC_RECONCILE_INTERVAL_SECONDS: float = 30.0
-  SYNC_RECONCILE_LOCK_TTL_SECONDS: int = 45
+  # Watch is the fast path. This full pass is a catch-up, so keep it slower
+  # than a typical run (~35s) to avoid a nearly continuous Worker occupancy.
+  SYNC_RECONCILE_INTERVAL_SECONDS: float = 120.0
+  SYNC_RECONCILE_LOCK_TTL_SECONDS: int = 180
   REPLICATION_RECONCILE_INTERVAL_SECONDS: float = 300.0
   REPLICATION_LOCK_TTL_SECONDS: int = 120
   REPLICATION_LOCK_TIMEOUT_SECONDS: int = 10

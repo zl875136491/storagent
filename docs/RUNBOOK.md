@@ -34,7 +34,7 @@
 
 1. 确认各节点 `ETCD_*` 与 `SECRET_KEY` 一致。
 2. 恢复 Etcd 多数派；查看 Storagent 日志中 `Etcd watch 异常` / `CAS conflict`。
-3. Etcd 恢复后由 Watch 和默认 30 秒周期全量校准自动收敛；关注 `sync_reconcile_failures_total`。
+3. Etcd 恢复后由 Watch 和默认 120 秒周期全量校准自动收敛；关注 `sync_reconcile_failures_total`。
 4. 勿在 Etcd 未恢复时强行改拓扑（易造成本地孤儿数据）。
 
 ### 3.2 幽灵节点 / 拓扑不收敛
