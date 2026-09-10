@@ -1,7 +1,6 @@
 import asyncio
 import re
 from typing import List
-from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
 
@@ -12,12 +11,11 @@ from src.modules.storage import schema as storage_schema
 from src.modules.storage.model import MinioServer
 from src.modules.graph import crud as graph_crud
 from src.modules.graph import service as graph_service
+from src.modules.storage import inventory as storage_inventory
 from src.core.minio_op import (
   test_minio_server,
   set_site_alias,
-  get_buckets_info,
   check_server_bucket_existed,
-  get_minio_client,
   get_server_buckets,
   get_bucket_replicate_status_result,
   get_bucket_replicate_entries_result,
@@ -26,23 +24,6 @@ from src.core.minio_op import (
   delete_bucket_replicate as delete_minio_bucket_replicate,
 )
 from src.core import sync as sync_module
-from src.configs.configs import settings
-from src.utils.helpers import utc_now
-
-
-_server_details_locks: dict[str, asyncio.Lock] = {}
-
-
-def _server_details_lock(server_id: str) -> asyncio.Lock:
-  lock = _server_details_locks.get(server_id)
-  if lock is None:
-    lock = asyncio.Lock()
-    _server_details_locks[server_id] = lock
-  return lock
-
-
-def _aware_utc(value: datetime) -> datetime:
-  return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 async def _connect_minio_server(
   host: str,
@@ -229,69 +210,71 @@ async def get_buckets() -> List[str]:
         bucket_data[bucket_name]["servers"].append(server_name)
   return dict[str, List](data=list(bucket_data.values()))
 
+async def _require_minio_server(minio_server: ObjectId) -> MinioServer:
+  minio_server_obj = await storage_crud.read_minio_server_by_id(minio_server)
+  if not minio_server_obj:
+    raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
+  return minio_server_obj
+
+
 async def get_server_details(
   minio_server: ObjectId,
   force_refresh: bool = False,
 ) -> dict:
-  """Return a recursive inventory cached in MongoDB for ten minutes."""
-  minio_server_obj = await storage_crud.read_minio_server_by_id(minio_server)
-  if not minio_server_obj:
-    raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
-  server_id = str(minio_server_obj.id)
-  now = utc_now()
-  await storage_crud.delete_expired_server_file_details(now)
-  if force_refresh:
-    await storage_crud.delete_server_file_details_cache(server_id)
+  """Return bucket occupancy from the Mongo object index."""
+  minio_server_obj = await _require_minio_server(minio_server)
+  return await storage_inventory.inventory_summary(
+    minio_server_obj,
+    force_refresh=force_refresh,
+  )
 
-  cache = await storage_crud.read_server_file_details_cache(server_id)
-  if cache and _aware_utc(cache.expires_at) > now:
-    return {
-      "data": cache.data,
-      "cache_hit": True,
-      "cached_at": cache.fetched_at,
-      "expires_at": cache.expires_at,
-      "ttl_seconds": settings.SERVER_DETAILS_CACHE_TTL_SECONDS,
-    }
 
-  async with _server_details_lock(server_id):
-    # Recheck after acquiring the lock so concurrent cache misses use one fetch.
-    now = utc_now()
-    await storage_crud.delete_expired_server_file_details(now)
-    if not force_refresh:
-      cache = await storage_crud.read_server_file_details_cache(server_id)
-      if cache and _aware_utc(cache.expires_at) > now:
-        return {
-          "data": cache.data,
-          "cache_hit": True,
-          "cached_at": cache.fetched_at,
-          "expires_at": cache.expires_at,
-          "ttl_seconds": settings.SERVER_DETAILS_CACHE_TTL_SECONDS,
-        }
+async def list_server_file_children(
+  minio_server: ObjectId,
+  *,
+  bucket: str | None = None,
+  prefix: str | None = None,
+  offset: int = 0,
+  limit: int = 40,
+  sort: str = "size",
+  order: str = "desc",
+  force_refresh: bool = False,
+) -> dict:
+  minio_server_obj = await _require_minio_server(minio_server)
+  return await storage_inventory.list_inventory_children(
+    minio_server_obj,
+    bucket=bucket,
+    prefix=prefix,
+    offset=offset,
+    limit=limit,
+    sort=sort,  # type: ignore[arg-type]
+    order=order,  # type: ignore[arg-type]
+    force_refresh=force_refresh,
+  )
 
-    access_key, secret_key = storage_crud.plain_minio_credentials(minio_server_obj)
-    minio_client = get_minio_client(
-      host=minio_server_obj.host,
-      port=minio_server_obj.minio_port,
-      access_key=access_key,
-      secret_key=secret_key
-    )
-    buckets = await get_buckets_info(minio_client)
-    fetched_at = utc_now()
-    ttl_seconds = max(int(settings.SERVER_DETAILS_CACHE_TTL_SECONDS), 1)
-    expires_at = fetched_at + timedelta(seconds=ttl_seconds)
-    cache = await storage_crud.write_server_file_details_cache(
-      server_id,
-      buckets,
-      fetched_at,
-      expires_at,
-    )
-    return {
-      "data": cache.data,
-      "cache_hit": False,
-      "cached_at": cache.fetched_at,
-      "expires_at": cache.expires_at,
-      "ttl_seconds": ttl_seconds,
-    }
+
+async def search_server_files(
+  minio_server: ObjectId,
+  *,
+  query: str | None = None,
+  bucket: str | None = None,
+  page: int = 1,
+  page_size: int = 50,
+  sort: str = "object_key",
+  order: str = "asc",
+  force_refresh: bool = False,
+) -> dict:
+  minio_server_obj = await _require_minio_server(minio_server)
+  return await storage_inventory.search_inventory(
+    minio_server_obj,
+    query=query,
+    bucket=bucket,
+    page=page,
+    page_size=page_size,
+    sort=sort,  # type: ignore[arg-type]
+    order=order,  # type: ignore[arg-type]
+    force_refresh=force_refresh,
+  )
 
 async def format_replicate_status(status: dict) -> dict:
   """

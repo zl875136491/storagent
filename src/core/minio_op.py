@@ -543,6 +543,37 @@ def _get_buckets_info_sync(client: Minio) -> list[dict[str, Any]]:
   return results
 
 
+def _list_server_object_rows_sync(
+  client: Minio,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+  """Flat bucket + object rows for the Mongo inventory index. No nested tree."""
+  buckets: list[dict[str, Any]] = []
+  objects: list[dict[str, Any]] = []
+  for bucket in client.list_buckets():
+    buckets.append({
+      "name": bucket.name,
+      "created_at": bucket.creation_date,
+    })
+    for obj in client.list_objects(bucket.name, recursive=True):
+      key = str(getattr(obj, "object_name", "") or "").replace("\\", "/").strip("/")
+      if not key or key.endswith("/"):
+        continue
+      objects.append({
+        "bucket": bucket.name,
+        "object_key": key,
+        "size": max(int(getattr(obj, "size", 0) or 0), 0),
+        "last_modified": getattr(obj, "last_modified", None),
+      })
+  return buckets, objects
+
+
+async def list_server_object_rows(
+  client: Minio,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+  """List buckets and objects without blocking the event loop."""
+  return await asyncio.to_thread(_list_server_object_rows_sync, client)
+
+
 async def get_buckets_info(client: Minio) -> list[dict[str, Any]]:
   """Collect a recursive inventory without blocking the FastAPI event loop."""
   return await asyncio.to_thread(_get_buckets_info_sync, client)

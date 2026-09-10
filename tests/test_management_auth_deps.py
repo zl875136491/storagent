@@ -34,6 +34,8 @@ def test_storage_read_routes_require_user():
   for fn in (
     storage_route.get_minio_server_list,
     storage_route.get_server_details,
+    storage_route.list_server_file_children,
+    storage_route.search_server_files,
     storage_route.get_buckets,
     storage_route.get_bucket_replicate_infos,
     storage_route.get_replication_operations,

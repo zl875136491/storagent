@@ -577,85 +577,78 @@ def test_historical_failures_without_resync_record_remain_degraded():
 async def test_server_details_returns_valid_cache_without_minio(monkeypatch):
   now = utc_now()
   server = SimpleNamespace(id=ObjectId())
-  cache = SimpleNamespace(
-    data=[{"name": "Bucket: system-test", "total_size": 1, "created_at": now, "files": []}],
-    fetched_at=now,
-    expires_at=now + timedelta(minutes=5),
-  )
-
-  async def no_fetch(_client):
-    pytest.fail("valid cache must not call MinIO")
+  summary = {
+    "data": [{
+      "name": "system-test",
+      "total_size": 1,
+      "created_at": now,
+      "object_count": 1,
+      "files": [],
+    }],
+    "cache_hit": True,
+    "cached_at": now,
+    "expires_at": now + timedelta(minutes=5),
+    "ttl_seconds": 600,
+    "object_count": 1,
+    "total_size": 1,
+  }
 
   async def read_server(_id):
     return server
 
-  async def cleanup(_now):
-    return 0
+  async def summarize(_server, force_refresh=False):
+    assert force_refresh is False
+    return summary
 
-  async def read_cache(_id):
-    return cache
+  async def no_fetch(*_args, **_kwargs):
+    pytest.fail("valid cache must not call MinIO")
 
   monkeypatch.setattr(service.storage_crud, "read_minio_server_by_id", read_server)
-  monkeypatch.setattr(service.storage_crud, "delete_expired_server_file_details", cleanup)
-  monkeypatch.setattr(service.storage_crud, "read_server_file_details_cache", read_cache)
-  monkeypatch.setattr(service, "get_buckets_info", no_fetch)
+  monkeypatch.setattr(service.storage_inventory, "inventory_summary", summarize)
+  monkeypatch.setattr(service.storage_inventory, "list_server_object_rows", no_fetch)
 
   result = await service.get_server_details(server.id)
 
   assert result["cache_hit"] is True
-  assert result["data"] == cache.data
+  assert result["data"][0]["name"] == "system-test"
+  assert result["data"][0]["files"] == []
 
 
 @pytest.mark.asyncio
-async def test_server_details_deletes_expired_then_refetches(monkeypatch):
+async def test_server_details_force_refresh_rebuilds_index(monkeypatch):
   now = utc_now()
-  server = SimpleNamespace(
-    id=ObjectId(),
-    host="10.32.129.241",
-    minio_port=9000,
-  )
-  calls = {"cleanup": 0, "fetch": 0, "write": 0}
-  stored = SimpleNamespace(
-    data=[{"name": "Bucket: system-test", "total_size": 10, "created_at": now, "files": []}],
-    fetched_at=now,
-    expires_at=now + timedelta(minutes=10),
-  )
-
-  async def cleanup(_now):
-    calls["cleanup"] += 1
-    return 1
-
-  async def no_cache(_id):
-    return None
-
-  async def fetch(_client):
-    calls["fetch"] += 1
-    return stored.data
-
-  async def write(_id, data, fetched_at, expires_at):
-    calls["write"] += 1
-    stored.data = data
-    stored.fetched_at = fetched_at
-    stored.expires_at = expires_at
-    return stored
+  server = SimpleNamespace(id=ObjectId())
+  calls = {"refresh": 0}
 
   async def read_server(_id):
     return server
 
+  async def summarize(_server, force_refresh=False):
+    calls["refresh"] += int(force_refresh)
+    return {
+      "data": [{
+        "name": "system-test",
+        "total_size": 10,
+        "created_at": now,
+        "object_count": 2,
+        "files": [],
+      }],
+      "cache_hit": not force_refresh,
+      "cached_at": now,
+      "expires_at": now + timedelta(minutes=10),
+      "ttl_seconds": 600,
+      "object_count": 2,
+      "total_size": 10,
+    }
+
   monkeypatch.setattr(service.storage_crud, "read_minio_server_by_id", read_server)
-  monkeypatch.setattr(service.storage_crud, "delete_expired_server_file_details", cleanup)
-  monkeypatch.setattr(service.storage_crud, "read_server_file_details_cache", no_cache)
-  monkeypatch.setattr(service.storage_crud, "plain_minio_credentials", lambda _server: ("key", "secret"))
-  monkeypatch.setattr(service.storage_crud, "write_server_file_details_cache", write)
-  monkeypatch.setattr(service, "get_minio_client", lambda **_kwargs: object())
-  monkeypatch.setattr(service, "get_buckets_info", fetch)
+  monkeypatch.setattr(service.storage_inventory, "inventory_summary", summarize)
 
-  result = await service.get_server_details(server.id)
+  result = await service.get_server_details(server.id, force_refresh=True)
 
-  assert calls["cleanup"] >= 1
-  assert calls["fetch"] == 1
-  assert calls["write"] == 1
+  assert calls["refresh"] == 1
   assert result["cache_hit"] is False
+  assert result["object_count"] == 2
 
 
 @pytest.mark.asyncio

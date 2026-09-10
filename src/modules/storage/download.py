@@ -72,48 +72,10 @@ def _validate_object_request(bucket: str, object_key: str) -> tuple[str, str]:
   return bucket, object_key
 
 
-def _find_cached_object(
-  inventory: list[dict[str, Any]],
-  bucket: str,
-  object_key: str,
-) -> dict[str, Any] | None:
-  bucket_entry = next((
-    item for item in inventory
-    if item.get("name") in {bucket, f"Bucket: {bucket}"}
-  ), None)
-  if not bucket_entry:
-    return None
+async def _lookup_inventory_file(server: Any, bucket: str, object_key: str) -> dict[str, Any] | None:
+  from src.modules.storage.inventory import find_inventory_file
 
-  def walk(nodes: Any, parts: list[str]) -> dict[str, Any] | None:
-    if not isinstance(nodes, list):
-      return None
-    for node in nodes:
-      if not isinstance(node, dict) or not isinstance(node.get("name"), str):
-        continue
-      next_parts = [*parts, node["name"]]
-      children = node.get("children")
-      if isinstance(children, list):
-        found = walk(children, next_parts)
-        if found:
-          return found
-      elif "/".join(next_parts) == object_key:
-        return node
-    return None
-
-  return walk(bucket_entry.get("files"), [])
-
-
-async def _inventory_for_server(server: Any) -> list[dict[str, Any]]:
-  now = utc_now()
-  cache = await storage_crud.read_server_file_details_cache(str(server.id))
-  if cache and _aware_utc(cache.expires_at) > now:
-    return cache.data
-
-  # Only refresh when the ten-minute snapshot is absent or expired.
-  from src.modules.storage import service as storage_service
-
-  details = await storage_service.get_server_details(server.id)
-  return details["data"]
+  return await find_inventory_file(server, bucket, object_key)
 
 
 def _is_object_not_found(error: Exception) -> bool:
@@ -187,8 +149,8 @@ async def issue_one_time_download(
   if not server:
     raise CustomException(ErrorDesc.RES_NOT_FOUND, "MinioServer")
 
-  inventory = await _inventory_for_server(server)
-  if not _find_cached_object(inventory, bucket, object_key):
+  found = await _lookup_inventory_file(server, bucket, object_key)
+  if not found:
     raise CustomException(
       ErrorDesc.OBJECT_NOT_FOUND,
       "对象不在当前服务器文件清单中，请刷新清单后重试",

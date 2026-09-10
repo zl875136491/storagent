@@ -1,4 +1,5 @@
 import secrets
+from typing import Literal
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
@@ -120,6 +121,62 @@ async def get_server_details(
   """
   return await storage_service.get_server_details(
     minio_server_id,
+    force_refresh=refresh,
+  )
+
+
+@router.get(
+  path="/{minio_server_id}/inventory/children",
+  response_model=storage_schema.InventoryChildrenResponse,
+  summary="分页列出服务器文件目录子项",
+)
+async def list_server_file_children(
+  minio_server_id: public_schema.PydanticObjectId,
+  bucket: str | None = Query(None, max_length=63, description="存储桶；缺省时列出最外层存储桶"),
+  prefix: str | None = Query(None, max_length=1024, description="当前目录前缀，缺省为桶根"),
+  offset: int = Query(0, ge=0, description="已加载的子项数量"),
+  limit: int = Query(40, ge=1, le=100, description="本次返回的子项数量"),
+  sort: Literal["size", "name", "last_modified", "object_key"] = Query("size"),
+  order: Literal["asc", "desc"] = Query("desc"),
+  refresh: bool = Query(False, description="忽略索引并重新读取 MinIO"),
+  current_user: User = Depends(get_current_user),
+):
+  return await storage_service.list_server_file_children(
+    minio_server_id,
+    bucket=bucket,
+    prefix=prefix,
+    offset=offset,
+    limit=limit,
+    sort=sort,
+    order=order,
+    force_refresh=refresh,
+  )
+
+
+@router.get(
+  path="/{minio_server_id}/inventory/search",
+  response_model=storage_schema.InventorySearchResponse,
+  summary="在服务器文件索引中分页搜索",
+)
+async def search_server_files(
+  minio_server_id: public_schema.PydanticObjectId,
+  q: str | None = Query(None, max_length=128, description="按文件名、对象路径或存储桶全量搜索"),
+  bucket: str | None = Query(None, max_length=63),
+  page: int = Query(1, ge=1),
+  page_size: int = Query(50, ge=1, le=100),
+  sort: Literal["size", "name", "last_modified", "object_key"] = Query("object_key"),
+  order: Literal["asc", "desc"] = Query("asc"),
+  refresh: bool = Query(False, description="忽略索引并重新读取 MinIO"),
+  current_user: User = Depends(get_current_user),
+):
+  return await storage_service.search_server_files(
+    minio_server_id,
+    query=q,
+    bucket=bucket,
+    page=page,
+    page_size=page_size,
+    sort=sort,
+    order=order,
     force_refresh=refresh,
   )
 

@@ -93,6 +93,111 @@ class ServerFileDetailsCache(Document):
     ]
 
 
+class ServerFileInventoryMeta(Document):
+  """Queryable MinIO listing snapshot for one server, served from Mongo."""
+  server_id: str
+  generation: str
+  buckets: list[dict[str, Any]] = Field(default_factory=list)
+  object_count: int = Field(default=0, ge=0)
+  total_size: int = Field(default=0, ge=0)
+  fetched_at: datetime = Field(default_factory=utc_now)
+  expires_at: datetime
+
+  class Settings:
+    name = "server_file_inventory_meta"
+    indexes = [
+      IndexModel([("server_id", 1)], unique=True),
+      IndexModel([("expires_at", 1)]),
+    ]
+
+
+class ServerFileNode(Document):
+  """One directory or object row inside a server file inventory generation."""
+  server_id: str
+  generation: str
+  bucket: str
+  parent: str = ""
+  name: str
+  kind: Literal["dir", "file"]
+  object_key: str = ""
+  size: int = Field(default=0, ge=0)
+  object_count: int = Field(default=0, ge=0)
+  child_count: int = Field(default=0, ge=0)
+  last_modified: datetime = Field(default_factory=utc_now)
+  name_lower: str = ""
+  object_key_lower: str = ""
+
+  class Settings:
+    name = "server_file_node"
+    indexes = [
+      IndexModel(
+        [
+          ("server_id", 1),
+          ("generation", 1),
+          ("bucket", 1),
+          ("parent", 1),
+          ("size", -1),
+          ("name", 1),
+        ],
+      ),
+      IndexModel(
+        [
+          ("server_id", 1),
+          ("generation", 1),
+          ("bucket", 1),
+          ("parent", 1),
+          ("kind", 1),
+          ("name", 1),
+        ],
+        unique=True,
+      ),
+      IndexModel(
+        [
+          ("server_id", 1),
+          ("generation", 1),
+          ("kind", 1),
+          ("bucket", 1),
+          ("object_key", 1),
+        ],
+      ),
+      IndexModel(
+        [
+          ("server_id", 1),
+          ("generation", 1),
+          ("kind", 1),
+          ("bucket", 1),
+          ("object_key_lower", 1),
+        ],
+      ),
+      IndexModel(
+        [
+          ("server_id", 1),
+          ("generation", 1),
+          ("kind", 1),
+          ("bucket", 1),
+          ("object_key_lower", 1),
+        ],
+      ),
+      IndexModel(
+        [
+          ("server_id", 1),
+          ("generation", 1),
+          ("kind", 1),
+          ("last_modified", -1),
+        ],
+      ),
+      IndexModel(
+        [
+          ("server_id", 1),
+          ("generation", 1),
+          ("kind", 1),
+          ("name_lower", 1),
+        ],
+      ),
+      IndexModel([("server_id", 1), ("generation", 1)]),
+    ]
+
+
 class StorageOperation(Document):
   """Persistent state for long-running MinIO maintenance operations."""
   kind: Literal[

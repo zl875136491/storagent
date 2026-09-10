@@ -165,19 +165,6 @@ def one_time_env(monkeypatch):
     minio_port=9000,
     region=SimpleNamespace(name="beijing"),
   )
-  inventory = [{
-    "name": "Bucket: system-test",
-    "files": [{
-      "name": "folder",
-      "size": 9,
-      "last_modified": "2026-08-04T00:00:00Z",
-      "children": [{
-        "name": "文件.txt",
-        "size": 9,
-        "last_modified": "2026-08-04T00:00:00Z",
-      }],
-    }],
-  }]
 
   async def get_etcd():
     return _FakeEtcd(state)
@@ -188,11 +175,18 @@ def one_time_env(monkeypatch):
   async def read_server_by_region_name(name):
     return server if name == server.region.name else None
 
-  async def read_cache(_server_id):
-    return SimpleNamespace(
-      data=inventory,
-      expires_at=utc_now() + timedelta(minutes=5),
-    )
+  allowed = {"system-test/folder/文件.txt"}
+
+  async def lookup_file(_server, bucket, object_key):
+    if f"{bucket}/{object_key}" not in allowed:
+      return None
+    return {
+      "name": "文件.txt",
+      "kind": "file",
+      "bucket": bucket,
+      "object_key": object_key,
+      "size": 9,
+    }
 
   monkeypatch.setattr(download, "get_etcd_client", get_etcd)
   monkeypatch.setattr(download.storage_crud, "read_minio_server_by_id", read_server_by_id)
@@ -201,7 +195,7 @@ def one_time_env(monkeypatch):
     "read_minio_server_by_region_name",
     read_server_by_region_name,
   )
-  monkeypatch.setattr(download.storage_crud, "read_server_file_details_cache", read_cache)
+  monkeypatch.setattr(download, "_lookup_inventory_file", lookup_file)
   monkeypatch.setattr(
     download.storage_crud,
     "plain_minio_credentials",
@@ -214,7 +208,7 @@ def one_time_env(monkeypatch):
     state=state,
     minio=minio,
     server=server,
-    inventory=inventory,
+    allowed=allowed,
   )
 
 
@@ -425,7 +419,7 @@ async def test_redeem_route_rejects_chunked_body_over_limit(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_issue_requires_object_in_fresh_inventory(one_time_env):
-  one_time_env.inventory[0]["files"] = []
+  one_time_env.allowed.clear()
 
   with pytest.raises(CustomException) as exc_info:
     await _issue()

@@ -45,14 +45,62 @@ class BucketInfo(BaseModel):
   name: str = Field(..., description="存储桶名称")
   total_size: int = Field(..., description="总大小")
   created_at: datetime = Field(..., description="创建时间")
-  files: List[BucketFileItem] = Field(..., description="文件列表")
+  object_count: int = Field(default=0, ge=0, description="对象数量")
+  files: List[BucketFileItem] = Field(default_factory=list, description="兼容字段：完整树已不再返回")
 
 class ServerDetailsResponse(BaseModel):
-  data: List[BucketInfo] = Field(..., description="文件详情")
-  cache_hit: bool = Field(False, description="是否命中 Mongo 缓存")
+  data: List[BucketInfo] = Field(..., description="存储桶占用摘要")
+  cache_hit: bool = Field(False, description="是否命中 Mongo 对象索引")
   cached_at: datetime = Field(..., description="缓存生成时间")
   expires_at: datetime = Field(..., description="缓存过期时间")
-  ttl_seconds: int = Field(600, ge=1, description="缓存有效期")
+  ttl_seconds: int = Field(21600, ge=1, description="建议刷新间隔（秒）；过期后仍从 Mongo 读取，仅手动刷新才回源 MinIO")
+  object_count: int = Field(default=0, ge=0, description="对象总数")
+  total_size: int = Field(default=0, ge=0, description="对象总大小")
+
+
+class InventoryNode(BaseModel):
+  name: str
+  kind: Literal["dir", "file"]
+  bucket: str = ""
+  object_key: str = ""
+  parent: str = ""
+  size: int = Field(default=0, ge=0)
+  object_count: int = Field(default=0, ge=0)
+  child_count: int = Field(default=0, ge=0)
+  last_modified: datetime
+
+
+class InventoryChildrenResponse(BaseModel):
+  bucket: str = ""
+  prefix: str = ""
+  items: List[InventoryNode] = Field(default_factory=list)
+  offset: int = Field(default=0, ge=0)
+  limit: int = Field(default=40, ge=1)
+  total: int = Field(default=0, ge=0)
+  has_more: bool = False
+  remaining_count: int = Field(default=0, ge=0)
+  page_size_sum: int = Field(default=0, ge=0)
+  parent_size: int = Field(default=0, ge=0)
+  parent_object_count: int = Field(default=0, ge=0)
+  parent_child_count: int = Field(default=0, ge=0)
+  cache_hit: bool = False
+  cached_at: datetime
+  expires_at: datetime
+  ttl_seconds: int = Field(21600, ge=1)
+
+
+class InventorySearchResponse(BaseModel):
+  q: str = ""
+  bucket: str = ""
+  items: List[InventoryNode] = Field(default_factory=list)
+  page: int = Field(default=1, ge=1)
+  page_size: int = Field(default=50, ge=1)
+  total: int = Field(default=0, ge=0)
+  page_count: int = Field(default=1, ge=1)
+  cache_hit: bool = False
+  cached_at: datetime
+  expires_at: datetime
+  ttl_seconds: int = Field(21600, ge=1)
 
 
 class OneTimeDownloadCreateRequest(BaseModel):
