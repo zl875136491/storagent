@@ -113,16 +113,12 @@ async def get_minio_server_list(
   summary="获取服务器文件详情")
 async def get_server_details(
   minio_server_id: public_schema.PydanticObjectId,
-  refresh: bool = Query(False, description="忽略缓存并重新读取 MinIO"),
   current_user: User = Depends(get_current_user),
 ):
   """
   获取服务器文件详情（需登录）
   """
-  return await storage_service.get_server_details(
-    minio_server_id,
-    force_refresh=refresh,
-  )
+  return await storage_service.get_server_details(minio_server_id)
 
 
 @router.get(
@@ -138,7 +134,6 @@ async def list_server_file_children(
   limit: int = Query(40, ge=1, le=100, description="本次返回的子项数量"),
   sort: Literal["size", "name", "last_modified", "object_key"] = Query("size"),
   order: Literal["asc", "desc"] = Query("desc"),
-  refresh: bool = Query(False, description="忽略索引并重新读取 MinIO"),
   current_user: User = Depends(get_current_user),
 ):
   return await storage_service.list_server_file_children(
@@ -149,7 +144,6 @@ async def list_server_file_children(
     limit=limit,
     sort=sort,
     order=order,
-    force_refresh=refresh,
   )
 
 
@@ -166,7 +160,6 @@ async def search_server_files(
   page_size: int = Query(50, ge=1, le=100),
   sort: Literal["size", "name", "last_modified", "object_key"] = Query("object_key"),
   order: Literal["asc", "desc"] = Query("asc"),
-  refresh: bool = Query(False, description="忽略索引并重新读取 MinIO"),
   current_user: User = Depends(get_current_user),
 ):
   return await storage_service.search_server_files(
@@ -177,7 +170,6 @@ async def search_server_files(
     page_size=page_size,
     sort=sort,
     order=order,
-    force_refresh=refresh,
   )
 
 

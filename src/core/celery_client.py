@@ -61,6 +61,7 @@ def dispatch_task(
   name: str,
   *args: Any,
   origin_region: str | None = None,
+  expires: float | None = None,
   **kwargs: Any,
 ) -> str | None:
   """Publish a task only to the queue owned by its source Region.
@@ -79,15 +80,17 @@ def dispatch_task(
     protocol_version=settings.CELERY_TASK_PROTOCOL_VERSION,
   )
   logger.debug("派发 Celery 任务 {} queue={} origin={}", name, queue, region)
-  result = celery_app.send_task(
-    name,
-    args=args,
-    kwargs=kwargs,
-    queue=queue,
-    routing_key=queue,
-    headers=task_headers(
+  options: dict[str, Any] = {
+    "args": args,
+    "kwargs": kwargs,
+    "queue": queue,
+    "routing_key": queue,
+    "headers": task_headers(
       region,
       protocol_version=settings.CELERY_TASK_PROTOCOL_VERSION,
     ),
-  )
+  }
+  if expires is not None:
+    options["expires"] = expires
+  result = celery_app.send_task(name, **options)
   return str(result.id)

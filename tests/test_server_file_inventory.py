@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from src.modules.storage.inventory import (
   build_inventory_documents,
   search_regex,
@@ -68,3 +70,24 @@ def test_slice_child_page_returns_largest_first_then_remainder():
 
 def test_search_regex_escapes_user_input():
   assert search_regex("a+b.txt") == r"a\+b\.txt"
+
+
+@pytest.mark.asyncio
+async def test_ensure_inventory_returns_empty_without_listing(monkeypatch):
+  from types import SimpleNamespace
+  from src.modules.storage import inventory
+
+  async def no_meta(_server_id):
+    return None
+
+  async def boom(*_args, **_kwargs):
+    raise AssertionError("details page must not list MinIO")
+
+  monkeypatch.setattr(inventory, "_read_meta", no_meta)
+  monkeypatch.setattr(inventory, "_sync_from_minio", boom)
+  snapshot = await inventory.ensure_server_file_inventory(SimpleNamespace(id="sid"))
+  assert snapshot.generation == ""
+  assert snapshot.buckets == []
+  summary = await inventory.inventory_summary(SimpleNamespace(id="sid"))
+  assert summary["index_ready"] is False
+  assert summary["object_count"] == 0

@@ -79,3 +79,4 @@ def test_graph_write_routes_require_user():
 def test_celery_read_routes_require_user():
   assert "current_user" in _endpoint_params(celery_route.get_celery_overview)
   assert "current_user" in _endpoint_params(celery_route.get_celery_history)
+  assert "current_user" in _endpoint_params(celery_route.run_celery_task)

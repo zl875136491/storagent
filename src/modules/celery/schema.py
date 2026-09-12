@@ -72,6 +72,7 @@ class CeleryTaskCatalogItem(BaseModel):
   schedule_seconds: int | None = None
   execution_scope: str
   description: str
+  manual_run_allowed: bool = False
 
 
 class CeleryBeatLeader(BaseModel):
@@ -104,3 +105,15 @@ class CeleryHistoryResponse(BaseModel):
   offset: int = 0
   legacy_record_count: int = 0
   message: str = ""
+
+
+class CeleryTaskRunRequest(BaseModel):
+  name: str = Field(..., min_length=1, max_length=200)
+
+
+class CeleryTaskRunResponse(BaseModel):
+  message: str
+  task_id: str
+  task_name: str
+  display_name: str
+  status: str = "queued"

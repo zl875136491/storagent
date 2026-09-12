@@ -174,6 +174,9 @@ class Settings(BaseSettings):
   REPLICATION_LOCK_TIMEOUT_SECONDS: int = 10
 
   # Storage operations and cluster self-healing
+  # Object-index listing is a Celery job, not a details-page refresh.
+  FILE_INVENTORY_SYNC_INTERVAL_SECONDS: int = 21600
+  FILE_INVENTORY_SYNC_LOCK_TTL_SECONDS: int = 3600
   SERVER_DETAILS_CACHE_TTL_SECONDS: int = 21600
   # 管理员应急下载链接；运行时还会限制在 30-900 秒内。
   ONE_TIME_DOWNLOAD_TTL_SECONDS: int = 300

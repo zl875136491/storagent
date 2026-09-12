@@ -596,8 +596,7 @@ async def test_server_details_returns_valid_cache_without_minio(monkeypatch):
   async def read_server(_id):
     return server
 
-  async def summarize(_server, force_refresh=False):
-    assert force_refresh is False
+  async def summarize(_server):
     return summary
 
   async def no_fetch(*_args, **_kwargs):
@@ -615,16 +614,14 @@ async def test_server_details_returns_valid_cache_without_minio(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_server_details_force_refresh_rebuilds_index(monkeypatch):
+async def test_server_details_reads_index_without_refresh_flag(monkeypatch):
   now = utc_now()
   server = SimpleNamespace(id=ObjectId())
-  calls = {"refresh": 0}
 
   async def read_server(_id):
     return server
 
-  async def summarize(_server, force_refresh=False):
-    calls["refresh"] += int(force_refresh)
+  async def summarize(_server):
     return {
       "data": [{
         "name": "system-test",
@@ -633,10 +630,11 @@ async def test_server_details_force_refresh_rebuilds_index(monkeypatch):
         "object_count": 2,
         "files": [],
       }],
-      "cache_hit": not force_refresh,
+      "cache_hit": True,
+      "index_ready": True,
       "cached_at": now,
-      "expires_at": now + timedelta(minutes=10),
-      "ttl_seconds": 600,
+      "expires_at": now + timedelta(hours=6),
+      "ttl_seconds": 21600,
       "object_count": 2,
       "total_size": 10,
     }
@@ -644,10 +642,9 @@ async def test_server_details_force_refresh_rebuilds_index(monkeypatch):
   monkeypatch.setattr(service.storage_crud, "read_minio_server_by_id", read_server)
   monkeypatch.setattr(service.storage_inventory, "inventory_summary", summarize)
 
-  result = await service.get_server_details(server.id, force_refresh=True)
+  result = await service.get_server_details(server.id)
 
-  assert calls["refresh"] == 1
-  assert result["cache_hit"] is False
+  assert result["index_ready"] is True
   assert result["object_count"] == 2
 
 

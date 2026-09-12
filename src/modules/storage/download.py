@@ -153,7 +153,7 @@ async def issue_one_time_download(
   if not found:
     raise CustomException(
       ErrorDesc.OBJECT_NOT_FOUND,
-      "对象不在当前服务器文件清单中，请刷新清单后重试",
+      "对象不在当前服务器文件清单中，请到 Celery 运维发起文件索引同步后重试",
     )
 
   access_key, secret_key = storage_crud.plain_minio_credentials(server)

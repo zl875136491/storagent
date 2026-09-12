@@ -110,7 +110,7 @@
 Celery 的 Region queue 和 task protocol 是 Backend、Worker、Frontend 的共同兼容面。详细任务清单、状态机和参数见 [`CELERY_OPERATIONS.md`](CELERY_OPERATIONS.md)。
 
 1. 使旧 API producer 静默或摘流，排空旧共享 `celery` 队列中的手工任务。
-2. 停止旧 Worker/Beat 后部署新 Worker；验证每个 Region 的 `storagent.<region>.v<protocol>` 队列、11 个已注册任务、Worker 心跳和每 Region 单 Beat 租约。
+2. 停止旧 Worker/Beat 后部署新 Worker；验证每个 Region 的 `storagent.<region>.v<protocol>` 队列、12 个已注册任务、Worker 心跳和每 Region 单 Beat 租约。
 3. 部署 Backend，验证 `/ready`、v1/v2 存储运维兼容接口、诊断和一条可回收的手工任务。
 4. 最后部署 Frontend。旧前端在过渡期仍依赖的 `orphan-buckets` 旧响应模型和复制运维 HTTP 200 受理语义必须保留。
 5. 回滚前先停止新 producer，并排空或人工标记新协议队列中的手工任务；不能仅回滚 Worker 或 Backend。

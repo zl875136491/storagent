@@ -111,6 +111,26 @@ class ServerFileInventoryMeta(Document):
     ]
 
 
+class FileInventorySyncLease(Document):
+  """Cross-process mutex so Beat and manual inventory sync do not overlap."""
+  region: str
+  status: Literal["idle", "running"] = "idle"
+  trigger: str = ""
+  task_id: str = ""
+  actor: str = ""
+  started_at: datetime | None = None
+  expires_at: datetime | None = None
+  last_finished_at: datetime | None = None
+  last_status: str = ""
+  updated_at: datetime = Field(default_factory=utc_now)
+
+  class Settings:
+    name = "file_inventory_sync_lease"
+    indexes = [
+      IndexModel([("region", 1)], unique=True),
+    ]
+
+
 class ServerFileNode(Document):
   """One directory or object row inside a server file inventory generation."""
   server_id: str

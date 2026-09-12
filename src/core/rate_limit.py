@@ -92,6 +92,11 @@ def rate_limit_celery_history(request: Request, username: str) -> None:
   )
 
 
+def rate_limit_celery_run(request: Request, username: str) -> None:
+  ip = _client_ip(request)
+  check_rate_limit(f"celery-run:{username}:{ip}", limit=10, window_seconds=60.0)
+
+
 def rate_limit_oa_request(request: Request, username: str) -> None:
   ip = _client_ip(request)
   check_rate_limit(f"oa-request:{username}:{ip}", limit=5, window_seconds=600.0)

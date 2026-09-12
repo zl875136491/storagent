@@ -44,6 +44,7 @@ storagent-beat:<region>:v<protocol>
 | `storagent.auth.cleanup_expired_tokens` | Beat | 本区认证数据 | 可重试 |
 | `storagent.files.archive_expired_objects` | Beat，显式开启归档后 | 本区且 `source_region` 匹配的对象 | 可重试，复制/删除幂等 |
 | `storagent.etcd.reconcile` | Beat | 本区 Mongo 与共享 Etcd | 可重试 |
+| `storagent.storage.sync_file_inventory` | Beat（6 小时）/ Celery 运维手动发起 | 本区 MinIO listing 与 Mongo 对象索引 | 不自动重试；同区互斥 |
 | `storagent.maintenance.recover_queued_tasks` | Beat | 本区存储/Etcd 手工任务 | 可重试 |
 | `storagent.replication.reconcile_policies` | Beat | 仅 `SYNC_AUTHORITY_REGION` | 可重试 |
 | `storagent.public.refresh_quota_aggregates` | Beat | 仅权威 Region，按批次轮转 | 可重试 |

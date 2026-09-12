@@ -16,6 +16,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from src.configs.configs import settings
 from src.core.celery_client import broker_url, celery_app, result_backend
 from src.core.celery_routing import task_queue_name
+from src.core.exception import CustomException, ErrorDesc
 from src.modules.celery import schema
 from src.utils.helpers import utc_now
 from src.utils.logger import logger
@@ -45,6 +46,15 @@ TASK_CATALOG = (
     "schedule_setting": "SYNC_RECONCILE_INTERVAL_SECONDS",
     "execution_scope": "本区控制面与共享 Etcd",
     "description": "将本区 Mongo 元数据与 Etcd 控制面进行一次有界校准。",
+  },
+  {
+    "name": "storagent.storage.sync_file_inventory",
+    "display_name": "文件索引同步",
+    "trigger": "周期调度 / 可手动发起",
+    "schedule_setting": "FILE_INVENTORY_SYNC_INTERVAL_SECONDS",
+    "execution_scope": "本区 MinIO 与 Mongo 对象索引",
+    "description": "对本区 MinIO 做一次全量 listing，重建服务器文件详情索引。",
+    "manual_run_allowed": True,
   },
   {
     "name": "storagent.replication.reconcile_policies",
@@ -111,6 +121,9 @@ TASK_CATALOG = (
 
 _TASK_DISPLAY_NAMES = {
   str(item["name"]): str(item["display_name"]) for item in TASK_CATALOG
+}
+_MANUAL_RUN_TASKS = {
+  str(item["name"]) for item in TASK_CATALOG if item.get("manual_run_allowed")
 }
 _IN_PROGRESS_STATUSES = {"STARTED", "RETRY"}
 
@@ -232,6 +245,7 @@ def task_catalog() -> list[schema.CeleryTaskCatalogItem]:
       schedule_seconds=_as_int(schedule_value, 0) if schedule_value is not None else None,
       execution_scope=str(item["execution_scope"]),
       description=str(item["description"]),
+      manual_run_allowed=bool(item.get("manual_run_allowed")),
     ))
   return rows
 
@@ -811,7 +825,13 @@ _HISTORY_PROJECTION = {
 }
 
 
-async def get_history(limit: int = 50, offset: int = 0) -> schema.CeleryHistoryResponse:
+def _history_mongo_filter(*, failed_only: bool) -> dict[str, Any]:
+  if failed_only:
+    return {"status": "FAILURE"}
+  return {}
+
+
+async def get_history(limit: int = 50, offset: int = 0, failed_only: bool = False) -> schema.CeleryHistoryResponse:
   generated_at = utc_now()
   limit = max(int(limit), 1)
   offset = max(int(offset), 0)
@@ -835,14 +855,15 @@ async def get_history(limit: int = 50, offset: int = 0) -> schema.CeleryHistoryR
     await client.admin.command("ping")
     database = client[result_db_name]
     history_collection = database[settings.CELERY_TASK_HISTORY_COLLECTION]
-    total = int(await history_collection.count_documents({}))
+    query = _history_mongo_filter(failed_only=failed_only)
+    total = int(await history_collection.count_documents(query))
     history_rows = await history_collection.find(
-      {},
+      query,
       _HISTORY_PROJECTION,
     ).sort("updated_at", -1).skip(offset).limit(limit).to_list(length=limit)
     rows = [_history_item({**row, "source": "history"}) for row in history_rows]
     legacy_count = 0
-    if total == 0 and offset == 0:
+    if not failed_only and total == 0 and offset == 0:
       remaining = limit
       legacy_rows = await database[settings.CELERY_MONGODB_RESULT_COLLECTION].find(
         {}, {"status": 1, "result": 1, "traceback": 1, "date_done": 1},
@@ -877,3 +898,52 @@ async def get_history(limit: int = 50, offset: int = 0) -> schema.CeleryHistoryR
     )
   finally:
     client.close()
+
+
+async def _task_in_progress(name: str) -> bool:
+  result = result_backend()
+  result_db_name = (
+    settings.CELERY_MONGODB_RESULT_DATABASE.strip()
+    or _database_name(result, settings.CELERY_MONGODB_DATABASE)
+  )
+  timeout_ms = max(int(float(settings.CELERY_RUNTIME_TIMEOUT_SECONDS) * 1000), 500)
+  client = AsyncIOMotorClient(result, serverSelectionTimeoutMS=timeout_ms, connectTimeoutMS=timeout_ms)
+  try:
+    row = await client[result_db_name][settings.CELERY_TASK_HISTORY_COLLECTION].find_one(
+      {
+        "task_name": name,
+        "status": {"$in": list(_IN_PROGRESS_STATUSES)},
+        "region": settings.REGION,
+      },
+      {"task_id": 1},
+    )
+    return row is not None
+  except Exception:
+    return False
+  finally:
+    client.close()
+
+
+async def run_registered_task(name: str, actor: str) -> schema.CeleryTaskRunResponse:
+  """Enqueue a catalog task that operators are allowed to start by hand."""
+  task_name = str(name or "").strip()
+  if task_name not in _MANUAL_RUN_TASKS:
+    raise CustomException(ErrorDesc.OPERATION_NOT_ALLOWED, "该任务不允许手动发起")
+  if not settings.CELERY_ENABLED:
+    raise CustomException(ErrorDesc.STATUS_ERR, "当前节点未启用 Celery")
+  from src.modules.storage.inventory_sync import is_lease_held, enqueue_file_inventory_sync
+
+  if await is_lease_held() or await _task_in_progress(task_name):
+    raise CustomException(ErrorDesc.TASK_ALREADY_RUNNING, "本区文件索引正在同步，请稍后再试")
+  task_id = enqueue_file_inventory_sync(trigger="manual", actor=actor)
+  if not task_id:
+    raise CustomException(ErrorDesc.STATUS_ERR, "任务派发失败")
+  from src.core import audit
+  audit.audit("celery.task.run", actor=actor, resource=task_name, detail=task_id)
+  return schema.CeleryTaskRunResponse(
+    message="文件索引同步已加入队列",
+    task_id=task_id,
+    task_name=task_name,
+    display_name=_task_display_name(task_name),
+    status="queued",
+  )

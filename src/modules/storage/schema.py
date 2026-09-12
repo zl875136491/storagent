@@ -53,9 +53,10 @@ class ServerDetailsResponse(BaseModel):
   cache_hit: bool = Field(False, description="是否命中 Mongo 对象索引")
   cached_at: datetime = Field(..., description="缓存生成时间")
   expires_at: datetime = Field(..., description="缓存过期时间")
-  ttl_seconds: int = Field(21600, ge=1, description="建议刷新间隔（秒）；过期后仍从 Mongo 读取，仅手动刷新才回源 MinIO")
+  ttl_seconds: int = Field(21600, ge=1, description="索引建议刷新间隔（秒），由 Celery 定时任务执行")
   object_count: int = Field(default=0, ge=0, description="对象总数")
   total_size: int = Field(default=0, ge=0, description="对象总大小")
+  index_ready: bool = Field(True, description="本区是否已有可用的对象索引")
 
 
 class InventoryNode(BaseModel):
@@ -87,6 +88,7 @@ class InventoryChildrenResponse(BaseModel):
   cached_at: datetime
   expires_at: datetime
   ttl_seconds: int = Field(21600, ge=1)
+  index_ready: bool = True
 
 
 class InventorySearchResponse(BaseModel):
@@ -101,6 +103,7 @@ class InventorySearchResponse(BaseModel):
   cached_at: datetime
   expires_at: datetime
   ttl_seconds: int = Field(21600, ge=1)
+  index_ready: bool = True
 
 
 class OneTimeDownloadCreateRequest(BaseModel):

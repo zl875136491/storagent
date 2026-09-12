@@ -16,6 +16,7 @@ def test_celery_routes_are_registered_for_both_versions():
   for prefix in ("/api/v1/celery", "/api/v2/celery"):
     assert prefix + "/overview" in paths
     assert prefix + "/history" in paths
+    assert prefix + "/tasks/run" in paths
 
 
 def test_task_catalog_covers_all_worker_tasks():
@@ -32,7 +33,12 @@ def test_task_catalog_covers_all_worker_tasks():
     "storagent.replication.reconcile_policies",
     "storagent.storage.execute_operation",
     "storagent.storage.monitor_cluster_health",
+    "storagent.storage.sync_file_inventory",
   }
+  inventory = next(item for item in service.task_catalog() if item.name.endswith("sync_file_inventory"))
+  assert inventory.manual_run_allowed is True
+  assert inventory.schedule_seconds == 21600
+  assert not any(item.manual_run_allowed for item in service.task_catalog() if item.name != inventory.name)
 
 
 def test_runtime_task_never_exposes_args_or_kwargs():
@@ -134,10 +140,15 @@ def test_legacy_history_hides_unredacted_result_and_error_payloads():
   assert "secret-value" not in item.model_dump_json()
 
 
+def test_history_mongo_filter_failed_only():
+  assert service._history_mongo_filter(failed_only=False) == {}
+  assert service._history_mongo_filter(failed_only=True) == {"status": "FAILURE"}
+
+
 @pytest.mark.asyncio
 async def test_history_disabled_includes_pagination_fields(monkeypatch):
   monkeypatch.setattr(service.settings, "CELERY_ENABLED", False)
-  result = await service.get_history(limit=50, offset=100)
+  result = await service.get_history(limit=50, offset=100, failed_only=True)
   assert result.available is False
   assert result.total == 0
   assert result.limit == 50
@@ -269,3 +280,56 @@ def test_worker_heartbeat_view_hides_legacy_and_replaced_instances(monkeypatch):
     "beijing@current-host",
     "tianjin@last-host",
   ]
+
+
+@pytest.mark.asyncio
+async def test_run_registered_task_rejects_unknown_names():
+  from src.core.exception import CustomException, ErrorDesc
+
+  with pytest.raises(CustomException) as raised:
+    await service.run_registered_task("storagent.etcd.reconcile", "zhangle")
+  assert raised.value.error_desc == ErrorDesc.OPERATION_NOT_ALLOWED
+
+
+@pytest.mark.asyncio
+async def test_run_registered_task_rejects_when_lease_held(monkeypatch):
+  from src.core.exception import CustomException, ErrorDesc
+  from src.modules.storage import inventory_sync
+
+  monkeypatch.setattr(service.settings, "CELERY_ENABLED", True)
+
+  async def held():
+    return True
+
+  async def idle(_name):
+    return False
+
+  monkeypatch.setattr(inventory_sync, "is_lease_held", held)
+  monkeypatch.setattr(service, "_task_in_progress", idle)
+
+  with pytest.raises(CustomException) as raised:
+    await service.run_registered_task("storagent.storage.sync_file_inventory", "zhangle")
+  assert raised.value.error_desc == ErrorDesc.TASK_ALREADY_RUNNING
+
+
+@pytest.mark.asyncio
+async def test_run_registered_task_dispatches_manual_inventory(monkeypatch):
+  from src.modules.storage import inventory_sync
+
+  monkeypatch.setattr(service.settings, "CELERY_ENABLED", True)
+
+  async def free():
+    return False
+
+  async def idle(_name):
+    return False
+
+  monkeypatch.setattr(inventory_sync, "is_lease_held", free)
+  monkeypatch.setattr(service, "_task_in_progress", idle)
+  monkeypatch.setattr(inventory_sync, "enqueue_file_inventory_sync", lambda **_kwargs: "task-manual-1")
+  monkeypatch.setattr("src.core.audit.audit", lambda *args, **kwargs: None)
+
+  result = await service.run_registered_task("storagent.storage.sync_file_inventory", "zhangle")
+  assert result.task_id == "task-manual-1"
+  assert result.status == "queued"
+  assert result.display_name == "文件索引同步"

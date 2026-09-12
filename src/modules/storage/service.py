@@ -24,6 +24,7 @@ from src.core.minio_op import (
   delete_bucket_replicate as delete_minio_bucket_replicate,
 )
 from src.core import sync as sync_module
+from src.utils.logger import logger
 
 async def _connect_minio_server(
   host: str,
@@ -125,6 +126,11 @@ async def create_minio_server(
     raise CustomException(ErrorDesc.SYNC_FAILED, f"Server 同步到 Etcd 失败: {e}")
   from src.core import audit
   audit.audit("minio_server.create", resource=region_obj.name)
+  try:
+    from src.modules.storage.inventory_sync import enqueue_file_inventory_sync
+    enqueue_file_inventory_sync(trigger="bootstrap", actor="system")
+  except Exception as error:
+    logger.warning("派发文件索引同步失败 region={} error={}", region_obj.name, error)
   return minio_server_obj
 
 async def update_minio_server(
@@ -219,14 +225,10 @@ async def _require_minio_server(minio_server: ObjectId) -> MinioServer:
 
 async def get_server_details(
   minio_server: ObjectId,
-  force_refresh: bool = False,
 ) -> dict:
   """Return bucket occupancy from the Mongo object index."""
   minio_server_obj = await _require_minio_server(minio_server)
-  return await storage_inventory.inventory_summary(
-    minio_server_obj,
-    force_refresh=force_refresh,
-  )
+  return await storage_inventory.inventory_summary(minio_server_obj)
 
 
 async def list_server_file_children(
@@ -238,7 +240,6 @@ async def list_server_file_children(
   limit: int = 40,
   sort: str = "size",
   order: str = "desc",
-  force_refresh: bool = False,
 ) -> dict:
   minio_server_obj = await _require_minio_server(minio_server)
   return await storage_inventory.list_inventory_children(
@@ -249,7 +250,6 @@ async def list_server_file_children(
     limit=limit,
     sort=sort,  # type: ignore[arg-type]
     order=order,  # type: ignore[arg-type]
-    force_refresh=force_refresh,
   )
 
 
@@ -262,7 +262,6 @@ async def search_server_files(
   page_size: int = 50,
   sort: str = "object_key",
   order: str = "asc",
-  force_refresh: bool = False,
 ) -> dict:
   minio_server_obj = await _require_minio_server(minio_server)
   return await storage_inventory.search_inventory(
@@ -273,7 +272,6 @@ async def search_server_files(
     page_size=page_size,
     sort=sort,  # type: ignore[arg-type]
     order=order,  # type: ignore[arg-type]
-    force_refresh=force_refresh,
   )
 
 async def format_replicate_status(status: dict) -> dict:

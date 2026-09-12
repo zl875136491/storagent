@@ -1,7 +1,6 @@
 """Queryable MinIO object index stored in Mongo, with sliced directory reads."""
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -26,17 +25,6 @@ _BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 
 SortKey = Literal["size", "name", "last_modified", "object_key"]
 SortOrder = Literal["asc", "desc"]
-
-_inventory_locks: dict[str, asyncio.Lock] = {}
-
-
-def _inventory_lock(server_id: str) -> asyncio.Lock:
-  lock = _inventory_locks.get(server_id)
-  if lock is None:
-    lock = asyncio.Lock()
-    _inventory_locks[server_id] = lock
-  return lock
-
 
 def _aware_utc(value: datetime) -> datetime:
   return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -230,7 +218,10 @@ def search_regex(query: str) -> str:
 
 
 def _ttl_seconds() -> int:
-  return max(int(settings.SERVER_DETAILS_CACHE_TTL_SECONDS), 1)
+  value = int(getattr(settings, "FILE_INVENTORY_SYNC_INTERVAL_SECONDS", 0) or 0)
+  if value <= 0:
+    value = int(settings.SERVER_DETAILS_CACHE_TTL_SECONDS)
+  return max(value, 1)
 
 
 def _validate_bucket(bucket: str | None) -> str:
@@ -403,41 +394,47 @@ async def _sync_from_minio(server: Any) -> InventorySnapshot:
   )
 
 
-async def ensure_server_file_inventory(
-  server: Any,
-  *,
-  force_refresh: bool = False,
-) -> InventorySnapshot:
+def _empty_snapshot(server_id: str) -> InventorySnapshot:
+  return InventorySnapshot(
+    server_id=server_id,
+    generation="",
+    buckets=[],
+    object_count=0,
+    total_size=0,
+    fetched_at=_EPOCH,
+    expires_at=_EPOCH,
+    cache_hit=True,
+  )
+
+
+async def ensure_server_file_inventory(server: Any) -> InventorySnapshot:
+  """Read the Mongo index only. MinIO listing is a Celery job."""
   server_id = str(server.id)
-  if not force_refresh:
-    meta = await _read_meta(server_id)
-    # Keep serving Mongo even after the advisory TTL so browsing never
-    # re-lists MinIO unless the operator explicitly refreshes.
-    if meta is not None:
-      return _meta_to_snapshot(meta, cache_hit=True)
-
-  async with _inventory_lock(server_id):
-    if not force_refresh:
-      meta = await _read_meta(server_id)
-      if meta is not None:
-        return _meta_to_snapshot(meta, cache_hit=True)
-    if force_refresh:
-      await ServerFileInventoryMeta.get_motor_collection().delete_many({"server_id": server_id})
-      await _delete_generation(server_id)
-    return await _sync_from_minio(server)
+  meta = await _read_meta(server_id)
+  if meta is None:
+    return _empty_snapshot(server_id)
+  return _meta_to_snapshot(meta, cache_hit=True)
 
 
-async def inventory_summary(server: Any, *, force_refresh: bool = False) -> dict[str, Any]:
-  snapshot = await ensure_server_file_inventory(server, force_refresh=force_refresh)
-  buckets = [public_bucket(item) for item in snapshot.buckets]
+def _index_fields(snapshot: InventorySnapshot) -> dict[str, Any]:
+  ready = bool(snapshot.generation)
   return {
-    "data": buckets,
     "cache_hit": snapshot.cache_hit,
+    "index_ready": ready,
     "cached_at": snapshot.fetched_at,
     "expires_at": snapshot.expires_at,
     "ttl_seconds": _ttl_seconds(),
+  }
+
+
+async def inventory_summary(server: Any) -> dict[str, Any]:
+  snapshot = await ensure_server_file_inventory(server)
+  buckets = [public_bucket(item) for item in snapshot.buckets]
+  return {
+    "data": buckets,
     "object_count": snapshot.object_count,
     "total_size": snapshot.total_size,
+    **_index_fields(snapshot),
   }
 
 
@@ -469,9 +466,8 @@ async def list_inventory_children(
   limit: int = _DEFAULT_CHILD_LIMIT,
   sort: SortKey = "size",
   order: SortOrder = "desc",
-  force_refresh: bool = False,
 ) -> dict[str, Any]:
-  snapshot = await ensure_server_file_inventory(server, force_refresh=force_refresh)
+  snapshot = await ensure_server_file_inventory(server)
   bucket_name = _validate_bucket(bucket)
   parent = _validate_prefix(prefix)
   offset = max(int(offset), 0)
@@ -533,10 +529,7 @@ async def list_inventory_children(
     "parent_size": parent_size,
     "parent_object_count": parent_count,
     "parent_child_count": parent_children,
-    "cache_hit": snapshot.cache_hit,
-    "cached_at": snapshot.fetched_at,
-    "expires_at": snapshot.expires_at,
-    "ttl_seconds": _ttl_seconds(),
+    **_index_fields(snapshot),
   }
 
 
@@ -549,9 +542,8 @@ async def search_inventory(
   page_size: int = _DEFAULT_SEARCH_PAGE_SIZE,
   sort: SortKey = "object_key",
   order: SortOrder = "asc",
-  force_refresh: bool = False,
 ) -> dict[str, Any]:
-  snapshot = await ensure_server_file_inventory(server, force_refresh=force_refresh)
+  snapshot = await ensure_server_file_inventory(server)
   bucket_name = _validate_bucket(bucket)
   needle = normalize_search_query(query)
   page = max(int(page), 1)
@@ -588,15 +580,12 @@ async def search_inventory(
     "page_size": page_size,
     "total": total,
     "page_count": page_count,
-    "cache_hit": snapshot.cache_hit,
-    "cached_at": snapshot.fetched_at,
-    "expires_at": snapshot.expires_at,
-    "ttl_seconds": _ttl_seconds(),
+    **_index_fields(snapshot),
   }
 
 
 async def find_inventory_file(server: Any, bucket: str, object_key: str) -> dict[str, Any] | None:
-  snapshot = await ensure_server_file_inventory(server, force_refresh=False)
+  snapshot = await ensure_server_file_inventory(server)
   parts = split_object_key(object_key)
   if not parts:
     return None

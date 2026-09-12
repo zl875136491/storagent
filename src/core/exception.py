@@ -95,6 +95,7 @@ class ErrorDesc(Enum):
   QUOTA_RESTORE_EXCEEDED = ("恢复对象将超过存储限额", 409056)
   SHARE_CONSUMED = ("分享地址已经使用", 410057)
   SHARE_REVOKED = ("分享地址已失效", 410058)
+  TASK_ALREADY_RUNNING = ("任务正在执行", 409061)
 
   
   @property
@@ -133,6 +134,7 @@ V2_ERROR_CODES: dict[ErrorDesc, tuple[str, bool]] = {
   # retryable distinguish authentication from network/transient failures.
   ErrorDesc.MINIO_AUTH_FAILED: ("storage.unavailable", False),
   ErrorDesc.MINIO_NETWORK_UNAVAILABLE: ("storage.unavailable", True),
+  ErrorDesc.TASK_ALREADY_RUNNING: ("request.conflict", False),
   ErrorDesc.RATE_LIMITED: ("rate_limit.exceeded", True),
   ErrorDesc.SYNC_FAILED: ("system.dependency_unavailable", True),
   ErrorDesc.MINIO_ACCESS_FAILED: ("storage.unavailable", True),
