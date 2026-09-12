@@ -45,7 +45,7 @@ storagent-beat:<region>:v<protocol>
 | `storagent.files.archive_expired_objects` | Beat，显式开启归档后 | 本区且 `source_region` 匹配的对象 | 可重试，复制/删除幂等 |
 | `storagent.etcd.reconcile` | Beat | 本区 Mongo 与共享 Etcd | 可重试 |
 | `storagent.storage.sync_file_inventory` | Beat（6 小时）/ Celery 运维手动发起 | 本区 MinIO listing 与 Mongo 对象索引 | 不自动重试；同区互斥 |
-| `storagent.maintenance.recover_queued_tasks` | Beat | 本区存储/Etcd 手工任务 | 可重试 |
+| `storagent.maintenance.recover_queued_tasks` | Beat | 本区存储/Etcd 手工任务与过期任务历史 | 可重试 |
 | `storagent.replication.reconcile_policies` | Beat | 仅 `SYNC_AUTHORITY_REGION` | 可重试 |
 | `storagent.public.refresh_quota_aggregates` | Beat | 仅权威 Region，按批次轮转 | 可重试 |
 | `storagent.capacity.snapshot` | Beat | 仅权威 Region | 可重试 |
@@ -79,6 +79,8 @@ queued --(Worker atomic claim)--> running --(confirmed result)--> succeeded/fail
 - 已运行超过 `CELERY_OPERATION_RUNNING_TIMEOUT_SECONDS`。
 
 这样处理是刻意的：复制 resync、MinIO 删除、Etcd compact/defrag 在“外部调用已成功、进程在落库前中断”的窗口中不一定可以安全重放。人工复核原生 MinIO/Etcd 状态后，再创建新的运维任务。
+
+同一看门狗还会结束本区 `celery_task_history` 中超过运行超时仍停在 `STARTED`/`RETRY` 的记录。这只改观察数据，不重放任务、不触碰对象或 Etcd 键。Worker 启动时也会把本机 hostname 上一次进程留下的同类记录收成 `FAILURE`，避免容器重启后因 hostname 不变而一直显示为执行中。
 
 审计任务例外：每个 producer 在投递时生成 UUID `event_id`，Mongo 对该字段有 sparse unique index。重复投递会作为成功处理，因此可以安全自动重试。
 
@@ -120,6 +122,8 @@ Worker 将最小化的任务生命周期和心跳写入 result MongoDB：
 - result 只保留白名单中的运行计数，error 会脱敏 token、password、URL 凭据和 query secret。
 
 Celery 运维页面是只读的。服务端对 overview 做 `CELERY_OVERVIEW_CACHE_SECONDS` 短缓存，并分别限制 overview/history 的用户和客户端 IP 请求频率。页面显示 expected queue、Worker 实际队列/协议、任务来源 Region 和 Beat 租约，便于定位不匹配配置。
+
+执行中列表会把 Mongo broker 上可能漏检的 inspect 结果，与 `celery_task_history` 里仍在心跳窗口（`CELERY_WORKER_STALE_AFTER_SECONDS * 3`，至少 300 秒）内更新的 `STARTED`/`RETRY` 合并。Worker 主机名在线不足以让过期历史继续显示为执行中。
 
 旧的 `celery_taskmeta` 没有经过新的脱敏协议；页面只显示“历史记录已隐藏未脱敏内容”，不会泄露旧 result/traceback。
 

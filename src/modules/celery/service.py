@@ -7,13 +7,14 @@ import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from src.configs.configs import settings
+from src.core import metrics
 from src.core.celery_client import broker_url, celery_app, result_backend
 from src.core.celery_routing import task_queue_name
 from src.core.exception import CustomException, ErrorDesc
@@ -114,8 +115,8 @@ TASK_CATALOG = (
     "display_name": "运维任务状态看门狗",
     "trigger": "周期调度",
     "schedule_setting": "CELERY_OPERATION_WATCHDOG_INTERVAL_SECONDS",
-    "execution_scope": "本区持久化运维任务",
-    "description": "将长期未启动或运行超时的存储、Etcd 运维任务标记为需要人工复核。",
+    "execution_scope": "本区持久化运维任务与任务历史",
+    "description": "将长期未启动或运行超时的存储、Etcd 运维任务标记为需要人工复核；并结束本区已不再更新的 Celery 执行中历史。",
   },
 )
 
@@ -126,6 +127,7 @@ _MANUAL_RUN_TASKS = {
   str(item["name"]) for item in TASK_CATALOG if item.get("manual_run_allowed")
 }
 _IN_PROGRESS_STATUSES = {"STARTED", "RETRY"}
+_STALE_HISTORY_REASON = "任务执行记录已过期，Worker 未再更新状态"
 
 _overview_cache_lock = asyncio.Lock()
 _overview_cache_value: schema.CeleryOverviewResponse | None = None
@@ -173,6 +175,34 @@ def _as_int(value: Any, default: int = 0) -> int:
     return int(value)
   except (TypeError, ValueError):
     return default
+
+
+def _in_progress_max_age_seconds() -> int:
+  stale_after = max(_as_int(settings.CELERY_WORKER_STALE_AFTER_SECONDS), 1)
+  return max(stale_after * 3, 300)
+
+
+def _history_close_after_seconds() -> int:
+  return max(
+    _as_int(settings.CELERY_OPERATION_RUNNING_TIMEOUT_SECONDS),
+    _in_progress_max_age_seconds(),
+  )
+
+
+def _history_activity_at(row: dict[str, Any]) -> datetime | None:
+  return _as_datetime(row.get("updated_at") or row.get("started_at") or row.get("received_at"))
+
+
+def _history_row_open(
+  row: dict[str, Any],
+  *,
+  max_age_seconds: int,
+  now: datetime | None = None,
+) -> bool:
+  stamp = _history_activity_at(row)
+  if stamp is None:
+    return False
+  return ((now or utc_now()) - stamp).total_seconds() <= max(max_age_seconds, 1)
 
 
 def _expected_queue() -> str:
@@ -632,16 +662,13 @@ def _worker_statuses(
   return workers, active_tasks, reserved_tasks, scheduled_tasks
 
 
-def _in_progress_still_running(row: dict[str, Any], online_workers: set[str]) -> bool:
-  worker = str(row.get("worker") or "").strip()
-  if worker and worker in online_workers:
-    return True
-  updated = _as_datetime(row.get("updated_at") or row.get("started_at"))
-  if updated is None:
-    return False
-  stale_after = max(_as_int(settings.CELERY_WORKER_STALE_AFTER_SECONDS), 1)
-  age = (utc_now() - updated).total_seconds()
-  return age <= max(stale_after * 3, 300)
+def _in_progress_still_running(row: dict[str, Any]) -> bool:
+  """History fills inspect gaps only while the row was updated inside the heartbeat window.
+
+  A matching online Worker hostname is not enough: production hostnames stay
+  stable across restarts, so STARTED/RETRY leftovers would otherwise linger.
+  """
+  return _history_row_open(row, max_age_seconds=_in_progress_max_age_seconds())
 
 
 def _merge_in_progress_history(
@@ -653,12 +680,11 @@ def _merge_in_progress_history(
   """Celery inspect on Mongo broker can miss running tasks; history STARTED/RETRY fills the gap."""
   seen = {item.id for item in active_tasks if item.id and item.id != "-"}
   seen.update(item.id for item in reserved_tasks if item.id and item.id != "-")
-  online_workers = {worker.name for worker in workers if worker.status == "online"}
   extra: list[schema.CeleryTaskExecution] = []
   for row in rows:
     if str(row.get("status") or "") not in _IN_PROGRESS_STATUSES:
       continue
-    if not _in_progress_still_running(row, online_workers):
+    if not _in_progress_still_running(row):
       continue
     task = _history_item({**row, "source": "history"})
     if task.id in seen:
@@ -900,6 +926,82 @@ async def get_history(limit: int = 50, offset: int = 0, failed_only: bool = Fals
     client.close()
 
 
+def _stale_history_close_update(row: dict[str, Any], now: datetime) -> dict[str, Any]:
+  previous = str(row.get("error") or "").strip()
+  error = f"{previous}；{_STALE_HISTORY_REASON}" if previous else _STALE_HISTORY_REASON
+  started = _as_datetime(row.get("started_at"))
+  payload: dict[str, Any] = {
+    "status": "FAILURE",
+    "error": _redact(error, limit=600),
+    "error_summary_version": 2,
+    "finished_at": now,
+    "updated_at": now,
+    "result_summary": json.dumps(
+      {"recovery_required": True},
+      ensure_ascii=False,
+      separators=(",", ":"),
+    ),
+    "result_summary_version": 2,
+  }
+  if started is not None:
+    payload["duration_ms"] = max(int((now - started).total_seconds() * 1000), 0)
+  return {"$set": payload}
+
+
+async def recover_stale_task_history_once() -> dict[str, int]:
+  """Close orphaned STARTED/RETRY history. Observability only; never replays work."""
+  result = {"history_timeout": 0}
+  now = utc_now()
+  region = str(settings.REGION or "").strip()
+  backend = result_backend()
+  result_db_name = (
+    settings.CELERY_MONGODB_RESULT_DATABASE.strip()
+    or _database_name(backend, settings.CELERY_MONGODB_DATABASE)
+  )
+  timeout_ms = max(int(float(settings.CELERY_RUNTIME_TIMEOUT_SECONDS) * 1000), 500)
+  client = AsyncIOMotorClient(
+    backend,
+    serverSelectionTimeoutMS=timeout_ms,
+    connectTimeoutMS=timeout_ms,
+  )
+  try:
+    collection = client[result_db_name][settings.CELERY_TASK_HISTORY_COLLECTION]
+    rows = await collection.find(
+      {
+        "status": {"$in": list(_IN_PROGRESS_STATUSES)},
+        "region": {"$in": ["", region]},
+      },
+      {
+        "task_id": 1, "status": 1, "error": 1, "started_at": 1,
+        "updated_at": 1, "received_at": 1,
+      },
+    ).sort("updated_at", 1).to_list(length=500)
+    max_age = _history_close_after_seconds()
+    for row in rows:
+      task_id = str(row.get("task_id") or "").strip()
+      if not task_id or _history_row_open(row, max_age_seconds=max_age, now=now):
+        continue
+      updated = await collection.update_one(
+        {
+          "task_id": task_id,
+          "status": {"$in": list(_IN_PROGRESS_STATUSES)},
+        },
+        _stale_history_close_update(row, now),
+      )
+      if not getattr(updated, "modified_count", 0):
+        continue
+      result["history_timeout"] += 1
+      metrics.incr("celery_task_history_watchdog_failures_total")
+    if result["history_timeout"]:
+      logger.warning("Celery 历史看门狗已结束 %s 条过期执行中记录", result["history_timeout"])
+    return result
+  except Exception as error:
+    logger.warning("Celery 历史看门狗失败: %s", type(error).__name__)
+    return result
+  finally:
+    client.close()
+
+
 async def _task_in_progress(name: str) -> bool:
   result = result_backend()
   result_db_name = (
@@ -909,15 +1011,18 @@ async def _task_in_progress(name: str) -> bool:
   timeout_ms = max(int(float(settings.CELERY_RUNTIME_TIMEOUT_SECONDS) * 1000), 500)
   client = AsyncIOMotorClient(result, serverSelectionTimeoutMS=timeout_ms, connectTimeoutMS=timeout_ms)
   try:
-    row = await client[result_db_name][settings.CELERY_TASK_HISTORY_COLLECTION].find_one(
+    rows = await client[result_db_name][settings.CELERY_TASK_HISTORY_COLLECTION].find(
       {
         "task_name": name,
         "status": {"$in": list(_IN_PROGRESS_STATUSES)},
         "region": settings.REGION,
       },
-      {"task_id": 1},
+      {"task_id": 1, "updated_at": 1, "started_at": 1, "received_at": 1},
+    ).sort("updated_at", -1).to_list(length=50)
+    return any(
+      _history_row_open(row, max_age_seconds=_history_close_after_seconds())
+      for row in rows
     )
-    return row is not None
   except Exception:
     return False
   finally:

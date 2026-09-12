@@ -7,6 +7,43 @@ from src.api import register_api
 from src.modules.celery import service
 
 
+class _FakeHistoryCursor:
+  def __init__(self, rows):
+    self.rows = rows
+
+  def sort(self, *_args, **_kwargs):
+    return self
+
+  async def to_list(self, length=None):
+    return list(self.rows[:length])
+
+
+class _FakeHistoryCollection:
+  def __init__(self, rows):
+    self.rows = rows
+    self.updates = []
+
+  def find(self, _query, _projection=None):
+    return _FakeHistoryCursor(self.rows)
+
+  async def update_one(self, filt, update):
+    self.updates.append((filt, update))
+    return type("Result", (), {"modified_count": 1})()
+
+
+class _FakeResultClient:
+  def __init__(self, collection):
+    self.collection = collection
+
+  def __getitem__(self, name):
+    if name == service.settings.CELERY_TASK_HISTORY_COLLECTION:
+      return self.collection
+    return self
+
+  def close(self):
+    return None
+
+
 def test_celery_routes_are_registered_for_both_versions():
   from fastapi import FastAPI
 
@@ -39,6 +76,8 @@ def test_task_catalog_covers_all_worker_tasks():
   assert inventory.manual_run_allowed is True
   assert inventory.schedule_seconds == 21600
   assert not any(item.manual_run_allowed for item in service.task_catalog() if item.name != inventory.name)
+  watchdog = next(item for item in service.task_catalog() if item.name.endswith("recover_queued_tasks"))
+  assert "历史" in watchdog.description
 
 
 def test_runtime_task_never_exposes_args_or_kwargs():
@@ -185,6 +224,108 @@ def test_merge_in_progress_history_fills_empty_inspect(monkeypatch):
   assert active[0].display_name == "Etcd 全量校准"
   assert workers[0].active_count == 1
   assert workers[1].active_count == 0
+
+
+def test_merge_in_progress_history_ignores_stale_rows_on_online_workers(monkeypatch):
+  monkeypatch.setattr(service.settings, "CELERY_WORKER_STALE_AFTER_SECONDS", 90)
+  now = service.utc_now()
+  workers = [
+    service.schema.CeleryWorkerStatus(name="w1", status="online", active_count=0),
+  ]
+  rows = [
+    {
+      "task_id": "ghost-1",
+      "task_name": "storagent.etcd.reconcile",
+      "status": "RETRY",
+      "worker": "w1",
+      "updated_at": now - timedelta(hours=60),
+    },
+    {
+      "task_id": "fresh-offline",
+      "task_name": "storagent.etcd.reconcile",
+      "status": "STARTED",
+      "worker": "gone",
+      "updated_at": now - timedelta(minutes=2),
+    },
+  ]
+
+  workers, active = service._merge_in_progress_history(workers, [], [], rows)
+
+  assert [item.id for item in active] == ["fresh-offline"]
+  assert workers[0].active_count == 0
+
+
+def test_stale_history_close_update_keeps_retry_error():
+  now = service.utc_now()
+  update = service._stale_history_close_update(
+    {
+      "error": "ConnectionFailedError: etcd unreachable",
+      "started_at": now - timedelta(hours=3),
+    },
+    now,
+  )["$set"]
+
+  assert update["status"] == "FAILURE"
+  assert update["error"].startswith("ConnectionFailedError")
+  assert "未再更新状态" in update["error"]
+  assert update["error_summary_version"] == 2
+  assert update["result_summary_version"] == 2
+  assert update["duration_ms"] == 3 * 60 * 60 * 1000
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_task_history_closes_expired_rows(monkeypatch):
+  monkeypatch.setattr(service.settings, "REGION", "tianjin")
+  monkeypatch.setattr(service.settings, "CELERY_OPERATION_RUNNING_TIMEOUT_SECONDS", 60)
+  monkeypatch.setattr(service.settings, "CELERY_WORKER_STALE_AFTER_SECONDS", 90)
+  now = service.utc_now()
+  rows = [
+    {
+      "task_id": "ghost-1",
+      "status": "RETRY",
+      "region": "tianjin",
+      "error": "ConnectionFailedError",
+      "updated_at": now - timedelta(hours=3),
+      "started_at": now - timedelta(hours=3),
+    },
+    {
+      "task_id": "live-1",
+      "status": "STARTED",
+      "region": "tianjin",
+      "updated_at": now,
+      "started_at": now,
+    },
+  ]
+  collection = _FakeHistoryCollection(rows)
+  monkeypatch.setattr(service, "result_backend", lambda: "mongodb://localhost/storagent_celery")
+  monkeypatch.setattr(service, "AsyncIOMotorClient", lambda *_args, **_kwargs: _FakeResultClient(collection))
+
+  result = await service.recover_stale_task_history_once()
+
+  assert result == {"history_timeout": 1}
+  assert len(collection.updates) == 1
+  filt, update = collection.updates[0]
+  assert filt["task_id"] == "ghost-1"
+  assert update["$set"]["status"] == "FAILURE"
+
+
+@pytest.mark.asyncio
+async def test_task_in_progress_ignores_expired_history(monkeypatch):
+  monkeypatch.setattr(service.settings, "REGION", "tianjin")
+  monkeypatch.setattr(service.settings, "CELERY_OPERATION_RUNNING_TIMEOUT_SECONDS", 60)
+  monkeypatch.setattr(service.settings, "CELERY_WORKER_STALE_AFTER_SECONDS", 90)
+  now = service.utc_now()
+  collection = _FakeHistoryCollection([
+    {
+      "task_id": "ghost",
+      "updated_at": now - timedelta(hours=3),
+      "started_at": now - timedelta(hours=3),
+    },
+  ])
+  monkeypatch.setattr(service, "result_backend", lambda: "mongodb://localhost/storagent_celery")
+  monkeypatch.setattr(service, "AsyncIOMotorClient", lambda *_args, **_kwargs: _FakeResultClient(collection))
+
+  assert await service._task_in_progress("storagent.storage.sync_file_inventory") is False
 
 
 def test_merge_in_progress_history_does_not_duplicate_inspect_ids():

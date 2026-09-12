@@ -92,7 +92,7 @@ Celery Worker 位于相邻的独立仓库，但 Backend、Worker 与 Frontend �
 - Worker 只订阅自己的区域队列，缺失或不匹配 header 的任务会失败；
 - 多个同区域 Worker 可启用 Beat，但只有 MongoDB 租约 `storagent-beat:<region>:v<protocol>` 的持有者投递周期任务；
 - 权威任务（复制规则校准、配额聚合、容量快照、自动自愈）还会检查 `SYNC_AUTHORITY_REGION`；
-- `celery_task_history` 与 `celery_worker_heartbeats` 由 TTL 管理，历史输出脱敏；管理接口只读。
+- `celery_task_history` 与 `celery_worker_heartbeats` 由 TTL 管理，历史输出脱敏；管理接口只读。过期的 `STARTED`/`RETRY` 由看门狗收口，不会仅因 Worker 主机名仍在线而显示为执行中。
 
 完整的任务触发、执行角色、失败语义和发布顺序见 [Celery 后台任务说明](docs/CELERY_OPERATIONS.md)。
 
