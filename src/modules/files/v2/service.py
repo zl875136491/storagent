@@ -14,7 +14,7 @@ from src.modules.files import service as v1_service
 from src.modules.files.v2 import schema
 from src.modules.public import service as public_service
 from src.modules.storage import download as storage_download
-from src.utils.helpers import utc_now
+from src.utils.helpers import mongo_date_to_utc, utc_now
 
 
 def request_id(request: Request) -> str:
@@ -175,7 +175,7 @@ async def restore(request, app_name, object_id):
     raise CustomException(ErrorDesc.OBJECT_NOT_FOUND, {"object_id": object_id})
   if item.state == "active":
     return _mutation(request, item)
-  if item.restore_until is None or item.restore_until <= utc_now():
+  if item.restore_until is None or mongo_date_to_utc(item.restore_until) <= utc_now():
     raise CustomException(ErrorDesc.OBJECT_PURGED, "对象已超过可恢复期限")
   quota_bytes = await public_service.get_application_quota_limit(app_name)
   async with quota.application_quota_lock(app_name) as quota_client:
@@ -186,7 +186,7 @@ async def restore(request, app_name, object_id):
       raise CustomException(ErrorDesc.OBJECT_NOT_FOUND, {"object_id": object_id})
     if item.state == "active":
       return _mutation(request, item)
-    if item.restore_until is None or item.restore_until <= utc_now():
+    if item.restore_until is None or mongo_date_to_utc(item.restore_until) <= utc_now():
       raise CustomException(ErrorDesc.OBJECT_PURGED, "对象已超过可恢复期限")
     await quota.restore_deleted_object_locked(
       app_name, item.size_bytes, quota_bytes, quota_client,
