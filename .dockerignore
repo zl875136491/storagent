@@ -14,7 +14,8 @@ htmlcov
 .ruff_cache
 logs
 *.log
-tests
+tests/*
+!tests/virtual_storage
 docs
 Jenkinsfile
 README.md

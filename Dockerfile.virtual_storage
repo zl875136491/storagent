@@ -1,0 +1,37 @@
+FROM python:3.12.10-bookworm
+
+ARG VCS_REF=unknown
+ARG IMAGE_VERSION=dev
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+LABEL org.opencontainers.image.title="Storagent Virtual Storage" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    VS_PORT=8443
+
+WORKDIR /app
+
+RUN groupadd --gid 10001 storagent \
+    && useradd --uid 10001 --gid storagent --create-home --shell /usr/sbin/nologin storagent \
+    && install -d -o storagent -g storagent /app/logs
+
+COPY requirements.txt ./requirements.txt
+RUN python -m pip install --no-cache-dir --disable-pip-version-check --index-url "${PIP_INDEX_URL}" -r requirements.txt \
+    && python -m pip install --no-cache-dir --disable-pip-version-check --index-url "${PIP_INDEX_URL}" pytest==8.3.5
+
+RUN python -m pip install --no-cache-dir --disable-pip-version-check --index-url "${PIP_INDEX_URL}" httpx==0.28.1
+
+COPY --chown=storagent:storagent virtual_storage_main.py __init__.py ./
+COPY --chown=storagent:storagent src ./src
+COPY --chown=storagent:storagent tests/virtual_storage ./tests/virtual_storage
+
+USER storagent:storagent
+EXPOSE 8443
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD python -c "import ssl,urllib.request; ctx=ssl._create_unverified_context(); urllib.request.urlopen('https://127.0.0.1:8443/ready', context=ctx, timeout=4)" || exit 1
+
+CMD ["python", "-m", "uvicorn", "virtual_storage_main:app", "--host", "0.0.0.0", "--port", "8443", "--ssl-certfile", "/certs/cert.pem", "--ssl-keyfile", "/certs/key.pem"]
