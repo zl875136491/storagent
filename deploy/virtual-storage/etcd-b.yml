@@ -1,0 +1,19 @@
+services:
+  etcd-b:
+    image: quay.io/coreos/etcd:v3.5.15
+    container_name: storagent-vs-etcd-b
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd-b
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://10.32.12.111:12379
+      - --advertise-client-urls=http://10.32.12.111:12379
+      - --listen-peer-urls=http://10.32.12.111:12380
+      - --initial-advertise-peer-urls=http://10.32.12.111:12380
+      - --initial-cluster=etcd-a=http://10.32.12.110:12380,etcd-b=http://10.32.12.111:12380,etcd-a2=http://10.32.12.110:12384
+      - --initial-cluster-state=new
+      - --initial-cluster-token=storagent-vs-etcd
+    volumes:
+      - /opt/storagent-vs/data/etcd-b:/etcd-data

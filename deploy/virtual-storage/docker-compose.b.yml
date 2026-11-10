@@ -1,0 +1,21 @@
+services:
+  api:
+    image: storagent-virtual-storage-nuc:dev
+    container_name: storagent-vs-api-b
+    network_mode: host
+    env_file:
+      - /opt/storagent-vs/env/api.env
+    volumes:
+      - /opt/storagent-vs/certs:/certs:ro
+    restart: unless-stopped
+
+  worker:
+    image: storagent-virtual-storage-nuc:dev
+    container_name: storagent-vs-worker-b
+    network_mode: host
+    env_file:
+      - /opt/storagent-vs/env/worker.env
+    command: ["python", "-m", "src.virtual_storage.workers"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
