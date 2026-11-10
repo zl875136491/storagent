@@ -318,6 +318,24 @@ async def issue_tenant_key(
   return await _replay(delivery, fingerprint)
 
 
+async def list_tenant_keys(*, app_name: str, credential: str, tenant_id: str) -> list[dict]:
+  account = await authenticate_management(app_name, credential)
+  tenant = await Tenant.find_one(Tenant.tenant_id == tenant_id, Tenant.account_id == account.account_id)
+  if tenant is None:
+    raise TenantNotFoundError(tenant_id)
+  keys = await TenantAPIKey.find(TenantAPIKey.tenant_id == tenant_id).to_list()
+  return [
+    {
+      "key_id": item.key_id,
+      "key_hint": item.key_hint,
+      "purpose": item.purpose,
+      "enabled": item.enabled,
+      "expires_at": item.expires_at.isoformat(),
+    }
+    for item in keys
+  ]
+
+
 async def revoke_tenant_key(*, app_name: str, credential: str, tenant_id: str, key_id: str) -> dict:
   account = await authenticate_management(app_name, credential)
   matched = await TenantAPIKey.find_one(TenantAPIKey.key_id == key_id, TenantAPIKey.account_id == account.account_id)

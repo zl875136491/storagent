@@ -25,6 +25,9 @@ for name in ("env/backend-a.env", "env/backend-b.env"):
     for line in path.read_text().splitlines():
         if line.startswith("SERVER_PORT="):
             lines.append("SERVER_PORT=18088")
+        elif line.startswith("FRONT_URL="):
+            host = "10.32.12.110" if name.endswith("a.env") else "10.32.12.111"
+            lines.append(f"FRONT_URL=https://{host}:18443")
         elif line.startswith("ETCD_ENDPOINTS="):
             lines.append("ETCD_ENDPOINTS=http://10.32.12.110:12379,http://10.32.12.111:12379,http://10.32.12.110:12383")
         elif line.startswith("ETCD_HOST="):

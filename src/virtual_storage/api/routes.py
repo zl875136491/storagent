@@ -22,6 +22,7 @@ from src.virtual_storage.services.tenants import (
   create_tenant,
   get_tenant,
   issue_tenant_key,
+  list_tenant_keys,
   list_tenants,
   revoke_tenant_key,
 )
@@ -199,6 +200,11 @@ async def patch_tenant(
   )
 
 
+@router.get("/api/virtual-storage/v1/accounts/{app_name}/tenants/{tenant_id}/api-keys")
+async def read_tenant_keys(app_name: str, tenant_id: str, authorization: str | None = Header(default=None)):
+  return await list_tenant_keys(app_name=app_name, credential=_bearer(authorization), tenant_id=tenant_id)
+
+
 @router.post("/api/virtual-storage/v1/accounts/{app_name}/tenants/{tenant_id}/api-keys")
 async def post_tenant_key(
   app_name: str,
@@ -246,10 +252,8 @@ async def post_unfreeze(app_name: str, tenant_id: str, authorization: str | None
 
 @router.post("/api/virtual-storage/v1/accounts/{app_name}/tenants/{tenant_id}/retire")
 async def post_retire(app_name: str, tenant_id: str, authorization: str | None = Header(default=None)):
-  result = await retire_tenant(app_name, _bearer(authorization), tenant_id)
-  from src.virtual_storage.workers.queue import enqueue_scan
-  enqueue_scan()
-  return result
+  # 不在请求里立刻扫描。周期任务仍会清除，这段空档里页面可以撤销注销。
+  return await retire_tenant(app_name, _bearer(authorization), tenant_id)
 
 
 @router.post("/api/virtual-storage/v1/accounts/{app_name}/tenants/{tenant_id}/cancel-retire")
