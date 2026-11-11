@@ -42,6 +42,11 @@ class QuotaExceededError(VirtualStorageError):
     super().__init__(message, "QUOTA_EXCEEDED", 409)
 
 
+class ConsoleForbiddenError(VirtualStorageError):
+  def __init__(self, message: str):
+    super().__init__(message, "CONSOLE_FORBIDDEN", 403)
+
+
 class InvalidCredentialError(VirtualStorageError):
   def __init__(self, message: str = "凭据无效"):
     super().__init__(message, "INVALID_CREDENTIAL", 401)

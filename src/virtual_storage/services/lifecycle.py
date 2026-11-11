@@ -19,17 +19,17 @@ from src.virtual_storage.services.support import new_id, stamp, write_audit
 from src.virtual_storage.services.uploads import drive_session
 
 
-async def _tenant(app_name: str, credential: str, tenant_id: str) -> tuple[Tenant, object]:
-  from src.virtual_storage.models.documents import VirtualAccount
-  account = await authenticate_management(app_name, credential)
+async def _tenant(app_name: str, credential: str, tenant_id: str, account=None) -> tuple[Tenant, object]:
+  if account is None:
+    account = await authenticate_management(app_name, credential)
   tenant = await Tenant.find_one(Tenant.tenant_id == tenant_id, Tenant.account_id == account.account_id)
   if tenant is None:
     raise TenantNotFoundError(tenant_id)
   return tenant, account
 
 
-async def freeze_tenant(app_name: str, credential: str, tenant_id: str) -> dict:
-  tenant, account = await _tenant(app_name, credential, tenant_id)
+async def freeze_tenant(app_name: str, credential: str, tenant_id: str, account=None) -> dict:
+  tenant, account = await _tenant(app_name, credential, tenant_id, account)
   result = await Tenant.get_motor_collection().update_one(
     {"tenant_id": tenant_id, "state": "active"},
     {"$set": {"state": "frozen", "frozen_at": stamp(), "updated_at": stamp()}, "$inc": {"revision": 1}},
@@ -45,8 +45,8 @@ async def freeze_tenant(app_name: str, credential: str, tenant_id: str) -> dict:
   return tenant_view(refreshed)
 
 
-async def unfreeze_tenant(app_name: str, credential: str, tenant_id: str) -> dict:
-  tenant, account = await _tenant(app_name, credential, tenant_id)
+async def unfreeze_tenant(app_name: str, credential: str, tenant_id: str, account=None) -> dict:
+  tenant, account = await _tenant(app_name, credential, tenant_id, account)
   result = await Tenant.get_motor_collection().update_one(
     {"tenant_id": tenant_id, "state": "frozen", "purge_started": False},
     {"$set": {"state": "active", "updated_at": stamp()}, "$inc": {"revision": 1}},
@@ -62,8 +62,8 @@ async def unfreeze_tenant(app_name: str, credential: str, tenant_id: str) -> dic
   return tenant_view(refreshed)
 
 
-async def retire_tenant(app_name: str, credential: str, tenant_id: str) -> dict:
-  tenant, account = await _tenant(app_name, credential, tenant_id)
+async def retire_tenant(app_name: str, credential: str, tenant_id: str, account=None) -> dict:
+  tenant, account = await _tenant(app_name, credential, tenant_id, account)
   if tenant.state == "retired":
     raise ConflictError("租户已注销")
   operation_id = new_id("op")
@@ -101,8 +101,8 @@ async def retire_tenant(app_name: str, credential: str, tenant_id: str) -> dict:
   return {"operation_id": operation_id, "state": "retiring"}
 
 
-async def cancel_retire(app_name: str, credential: str, tenant_id: str) -> dict:
-  tenant, account = await _tenant(app_name, credential, tenant_id)
+async def cancel_retire(app_name: str, credential: str, tenant_id: str, account=None) -> dict:
+  tenant, account = await _tenant(app_name, credential, tenant_id, account)
   pending = await VirtualObject.find(
     VirtualObject.tenant_id == tenant_id,
     VirtualObject.state == "purge_pending",
@@ -129,8 +129,9 @@ async def cancel_retire(app_name: str, credential: str, tenant_id: str) -> dict:
   return tenant_view(refreshed)
 
 
-async def get_operation(app_name: str, credential: str, operation_id: str) -> dict:
-  account = await authenticate_management(app_name, credential)
+async def get_operation(app_name: str, credential: str, operation_id: str, account=None) -> dict:
+  if account is None:
+    account = await authenticate_management(app_name, credential)
   operation = await OperationRecord.find_one(
     OperationRecord.operation_id == operation_id,
     OperationRecord.account_id == account.account_id,

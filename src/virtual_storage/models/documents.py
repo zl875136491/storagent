@@ -46,6 +46,7 @@ class VirtualAccount(Document):
   enabled: bool = Field(default=True)
   management_credential_hash: str
   management_credential_hint: str = Field(default="")
+  application_id: str = Field(default="")
   quota_bytes_total: int = Field(default=0)
   quota_bytes_allocated: int = Field(default=0)
   quota_bytes_used: int = Field(default=0)
@@ -65,6 +66,22 @@ class VirtualAccount(Document):
     indexes = [
       IndexModel(["account_id"], unique=True),
       IndexModel(["app_name"], unique=True),
+    ]
+
+
+class VirtualAccountGrant(Document):
+  """把已验证的控制台用户显式授到一个虚拟账号。不按名称自动匹配。"""
+  grant_id: str
+  account_id: str
+  user_id: str
+  username: str
+  created_at: datetime = Field(default_factory=utc_now)
+
+  class Settings:
+    name = "vs_account_grants"
+    indexes = [
+      IndexModel(["grant_id"], unique=True),
+      IndexModel([("user_id", 1), ("account_id", 1)], unique=True),
     ]
 
 

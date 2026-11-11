@@ -581,6 +581,12 @@ async def get_application_list() -> dict[str, List[Application]]:
     _application_response(application, refresh_usage=False)
     for application in application_objs
   ))
+  from src.modules.virtual_console.bridge import virtual_account_labels
+  labels = await virtual_account_labels()
+  for item in data:
+    name = labels.get(str(item["id"]), "")
+    item["virtual_account"] = bool(name)
+    item["virtual_account_name"] = name
   return {"data": list(data)}
 
 
@@ -845,6 +851,8 @@ async def _application_response(
     "quota_usage_ratio": usage / quota,
     "quota_usage_updated_at": application.quota_usage_updated_at,
     "domains": list(getattr(application, "domains", None) or []),
+    "virtual_account": False,
+    "virtual_account_name": "",
     "author": {
       "id": author.id,
       "username": author.username,

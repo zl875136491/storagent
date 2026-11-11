@@ -45,6 +45,7 @@ class VSSettings:
   protocol_version: str
   celery_broker_url: str
   port: int
+  console_token: str
 
 
 _cached: VSSettings | None = None
@@ -84,6 +85,7 @@ def get_settings() -> VSSettings:
       protocol_version=os.getenv("VS_PROTOCOL_VERSION", "1").strip(),
       celery_broker_url=os.getenv("VS_CELERY_BROKER_URL", "").strip(),
       port=_int("VS_PORT", 8443),
+      console_token=os.getenv("VS_CONSOLE_TOKEN", "").strip(),
     )
   return _cached
 

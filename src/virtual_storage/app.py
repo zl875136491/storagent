@@ -60,7 +60,12 @@ def create_app() -> FastAPI:
       )
     if _should_forward(request.url.path):
       return await _forward(request)
-    return await call_next(request)
+    from src.virtual_storage.services.console_access import console_username
+    username_token = console_username.set(request.headers.get("x-console-username", ""))
+    try:
+      return await call_next(request)
+    finally:
+      console_username.reset(username_token)
 
   app.include_router(router)
   return app

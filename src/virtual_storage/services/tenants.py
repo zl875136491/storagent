@@ -53,13 +53,36 @@ def tenant_view(tenant: Tenant) -> dict:
 
 
 def _fingerprint(payload: dict) -> str:
-  return request_fingerprint({
+  body = {
     "external_tenant_id": payload["external_tenant_id"],
     "logical_name": payload["logical_name"],
     "quota_bytes": int(payload["quota_bytes"]),
     "quota_objects": int(payload["quota_objects"]),
     "key_ttl_seconds": int(payload["key_ttl_seconds"]),
-  })
+  }
+  if payload.get("credential_sha256"):
+    body["credential_sha256"] = payload["credential_sha256"]
+  return request_fingerprint(body)
+
+
+async def _find_delivery(account_id: str, subject: str, idempotency_key: str, session=None):
+  # 直接按三个字段查询。Beanie 的多表达式 find_one 会丢掉后面的幂等键条件。
+  document = await KeyDelivery.get_motor_collection().find_one(
+    {"account_id": account_id, "subject_hash": subject, "idempotency_key": idempotency_key},
+    session=session,
+  )
+  if document is None:
+    return None
+  return await KeyDelivery.find_one(KeyDelivery.delivery_id == document["delivery_id"])
+
+
+def _custom_tenant_credential(value: str | None) -> str:
+  supplied = (value or "").strip()
+  if not supplied:
+    return ""
+  if len(supplied) < 20 or len(supplied) > 128 or any(character.isspace() for character in supplied):
+    raise ConflictError("租户凭证需为 20 到 128 位且不能包含空白", "CREDENTIAL_FORMAT")
+  return supplied
 
 
 async def _replay(delivery: KeyDelivery, fingerprint: str) -> dict:
@@ -97,12 +120,20 @@ async def create_tenant(
   quota_bytes: int,
   quota_objects: int,
   key_ttl_seconds: int | None = None,
+  tenant_credential: str | None = None,
+  account=None,
+  actor_subject: str = "",
 ) -> dict:
   if quota_bytes < 0 or quota_objects < 0:
     raise ConflictError("配额不能为负")
-  account = await authenticate_management(app_name, credential)
+  if account is None:
+    account = await authenticate_management(app_name, credential)
+    subject = subject_hash(credential)
+  else:
+    subject = actor_subject or subject_hash(f"console:{account.account_id}")
   settings = get_settings()
   ttl = key_ttl_seconds or settings.key_ttl_seconds
+  supplied = _custom_tenant_credential(tenant_credential)
   payload = {
     "external_tenant_id": external_tenant_id,
     "logical_name": logical_name,
@@ -110,28 +141,20 @@ async def create_tenant(
     "quota_objects": quota_objects,
     "key_ttl_seconds": ttl,
   }
+  if supplied:
+    payload["credential_sha256"] = hash_tenant_key(supplied)
   fingerprint = _fingerprint(payload)
-  subject = subject_hash(credential)
-  existing = await KeyDelivery.find_one(
-    KeyDelivery.account_id == account.account_id,
-    KeyDelivery.subject_hash == subject,
-    KeyDelivery.idempotency_key == idempotency_key,
-  )
+  existing = await _find_delivery(account.account_id, subject, idempotency_key)
   if existing:
     return await _replay(existing, fingerprint)
 
-  raw_key = tenant_key_secret()
+  raw_key = supplied or tenant_key_secret()
   tenant_id = new_id("tn")
   key_id = new_id("key")
   now = stamp()
   try:
     async with transaction() as session:
-      again = await KeyDelivery.find_one(
-        KeyDelivery.account_id == account.account_id,
-        KeyDelivery.subject_hash == subject,
-        KeyDelivery.idempotency_key == idempotency_key,
-        session=session,
-      )
+      again = await _find_delivery(account.account_id, subject, idempotency_key, session)
       if again:
         raw_key = ""
       else:
@@ -198,11 +221,7 @@ async def create_tenant(
           session=session,
         )
   except DuplicateKeyError as exc:
-    existing = await KeyDelivery.find_one(
-      KeyDelivery.account_id == account.account_id,
-      KeyDelivery.subject_hash == subject,
-      KeyDelivery.idempotency_key == idempotency_key,
-    )
+    existing = await _find_delivery(account.account_id, subject, idempotency_key)
     if existing:
       return await _replay(existing, fingerprint)
     raise ConflictError("租户逻辑名或外部标识冲突") from exc
@@ -210,18 +229,15 @@ async def create_tenant(
     raise
 
   if raw_key == "":
-    existing = await KeyDelivery.find_one(
-      KeyDelivery.account_id == account.account_id,
-      KeyDelivery.subject_hash == subject,
-      KeyDelivery.idempotency_key == idempotency_key,
-    )
+    existing = await _find_delivery(account.account_id, subject, idempotency_key)
     return await _replay(existing, fingerprint)
   delivery = await KeyDelivery.find_one(KeyDelivery.key_id == key_id)
   return await _replay(delivery, fingerprint)
 
 
-async def list_tenants(app_name: str, credential: str) -> list[dict]:
-  account = await authenticate_management(app_name, credential)
+async def list_tenants(app_name: str, credential: str, account=None) -> list[dict]:
+  if account is None:
+    account = await authenticate_management(app_name, credential)
   tenants = await Tenant.find(Tenant.account_id == account.account_id).to_list()
   return [tenant_view(tenant) for tenant in tenants]
 
@@ -264,8 +280,14 @@ async def issue_tenant_key(
   tenant_id: str,
   idempotency_key: str,
   key_ttl_seconds: int | None = None,
+  account=None,
+  actor_subject: str = "",
 ) -> dict:
-  account = await authenticate_management(app_name, credential)
+  if account is None:
+    account = await authenticate_management(app_name, credential)
+    subject = subject_hash(credential)
+  else:
+    subject = actor_subject or subject_hash(f"console:{account.account_id}")
   tenant = await Tenant.find_one(Tenant.tenant_id == tenant_id, Tenant.account_id == account.account_id)
   if tenant is None:
     raise TenantNotFoundError(tenant_id)
@@ -274,12 +296,7 @@ async def issue_tenant_key(
   settings = get_settings()
   ttl = key_ttl_seconds or settings.key_ttl_seconds
   fingerprint = request_fingerprint({"tenant_id": tenant_id, "key_ttl_seconds": ttl, "op": "issue"})
-  subject = subject_hash(credential)
-  existing = await KeyDelivery.find_one(
-    KeyDelivery.account_id == account.account_id,
-    KeyDelivery.subject_hash == subject,
-    KeyDelivery.idempotency_key == idempotency_key,
-  )
+  existing = await _find_delivery(account.account_id, subject, idempotency_key)
   if existing:
     return await _replay(existing, fingerprint)
   raw_key = tenant_key_secret()
@@ -318,8 +335,9 @@ async def issue_tenant_key(
   return await _replay(delivery, fingerprint)
 
 
-async def list_tenant_keys(*, app_name: str, credential: str, tenant_id: str) -> list[dict]:
-  account = await authenticate_management(app_name, credential)
+async def list_tenant_keys(*, app_name: str, credential: str, tenant_id: str, account=None) -> list[dict]:
+  if account is None:
+    account = await authenticate_management(app_name, credential)
   tenant = await Tenant.find_one(Tenant.tenant_id == tenant_id, Tenant.account_id == account.account_id)
   if tenant is None:
     raise TenantNotFoundError(tenant_id)
@@ -336,8 +354,9 @@ async def list_tenant_keys(*, app_name: str, credential: str, tenant_id: str) ->
   ]
 
 
-async def revoke_tenant_key(*, app_name: str, credential: str, tenant_id: str, key_id: str) -> dict:
-  account = await authenticate_management(app_name, credential)
+async def revoke_tenant_key(*, app_name: str, credential: str, tenant_id: str, key_id: str, account=None) -> dict:
+  if account is None:
+    account = await authenticate_management(app_name, credential)
   matched = await TenantAPIKey.find_one(TenantAPIKey.key_id == key_id, TenantAPIKey.account_id == account.account_id)
   if matched is None or matched.tenant_id != tenant_id:
     raise TenantNotFoundError(key_id)
@@ -360,8 +379,10 @@ async def adjust_quota(
   if_match: str,
   quota_bytes: int,
   quota_objects: int,
+  account=None,
 ) -> dict:
-  account = await authenticate_management(app_name, credential)
+  if account is None:
+    account = await authenticate_management(app_name, credential)
   tenant = await Tenant.find_one(Tenant.tenant_id == tenant_id, Tenant.account_id == account.account_id)
   if tenant is None:
     raise TenantNotFoundError(tenant_id)

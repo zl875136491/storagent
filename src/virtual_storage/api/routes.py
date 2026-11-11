@@ -170,6 +170,7 @@ async def post_tenant(
     quota_bytes=int(body["quota_bytes"]),
     quota_objects=int(body["quota_objects"]),
     key_ttl_seconds=body.get("key_ttl_seconds"),
+    tenant_credential=body.get("tenant_credential") or None,
   )
   from src.virtual_storage.workers.queue import enqueue_scan
   enqueue_scan()
@@ -448,6 +449,136 @@ async def internal_drive(request: Request):
     )
     return {"ok": True}
   raise HTTPException(status_code=400, detail={"error_code": "BAD_OP", "message": "unknown op"})
+
+
+def _console_actor(
+  token: str | None,
+  user_id: str | None,
+  is_admin_header: str | None,
+) -> tuple[str, bool]:
+  from src.virtual_storage.services.console_access import assert_console_token
+  assert_console_token(token)
+  if not user_id:
+    raise InvalidCredentialError("缺少控制台用户")
+  return user_id, is_admin_header == "1"
+
+
+@router.get("/internal/console/session")
+async def console_session(
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+):
+  from src.virtual_storage.services.console_access import session_overview
+  user_id, is_admin = _console_actor(x_console_token, x_console_user_id, x_console_admin)
+  return await session_overview(user_id, is_admin)
+
+
+@router.get("/internal/console/application-links")
+async def console_application_links(
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+):
+  from src.virtual_storage.services.console_access import application_links, assert_console_token
+  assert_console_token(x_console_token)
+  return await application_links()
+
+
+@router.post("/internal/console/grants")
+async def console_grant(request: Request, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import assert_console_token, grant_account
+  assert_console_token(x_console_token)
+  body = await request.json()
+  return await grant_account(
+    actor_is_admin=x_console_admin == "1",
+    user_id=str(body["user_id"]),
+    username=str(body["username"]),
+    account_id=str(body["account_id"]),
+  )
+
+
+@router.delete("/internal/console/grants")
+async def console_grant_delete(request: Request, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import assert_console_token, revoke_grant
+  assert_console_token(x_console_token)
+  body = await request.json()
+  return await revoke_grant(
+    actor_is_admin=x_console_admin == "1",
+    user_id=str(body["user_id"]),
+    account_id=str(body["account_id"]),
+  )
+
+
+@router.put("/internal/console/accounts/{account_id}/application")
+async def console_link_application(account_id: str, request: Request, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import assert_console_token, link_application
+  assert_console_token(x_console_token)
+  body = await request.json()
+  return await link_application(
+    actor_is_admin=x_console_admin == "1",
+    account_id=account_id,
+    application_id=str(body.get("application_id") or ""),
+  )
+
+
+@router.get("/internal/console/accounts/{account_id}/tenants")
+async def console_list_tenants(account_id: str, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import console_tenants
+  user_id, is_admin = _console_actor(x_console_token, x_console_user_id, x_console_admin)
+  return await console_tenants(user_id, is_admin, account_id)
+
+
+@router.post("/internal/console/accounts/{account_id}/tenants")
+async def console_post_tenant(account_id: str, request: Request, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import console_create_tenant
+  user_id, is_admin = _console_actor(x_console_token, x_console_user_id, x_console_admin)
+  return await console_create_tenant(user_id, is_admin, account_id, await request.json())
+
+
+@router.patch("/internal/console/accounts/{account_id}/tenants/{tenant_id}")
+async def console_patch_quota(account_id: str, tenant_id: str, request: Request, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import console_quota
+  user_id, is_admin = _console_actor(x_console_token, x_console_user_id, x_console_admin)
+  return await console_quota(user_id, is_admin, account_id, tenant_id, await request.json())
+
+
+@router.post("/internal/console/accounts/{account_id}/tenants/{tenant_id}/freeze")
+@router.post("/internal/console/accounts/{account_id}/tenants/{tenant_id}/unfreeze")
+@router.post("/internal/console/accounts/{account_id}/tenants/{tenant_id}/retire")
+@router.post("/internal/console/accounts/{account_id}/tenants/{tenant_id}/cancel-retire")
+async def console_post_action(account_id: str, tenant_id: str, request: Request, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import console_action
+  user_id, is_admin = _console_actor(x_console_token, x_console_user_id, x_console_admin)
+  action = request.url.path.rstrip("/").rsplit("/", 1)[-1]
+  return await console_action(user_id, is_admin, account_id, tenant_id, action)
+
+
+@router.get("/internal/console/accounts/{account_id}/tenants/{tenant_id}/api-keys")
+async def console_get_keys(account_id: str, tenant_id: str, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import console_keys
+  user_id, is_admin = _console_actor(x_console_token, x_console_user_id, x_console_admin)
+  return await console_keys(user_id, is_admin, account_id, tenant_id)
+
+
+@router.post("/internal/console/accounts/{account_id}/tenants/{tenant_id}/api-keys")
+async def console_post_key(account_id: str, tenant_id: str, request: Request, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import console_issue_key
+  user_id, is_admin = _console_actor(x_console_token, x_console_user_id, x_console_admin)
+  body = await request.json()
+  return await console_issue_key(user_id, is_admin, account_id, tenant_id, str(body.get("idempotency_key") or ""))
+
+
+@router.delete("/internal/console/accounts/{account_id}/tenants/{tenant_id}/api-keys/{key_id}")
+async def console_delete_key(account_id: str, tenant_id: str, key_id: str, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import console_revoke_key
+  user_id, is_admin = _console_actor(x_console_token, x_console_user_id, x_console_admin)
+  return await console_revoke_key(user_id, is_admin, account_id, tenant_id, key_id)
+
+
+@router.get("/internal/console/accounts/{account_id}/operations/{operation_id}")
+async def console_get_operation(account_id: str, operation_id: str, x_console_token: str | None = Header(default=None, alias="X-Console-Token"), x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"), x_console_admin: str | None = Header(default=None, alias="X-Console-Admin")):
+  from src.virtual_storage.services.console_access import console_operation
+  user_id, is_admin = _console_actor(x_console_token, x_console_user_id, x_console_admin)
+  return await console_operation(user_id, is_admin, account_id, operation_id)
 
 
 def install_error_handler(app):

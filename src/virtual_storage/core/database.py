@@ -39,6 +39,7 @@ async def init_virtual_storage_db() -> None:
     TenantAPIKey,
     UploadSession,
     VirtualAccount,
+    VirtualAccountGrant,
     VirtualObject,
   )
   from beanie import init_beanie
@@ -49,6 +50,7 @@ async def init_virtual_storage_db() -> None:
     document_models=[
       BucketPool,
       VirtualAccount,
+      VirtualAccountGrant,
       Tenant,
       TenantAPIKey,
       KeyDelivery,

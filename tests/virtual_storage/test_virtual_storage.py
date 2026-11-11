@@ -1,6 +1,8 @@
+import os
 import uuid
 
 from src.virtual_storage.core.exception import UnknownMinioResult
+from src.virtual_storage.settings import reset_settings_cache
 from src.virtual_storage.core.minio_gateway import MinioGateway
 
 
@@ -418,3 +420,43 @@ def test_console_login(client):
   login = client.post("/console/session", json={"app_name": app_name, "credential": credential})
   assert login.status_code == 200
   assert credential not in login.text
+
+
+def test_console_bridge_scopes_accounts(client):
+  os.environ["VS_CONSOLE_TOKEN"] = "console-test-token"
+  reset_settings_cache()
+  try:
+    denied = client.get("/internal/console/session", headers={"X-Console-User-Id": "user-a", "X-Console-Admin": "1"})
+    assert denied.status_code == 401
+    user_id = "user-" + uuid.uuid4().hex[:8]
+    first_name, _, first = _account(client)
+    second_name, _, second = _account(client)
+    headers = {"X-Console-Token": "console-test-token", "X-Console-User-Id": user_id, "X-Console-Admin": "0"}
+    granted = client.post("/internal/console/grants", headers={**headers, "X-Console-Admin": "1"}, json={
+      "user_id": user_id, "username": user_id, "account_id": first["account_id"],
+    })
+    assert granted.status_code == 200, granted.text
+    session = client.get("/internal/console/session", headers=headers)
+    assert session.status_code == 200, session.text
+    assert session.json()["role"] == "virtual"
+    assert [item["account_id"] for item in session.json()["accounts"]] == [first["account_id"]]
+    blocked = client.get(f"/internal/console/accounts/{second['account_id']}/tenants", headers=headers)
+    assert blocked.status_code == 403
+    created = client.post(f"/internal/console/accounts/{first['account_id']}/tenants", headers=headers, json={
+      "logical_name": _name("ui"),
+      "quota_bytes": 1000,
+      "quota_objects": 2,
+      "idempotency_key": _name("idem"),
+      "tenant_credential": "custom-tenant-credential-01",
+    })
+    assert created.status_code == 200, created.text
+    assert created.json()["api_key"] == "custom-tenant-credential-01"
+    listed = client.get(f"/internal/console/accounts/{first['account_id']}/tenants", headers=headers)
+    assert created.json()["api_key"] not in listed.text
+    plain = client.get("/internal/console/session", headers={**headers, "X-Console-User-Id": "user-none"})
+    assert plain.json()["role"] == "none"
+    assert plain.json()["accounts"] == []
+    assert first_name and second_name
+  finally:
+    os.environ.pop("VS_CONSOLE_TOKEN", None)
+    reset_settings_cache()
