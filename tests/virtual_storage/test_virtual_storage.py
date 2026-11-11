@@ -1,3 +1,4 @@
+import base64
 import os
 import uuid
 
@@ -21,11 +22,26 @@ def _account(client, quota_bytes=10_000, quota_objects=20):
     "quota_objects": quota_objects,
   })
   assert response.status_code == 200, response.text
+  _ACCESS[credential] = _exchange(client, app_name, credential)
   return app_name, credential, response.json()
 
 
+_ACCESS: dict[str, str] = {}
+
+
 def _auth(credential: str) -> dict:
-  return {"Authorization": f"Bearer {credential}"}
+  return {"Authorization": f"Bearer {_ACCESS.get(credential, credential)}"}
+
+
+def _exchange(client, app_name: str, credential: str) -> str:
+  basic = base64.b64encode(f"{app_name}:{credential}".encode()).decode()
+  response = client.post(
+    "/oauth2/token",
+    headers={"Authorization": f"Basic {basic}"},
+    data={"grant_type": "client_credentials"},
+  )
+  assert response.status_code == 200, response.text
+  return response.json()["access_token"]
 
 
 def _tenant(client, app_name, credential, quota_bytes, quota_objects, external=None, logical=None):

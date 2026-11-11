@@ -46,6 +46,10 @@ class VSSettings:
   celery_broker_url: str
   port: int
   console_token: str
+  oauth_secret: str
+  oauth_issuer: str
+  access_token_seconds: int
+  refresh_token_seconds: int
 
 
 _cached: VSSettings | None = None
@@ -86,6 +90,10 @@ def get_settings() -> VSSettings:
       celery_broker_url=os.getenv("VS_CELERY_BROKER_URL", "").strip(),
       port=_int("VS_PORT", 8443),
       console_token=os.getenv("VS_CONSOLE_TOKEN", "").strip(),
+      oauth_secret=os.getenv("VS_OAUTH_SECRET", "").strip(),
+      oauth_issuer=os.getenv("VS_OAUTH_ISSUER", "").strip(),
+      access_token_seconds=_int("VS_ACCESS_TOKEN_SECONDS", 3600),
+      refresh_token_seconds=_int("VS_REFRESH_TOKEN_SECONDS", 7 * 24 * 3600),
     )
   return _cached
 

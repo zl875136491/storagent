@@ -17,6 +17,11 @@ class AccountNotFoundError(VirtualStorageError):
     super().__init__(f"虚拟账号 {app_name} 不存在", "ACCOUNT_NOT_FOUND", 404)
 
 
+class AccountScopeError(VirtualStorageError):
+  def __init__(self):
+    super().__init__("token 不能访问该账号", "ACCOUNT_SCOPE_MISMATCH", 403)
+
+
 class AccountDisabledError(VirtualStorageError):
   def __init__(self, app_name: str):
     super().__init__(f"虚拟账号 {app_name} 已停用", "ACCOUNT_DISABLED", 403)

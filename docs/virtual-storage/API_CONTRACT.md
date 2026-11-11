@@ -2,13 +2,45 @@
 
 测试入口：`https://<host>:8443`。进程只监听 TLS。
 
+本文描述仓库中的目标行为。测试环境在确认上线前仍使用固定管理凭据，以《APPS-测试环境接入指南》为准。
+
 除 `/healthz` 外，明文 HTTP 返回 `HTTPS_REQUIRED`。旧 `/api/v1` 与 `/api/v2` 不在这个进程里。
+
+机器管理接口只接受下面 `/oauth2/token` 或 `/oauth2/refresh` 签发的 access token。`client_secret` 不能放进表单，也不能再当作管理接口的 Bearer。
+
+## 机器认证
+
+实现在虚拟存储进程，不在人的 `/api/v1/auth`。
+
+`POST /oauth2/token`
+
+```http
+Authorization: Basic base64(urlencode(client_id):urlencode(client_secret))
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials
+```
+
+成功时返回 `access_token`、`refresh_token`、`token_type`、`expires_in`（3600）、`scope`。不接受表单里的 `client_id` 或 `client_secret`。
+
+`POST /oauth2/refresh`
+
+```http
+Authorization: Basic base64(urlencode(client_id):urlencode(client_secret))
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=refresh_token&refresh_token=<refresh_token>
+```
+
+每次刷新都换发新的 refresh token，旧的立即失效。refresh token 有效期 7 天。密钥在 Stor 管理页面重新生成后，已发出的 access token 和 refresh token 立即失效。重新生成接口不提供给 APPS 调用。
+
+非归属区域把这两个路径转发到归属区域，自己不签发。
 
 ## 管理面
 
-`Authorization: Bearer <管理凭据>`
+`Authorization: Bearer <access_token>`。路径中的账号必须等于 token 的 `sub`。
 
-- `GET /api/virtual-storage/v1/accounts/{app_name}`
+- `GET /api/virtual-storage/v1/accounts/{account_id}`
 - `POST /api/virtual-storage/v1/accounts/{app_name}/tenants`
   - 头 `Idempotency-Key`
   - 体：`external_tenant_id`、`logical_name`、`quota_bytes`、`quota_objects`、可选 `key_ttl_seconds`

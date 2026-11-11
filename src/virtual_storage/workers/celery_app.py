@@ -77,6 +77,8 @@ async def _scan() -> None:
       if account is None or account.home_region != _settings.region:
         continue
       await purge_object(obj.object_id, gateway)
+    from src.virtual_storage.services.applications import advance_pending
+    await advance_pending()
   finally:
     await close_virtual_storage_db()
 

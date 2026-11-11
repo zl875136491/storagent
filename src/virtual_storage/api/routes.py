@@ -114,6 +114,51 @@ async def healthz():
   return {"status": "ok"}
 
 
+def _oauth_error(exc) -> JSONResponse:
+  return JSONResponse(
+    status_code=exc.status,
+    content={"error": exc.error, "error_description": exc.description},
+  )
+
+
+@router.post("/oauth2/token")
+async def oauth_token(request: Request):
+  from src.virtual_storage.services.machine_auth import (
+    OAuthError,
+    issue_client_credentials,
+    parse_basic,
+    reject_secret_in_form,
+  )
+  try:
+    form = {key: value for key, value in (await request.form()).items()}
+    reject_secret_in_form(form)
+    if form.get("grant_type") != "client_credentials":
+      raise OAuthError("unsupported_grant_type", "只接受 client_credentials")
+    client_id, secret = parse_basic(request.headers.get("authorization"))
+    return await issue_client_credentials(client_id, secret, str(form.get("scope") or ""))
+  except OAuthError as exc:
+    return _oauth_error(exc)
+
+
+@router.post("/oauth2/refresh")
+async def oauth_refresh(request: Request):
+  from src.virtual_storage.services.machine_auth import (
+    OAuthError,
+    parse_basic,
+    refresh_access_token,
+    reject_secret_in_form,
+  )
+  try:
+    form = {key: value for key, value in (await request.form()).items()}
+    reject_secret_in_form(form)
+    if form.get("grant_type") != "refresh_token":
+      raise OAuthError("unsupported_grant_type", "只接受 refresh_token")
+    client_id, secret = parse_basic(request.headers.get("authorization"))
+    return await refresh_access_token(client_id, secret, str(form.get("refresh_token") or ""))
+  except OAuthError as exc:
+    return _oauth_error(exc)
+
+
 @router.get("/console", response_class=HTMLResponse)
 async def console_page():
   with open(CONSOLE_PATH, "r", encoding="utf-8") as handle:
@@ -123,7 +168,8 @@ async def console_page():
 @router.post("/console/session")
 async def console_login(request: Request):
   body = await request.json()
-  account = await authenticate_management(body["app_name"], body["credential"])
+  from src.virtual_storage.services.accounts import verify_client_secret
+  account = await verify_client_secret(body["app_name"], body["credential"])
   subject = subject_hash(body["credential"])
   request.app.state.session_subjects[account.account_id] = subject
   token = issue_session(account.app_name, subject)
@@ -403,6 +449,9 @@ async def internal_drive(request: Request):
   if op == "reconcile":
     from src.virtual_storage.services.reconcile import reconcile_tenant
     return await reconcile_tenant(body["tenant_id"])
+  if op == "advance-inits":
+    from src.virtual_storage.services.applications import advance_pending
+    return {"advanced": await advance_pending()}
   if op == "account":
     from src.virtual_storage.services.accounts import account_view, create_account
     account = await create_account(
@@ -579,6 +628,214 @@ async def console_get_operation(account_id: str, operation_id: str, x_console_to
   from src.virtual_storage.services.console_access import console_operation
   user_id, is_admin = _console_actor(x_console_token, x_console_user_id, x_console_admin)
   return await console_operation(user_id, is_admin, account_id, operation_id)
+
+
+def _console_identity(
+  token: str | None,
+  user_id: str | None,
+  username: str | None,
+  is_admin_header: str | None,
+  reviewer_header: str | None,
+) -> tuple[str, str, bool, bool]:
+  user_id, is_admin = _console_actor(token, user_id, is_admin_header)
+  return user_id, (username or "").strip(), is_admin, reviewer_header == "1" or is_admin
+
+
+@router.post("/internal/console/applications")
+async def console_create_application(
+  request: Request,
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_username: str | None = Header(default=None, alias="X-Console-Username"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+  idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+  from src.virtual_storage.services.applications import create_application
+  user_id, username, _admin, _reviewer = _console_identity(
+    x_console_token, x_console_user_id, x_console_username, x_console_admin, None,
+  )
+  body = await request.json()
+  created = await create_application(
+    user_id=user_id,
+    username=username,
+    public_account_id=str(body.get("public_account_id") or ""),
+    purpose=str(body.get("purpose") or ""),
+    quota_bytes=int(body.get("requested_quota_bytes") or 0),
+    quota_objects=int(body.get("requested_quota_objects") or 0),
+    idempotency_key=(idempotency_key or "").strip(),
+  )
+  return JSONResponse(status_code=201, content=created)
+
+
+@router.get("/internal/console/applications")
+async def console_list_applications(
+  mine: int = 0,
+  page: int = 1,
+  page_size: int = 20,
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_username: str | None = Header(default=None, alias="X-Console-Username"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+  x_console_reviewer: str | None = Header(default=None, alias="X-Console-Reviewer"),
+):
+  from src.virtual_storage.services.applications import list_applications
+  user_id, username, is_admin, reviewer = _console_identity(
+    x_console_token, x_console_user_id, x_console_username, x_console_admin, x_console_reviewer,
+  )
+  return await list_applications(
+    user_id=user_id,
+    username=username,
+    reviewer=reviewer or is_admin,
+    mine=bool(mine) or not (reviewer or is_admin),
+    page=page,
+    page_size=page_size,
+  )
+
+
+@router.get("/internal/console/applications/{application_id}")
+async def console_get_application(
+  application_id: str,
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_username: str | None = Header(default=None, alias="X-Console-Username"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+  x_console_reviewer: str | None = Header(default=None, alias="X-Console-Reviewer"),
+):
+  from src.virtual_storage.services.applications import get_application
+  user_id, username, is_admin, reviewer = _console_identity(
+    x_console_token, x_console_user_id, x_console_username, x_console_admin, x_console_reviewer,
+  )
+  return await get_application(application_id, user_id, username, reviewer or is_admin)
+
+
+@router.post("/internal/console/applications/{application_id}/withdraw")
+async def console_withdraw(
+  application_id: str,
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_username: str | None = Header(default=None, alias="X-Console-Username"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+  if_match: str | None = Header(default=None, alias="If-Match"),
+):
+  from src.virtual_storage.services.applications import withdraw_application
+  user_id, username, _admin, _reviewer = _console_identity(
+    x_console_token, x_console_user_id, x_console_username, x_console_admin, None,
+  )
+  return await withdraw_application(application_id, user_id, username, if_match or "")
+
+
+@router.post("/internal/console/applications/{application_id}/approve")
+async def console_approve(
+  application_id: str,
+  request: Request,
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_username: str | None = Header(default=None, alias="X-Console-Username"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+  x_console_reviewer: str | None = Header(default=None, alias="X-Console-Reviewer"),
+  if_match: str | None = Header(default=None, alias="If-Match"),
+):
+  from src.virtual_storage.services.applications import _subject, approve_application
+  user_id, username, is_admin, reviewer = _console_identity(
+    x_console_token, x_console_user_id, x_console_username, x_console_admin, x_console_reviewer,
+  )
+  if not (reviewer or is_admin):
+    from src.virtual_storage.core.exception import ConsoleForbiddenError
+    raise ConsoleForbiddenError("没有虚拟账号审核权限")
+  body = await request.json()
+  approved = await approve_application(
+    application_id=application_id,
+    if_match=if_match or "",
+    quota_bytes=int(body.get("quota_bytes") or 0),
+    quota_objects=int(body.get("quota_objects") or 0),
+    actor_id=_subject(user_id, username),
+  )
+  return approved
+
+
+@router.post("/internal/console/applications/{application_id}/reject")
+async def console_reject(
+  application_id: str,
+  request: Request,
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_username: str | None = Header(default=None, alias="X-Console-Username"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+  x_console_reviewer: str | None = Header(default=None, alias="X-Console-Reviewer"),
+  if_match: str | None = Header(default=None, alias="If-Match"),
+):
+  from src.virtual_storage.services.applications import reject_application
+  _user_id, _username, is_admin, reviewer = _console_identity(
+    x_console_token, x_console_user_id, x_console_username, x_console_admin, x_console_reviewer,
+  )
+  if not (reviewer or is_admin):
+    from src.virtual_storage.core.exception import ConsoleForbiddenError
+    raise ConsoleForbiddenError("没有虚拟账号审核权限")
+  body = await request.json()
+  return await reject_application(application_id, if_match or "", str(body.get("reason") or ""))
+
+
+@router.post("/internal/console/applications/{application_id}/advance")
+async def console_advance(
+  application_id: str,
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_username: str | None = Header(default=None, alias="X-Console-Username"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+  x_console_reviewer: str | None = Header(default=None, alias="X-Console-Reviewer"),
+):
+  from src.virtual_storage.services.applications import advance_application, get_application
+  user_id, username, is_admin, reviewer = _console_identity(
+    x_console_token, x_console_user_id, x_console_username, x_console_admin, x_console_reviewer,
+  )
+  await get_application(application_id, user_id, username, reviewer or is_admin)
+  return await advance_application(application_id)
+
+
+@router.post("/internal/console/applications/{application_id}/retry-init")
+async def console_retry_init(
+  application_id: str,
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_username: str | None = Header(default=None, alias="X-Console-Username"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+):
+  from src.virtual_storage.services.applications import retry_init
+  user_id, username, is_admin, _reviewer = _console_identity(
+    x_console_token, x_console_user_id, x_console_username, x_console_admin, None,
+  )
+  return await retry_init(application_id, user_id, username, is_admin)
+
+
+@router.post("/internal/console/accounts/{public_id}/secret-delivery")
+async def console_secret_delivery(
+  public_id: str,
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_username: str | None = Header(default=None, alias="X-Console-Username"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+):
+  from src.virtual_storage.services.applications import deliver_secret
+  user_id, username, is_admin, _reviewer = _console_identity(
+    x_console_token, x_console_user_id, x_console_username, x_console_admin, None,
+  )
+  return await deliver_secret(public_id, user_id, username, is_admin)
+
+
+@router.post("/internal/console/accounts/{public_id}/rotate-secret")
+async def console_rotate_secret(
+  public_id: str,
+  x_console_token: str | None = Header(default=None, alias="X-Console-Token"),
+  x_console_user_id: str | None = Header(default=None, alias="X-Console-User-Id"),
+  x_console_username: str | None = Header(default=None, alias="X-Console-Username"),
+  x_console_admin: str | None = Header(default=None, alias="X-Console-Admin"),
+  if_match: str | None = Header(default=None, alias="If-Match"),
+):
+  from src.virtual_storage.services.applications import rotate_secret
+  user_id, username, is_admin, _reviewer = _console_identity(
+    x_console_token, x_console_user_id, x_console_username, x_console_admin, None,
+  )
+  return await rotate_secret(public_id, user_id, username, is_admin, if_match or "")
 
 
 def install_error_handler(app):

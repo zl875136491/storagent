@@ -79,6 +79,8 @@ def _should_forward(path: str) -> bool:
     return False
   if path == "/console":
     return False
+  if path in {"/oauth2/token", "/oauth2/refresh"}:
+    return True
   return path.startswith("/api/virtual-storage/") or path.startswith("/console/")
 
 

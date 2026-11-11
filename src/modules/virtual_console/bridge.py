@@ -26,15 +26,27 @@ def _config() -> tuple[str, str]:
   return base, token
 
 
-def _call(method: str, path: str, *, admin: bool, user: User | None, body: dict | None = None) -> Response:
+def _call(
+  method: str,
+  path: str,
+  *,
+  admin: bool,
+  user: User | None,
+  body: dict | None = None,
+  reviewer: bool = False,
+  extra_headers: dict | None = None,
+) -> Response:
   base, token = _config()
   if not token:
     return JSONResponse(status_code=503, content={"error_code": "CONSOLE_BRIDGE_DISABLED", "message": "控制台桥接未配置"})
   headers = {
     "X-Console-Token": token,
     "X-Console-Admin": "1" if admin else "0",
+    "X-Console-Reviewer": "1" if reviewer or admin else "0",
     "Content-Type": "application/json",
   }
+  if extra_headers:
+    headers.update(extra_headers)
   if user is not None:
     headers["X-Console-User-Id"] = str(user.id)
     headers["X-Console-Username"] = user.username
@@ -51,6 +63,18 @@ def _call(method: str, path: str, *, admin: bool, user: User | None, body: dict 
   except urllib.error.URLError:
     return JSONResponse(status_code=503, content={"error_code": "CONSOLE_BRIDGE_UNAVAILABLE", "message": "虚拟存储服务不可用"})
   return Response(content=payload, status_code=status, media_type="application/json")
+
+
+async def user_can_review(user: User) -> bool:
+  if await user_is_admin(user):
+    return True
+  from src.core.auth import check_permissions
+  from src.core.exception import CustomException
+  try:
+    await check_permissions(user, ["virtual_account_review"])
+  except CustomException:
+    return False
+  return True
 
 
 async def user_is_admin(user: User) -> bool:
@@ -161,6 +185,144 @@ async def delete_grant(body: dict, user: User = Depends(get_current_user)):
     "user_id": str(target.id),
     "account_id": str(body.get("account_id") or ""),
   })
+
+
+def _match_headers(if_match: str | None, idempotency_key: str | None) -> dict:
+  headers = {}
+  if if_match:
+    headers["If-Match"] = if_match
+  if idempotency_key:
+    headers["Idempotency-Key"] = idempotency_key
+  return headers
+
+
+@router.post("/virtual-account-applications")
+async def create_virtual_account_application(body: dict, user: User = Depends(get_current_user)):
+  return _call(
+    "POST",
+    "/internal/console/applications",
+    admin=await user_is_admin(user),
+    reviewer=await user_can_review(user),
+    user=user,
+    body=body,
+    extra_headers=_match_headers(None, str(body.get("idempotency_key") or "")),
+  )
+
+
+@router.get("/virtual-account-applications")
+async def list_virtual_account_applications(
+  mine: int = 1,
+  page: int = 1,
+  page_size: int = 20,
+  user: User = Depends(get_current_user),
+):
+  reviewer = await user_can_review(user)
+  return _call(
+    "GET",
+    f"/internal/console/applications?mine={1 if mine else 0}&page={page}&page_size={page_size}",
+    admin=await user_is_admin(user),
+    reviewer=reviewer,
+    user=user,
+  )
+
+
+@router.get("/virtual-account-applications/{application_id}")
+async def read_virtual_account_application(application_id: str, user: User = Depends(get_current_user)):
+  return _call(
+    "GET",
+    f"/internal/console/applications/{quote(application_id)}",
+    admin=await user_is_admin(user),
+    reviewer=await user_can_review(user),
+    user=user,
+  )
+
+
+@router.post("/virtual-account-applications/{application_id}/withdraw")
+async def withdraw_virtual_account_application(application_id: str, body: dict, user: User = Depends(get_current_user)):
+  return _call(
+    "POST",
+    f"/internal/console/applications/{quote(application_id)}/withdraw",
+    admin=await user_is_admin(user),
+    user=user,
+    body=body or {},
+    extra_headers=_match_headers(str(body.get("revision") or ""), None),
+  )
+
+
+@router.post("/virtual-account-applications/{application_id}/approve")
+async def approve_virtual_account_application(application_id: str, body: dict, user: User = Depends(get_current_user)):
+  if not await user_can_review(user):
+    return JSONResponse(status_code=403, content={"error_code": "CONSOLE_FORBIDDEN", "message": "没有虚拟账号审核权限"})
+  return _call(
+    "POST",
+    f"/internal/console/applications/{quote(application_id)}/approve",
+    admin=await user_is_admin(user),
+    reviewer=True,
+    user=user,
+    body=body,
+    extra_headers=_match_headers(str(body.get("revision") or ""), None),
+  )
+
+
+@router.post("/virtual-account-applications/{application_id}/reject")
+async def reject_virtual_account_application(application_id: str, body: dict, user: User = Depends(get_current_user)):
+  if not await user_can_review(user):
+    return JSONResponse(status_code=403, content={"error_code": "CONSOLE_FORBIDDEN", "message": "没有虚拟账号审核权限"})
+  return _call(
+    "POST",
+    f"/internal/console/applications/{quote(application_id)}/reject",
+    admin=await user_is_admin(user),
+    reviewer=True,
+    user=user,
+    body=body,
+    extra_headers=_match_headers(str(body.get("revision") or ""), None),
+  )
+
+
+@router.post("/virtual-account-applications/{application_id}/advance")
+async def advance_virtual_account_application(application_id: str, user: User = Depends(get_current_user)):
+  return _call(
+    "POST",
+    f"/internal/console/applications/{quote(application_id)}/advance",
+    admin=await user_is_admin(user),
+    reviewer=await user_can_review(user),
+    user=user,
+    body={},
+  )
+
+
+@router.post("/virtual-account-applications/{application_id}/retry-init")
+async def retry_virtual_account_application(application_id: str, user: User = Depends(get_current_user)):
+  return _call(
+    "POST",
+    f"/internal/console/applications/{quote(application_id)}/retry-init",
+    admin=await user_is_admin(user),
+    user=user,
+    body={},
+  )
+
+
+@router.post("/virtual-accounts/{public_id}/secret-delivery")
+async def deliver_virtual_account_secret(public_id: str, user: User = Depends(get_current_user)):
+  return _call(
+    "POST",
+    f"/internal/console/accounts/{quote(public_id)}/secret-delivery",
+    admin=await user_is_admin(user),
+    user=user,
+    body={},
+  )
+
+
+@router.post("/virtual-accounts/{public_id}/rotate-secret")
+async def rotate_virtual_account_secret(public_id: str, body: dict, user: User = Depends(get_current_user)):
+  return _call(
+    "POST",
+    f"/internal/console/accounts/{quote(public_id)}/rotate-secret",
+    admin=await user_is_admin(user),
+    user=user,
+    body=body or {},
+    extra_headers=_match_headers(str(body.get("revision") or ""), None),
+  )
 
 
 @router.put("/virtual-accounts/{account_id}/application")

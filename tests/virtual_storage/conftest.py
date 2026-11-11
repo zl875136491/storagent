@@ -33,6 +33,8 @@ os.environ["VS_MINIO_SECURE"] = "false"
 os.environ["VS_MINIO_BUCKET"] = os.environ.get("VS_TEST_MINIO_BUCKET", "vs-pool-v1-test")
 os.environ["VS_ENABLE_TEST_DRIVE"] = "true"
 os.environ.setdefault("SECRET_KEY", "virtual-storage-test-secret")
+os.environ.setdefault("VS_OAUTH_SECRET", "virtual-storage-oauth-test-secret")
+os.environ.setdefault("VS_OAUTH_ISSUER", "https://virtual-storage.test")
 os.environ.setdefault("REGION", os.environ["VS_REGION"])
 
 from src.virtual_storage.settings import reset_settings_cache

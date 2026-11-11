@@ -14,6 +14,8 @@ def account_view(account: VirtualAccount) -> dict:
   return {
     "account_id": account.account_id,
     "app_name": account.app_name,
+    "public_account_id": account.public_account_id or account.app_name,
+    "credential_version": int(account.credential_version or 1),
     "display_name": account.display_name,
     "home_region": account.home_region,
     "pool_id": account.pool_id,
@@ -65,6 +67,8 @@ async def create_account(
     account = VirtualAccount(
       account_id=new_id("acct"),
       app_name=app_name,
+      public_account_id=app_name,
+      credential_version=1,
       display_name=display_name,
       home_region=region,
       pool_id=pool.pool_id,
@@ -89,10 +93,9 @@ async def create_account(
   return account
 
 
-async def authenticate_management(app_name: str, credential: str) -> VirtualAccount:
-  account = await VirtualAccount.find_one(VirtualAccount.app_name == app_name)
-  if account is None:
-    raise AccountNotFoundError(app_name)
+async def verify_client_secret(app_name: str, credential: str) -> VirtualAccount:
+  """只给换票和旧控制台会话使用。管理接口不接受这段明文。"""
+  account = await find_account(app_name)
   if not account.enabled:
     raise AccountDisabledError(app_name)
   if not verify_management_credential(credential, account.management_credential_hash):
@@ -100,8 +103,19 @@ async def authenticate_management(app_name: str, credential: str) -> VirtualAcco
   return account
 
 
-async def get_account(app_name: str) -> VirtualAccount:
-  account = await VirtualAccount.find_one(VirtualAccount.app_name == app_name)
+async def authenticate_management(app_name: str, credential: str) -> VirtualAccount:
+  from src.virtual_storage.services.machine_auth import authenticate_access_token
+  return await authenticate_access_token(app_name, credential)
+
+
+async def find_account(name: str) -> VirtualAccount:
+  account = await VirtualAccount.find_one(VirtualAccount.public_account_id == name)
   if account is None:
-    raise AccountNotFoundError(app_name)
+    account = await VirtualAccount.find_one(VirtualAccount.app_name == name)
+  if account is None:
+    raise AccountNotFoundError(name)
   return account
+
+
+async def get_account(app_name: str) -> VirtualAccount:
+  return await find_account(app_name)

@@ -44,6 +44,8 @@ class VirtualAccount(Document):
   home_region: str
   pool_id: str
   enabled: bool = Field(default=True)
+  public_account_id: str = Field(default="")
+  credential_version: int = Field(default=1)
   management_credential_hash: str
   management_credential_hint: str = Field(default="")
   application_id: str = Field(default="")
@@ -66,6 +68,11 @@ class VirtualAccount(Document):
     indexes = [
       IndexModel(["account_id"], unique=True),
       IndexModel(["app_name"], unique=True),
+      IndexModel(
+        ["public_account_id"],
+        unique=True,
+        partialFilterExpression={"public_account_id": {"$gt": ""}},
+      ),
     ]
 
 
@@ -290,6 +297,84 @@ class MinioCall(Document):
   class Settings:
     name = "vs_minio_calls"
     indexes = [IndexModel(["call_id"], unique=True), IndexModel([("resource_id", 1), ("state", 1)])]
+
+
+OCCUPYING_APPLICATION_FILTER = {
+  "$or": [
+    {"status": "submitted"},
+    {"status": "approved", "init_status": {"$in": ["pending", "initializing", "active", "failed"]}},
+  ]
+}
+
+
+class VirtualAccountApplication(Document):
+  """申请单。拒绝和撤回是终态，名字立即释放。"""
+
+  application_id: str
+  public_account_id: str
+  purpose: str = Field(default="")
+  requested_quota_bytes: int = Field(default=0)
+  requested_quota_objects: int = Field(default=0)
+  approved_quota_bytes: int = Field(default=0)
+  approved_quota_objects: int = Field(default=0)
+  status: str = Field(default="submitted")
+  init_status: str = Field(default="")
+  owner_user_id: str = Field(default="")
+  owner_username: str = Field(default="")
+  owner_subject: str = Field(default="")
+  revision: int = Field(default=0)
+  idempotency_key: str = Field(default="")
+  request_fingerprint: str = Field(default="")
+  reject_reason: str = Field(default="")
+  account_id: str = Field(default="")
+  init_attempt: str = Field(default="")
+  init_error: str = Field(default="")
+  created_at: datetime = Field(default_factory=utc_now)
+  updated_at: datetime = Field(default_factory=utc_now)
+
+  class Settings:
+    name = "vs_account_applications"
+    indexes = [
+      IndexModel(["application_id"], unique=True),
+      IndexModel(
+        ["public_account_id"],
+        unique=True,
+        name="public_id_submitted",
+        partialFilterExpression={"status": "submitted"},
+      ),
+      IndexModel(
+        ["public_account_id"],
+        unique=True,
+        name="public_id_approved",
+        partialFilterExpression={
+          "status": "approved",
+          "init_status": {"$in": ["pending", "initializing", "active", "failed"]},
+        },
+      ),
+      IndexModel(
+        [("owner_subject", 1), ("idempotency_key", 1)],
+        unique=True,
+        partialFilterExpression={"idempotency_key": {"$gt": ""}},
+      ),
+    ]
+
+
+class OAuthRefreshToken(Document):
+  token_id: str
+  public_account_id: str
+  credential_version: int
+  token_hash: str
+  expires_at: datetime
+  revoked: bool = Field(default=False)
+  created_at: datetime = Field(default_factory=utc_now)
+
+  class Settings:
+    name = "vs_oauth_refresh_tokens"
+    indexes = [
+      IndexModel(["token_id"], unique=True),
+      IndexModel(["token_hash"], unique=True),
+      IndexModel([("public_account_id", 1), ("revoked", 1)]),
+    ]
 
 
 class OperationRecord(Document):
