@@ -458,15 +458,16 @@ def test_console_bridge_scopes_accounts(client):
     assert [item["account_id"] for item in session.json()["accounts"]] == [first["account_id"]]
     blocked = client.get(f"/internal/console/accounts/{second['account_id']}/tenants", headers=headers)
     assert blocked.status_code == 403
+    supplied_key = "custom-tenant-credential-" + uuid.uuid4().hex
     created = client.post(f"/internal/console/accounts/{first['account_id']}/tenants", headers=headers, json={
       "logical_name": _name("ui"),
       "quota_bytes": 1000,
       "quota_objects": 2,
       "idempotency_key": _name("idem"),
-      "tenant_credential": "custom-tenant-credential-01",
+      "tenant_credential": supplied_key,
     })
     assert created.status_code == 200, created.text
-    assert created.json()["api_key"] == "custom-tenant-credential-01"
+    assert created.json()["api_key"] == supplied_key
     listed = client.get(f"/internal/console/accounts/{first['account_id']}/tenants", headers=headers)
     assert created.json()["api_key"] not in listed.text
     plain = client.get("/internal/console/session", headers={**headers, "X-Console-User-Id": "user-none"})

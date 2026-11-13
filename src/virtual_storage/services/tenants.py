@@ -224,6 +224,9 @@ async def create_tenant(
     existing = await _find_delivery(account.account_id, subject, idempotency_key)
     if existing:
       return await _replay(existing, fingerprint)
+    detail = str(exc)
+    if "key_hash" in detail:
+      raise ConflictError("租户密钥与已有密钥冲突", "TENANT_KEY_CONFLICT") from exc
     raise ConflictError("租户逻辑名或外部标识冲突") from exc
   except QuotaExceededError:
     raise

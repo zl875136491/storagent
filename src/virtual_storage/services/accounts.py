@@ -46,6 +46,10 @@ async def create_account(
 ) -> VirtualAccount:
   existing = await VirtualAccount.find_one(VirtualAccount.app_name == app_name)
   if existing:
+    if not existing.public_account_id:
+      existing.public_account_id = existing.app_name
+      existing.updated_at = stamp()
+      await existing.save()
     return existing
   settings = get_settings()
   region = home_region or settings.home_region
