@@ -111,6 +111,12 @@ async def _validate_application_name(name: str) -> None:
 
   if len(name) < 3 or len(name) > 32:
     raise CustomException(ErrorDesc.INVALID_PARAMS, "应用别名长度不能小于3或大于32")
+  # 应用别名会原样成为 MinIO 存储桶名。桶名拒绝大写，这里不能改写成小写。
+  if any(char.isupper() for char in name):
+    raise CustomException(
+      ErrorDesc.INVALID_PARAMS,
+      "应用别名会作为 MinIO 存储桶名，不能包含大写字母",
+    )
   # 符号仅允许连字符, 其他 deny
   for char in name:
     if char.isalnum() or char == "-":
