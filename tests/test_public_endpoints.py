@@ -87,6 +87,19 @@ async def test_endpoints_keeps_host_port_fallback_for_unknown_region(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_application_name_rejects_uppercase_before_etcd():
+  user = type("User", (), {"username": "u", "name": "n"})()
+  for name in ("APP", "App-1", "abC"):
+    with pytest.raises(CustomException, match="大写字母"):
+      await public_service.create_application(name, "显示名称", "描述", user, [])
+
+
+@pytest.mark.asyncio
+async def test_application_name_allows_lowercase_bucket_name():
+  await public_service._validate_application_name("app-1")
+
+
+@pytest.mark.asyncio
 async def test_application_name_cannot_claim_reserved_archive_bucket(monkeypatch):
   monkeypatch.setattr(public_service.settings, "OBJECT_ARCHIVE_BUCKET", "storagent-expired-archive")
 
