@@ -4,6 +4,13 @@ ARG VCS_REF=unknown
 ARG IMAGE_VERSION=dev
 ARG SOURCE_URL=https://github.com/zl875136491/storagent
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# Build-time only. These names are excluded from the committed image config.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
 
 LABEL org.opencontainers.image.authors="NC_SIT_ZHANGLE" \
       org.opencontainers.image.title="Storagent Backend" \
