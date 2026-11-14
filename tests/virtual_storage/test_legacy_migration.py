@@ -103,7 +103,8 @@ def test_migrate_requires_real_owner_and_preserves_account(client, monkeypatch):
   assert saved.revision == original_revision
   assert saved.public_account_id == public_id
   grants = _call(client, VirtualAccountGrant.find(VirtualAccountGrant.account_id == account_id).count)
-  assert grants == 0
+  assert grants == 1
+  _call(client, VirtualAccountGrant.find(VirtualAccountGrant.account_id == account_id).delete)
   stranger = "other-" + uuid.uuid4().hex[:8]
   denied = client.post(
     "/internal/console/applications",

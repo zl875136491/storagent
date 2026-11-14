@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-from src.virtual_storage.models.documents import VirtualAccount, VirtualAccountApplication
+from src.virtual_storage.models.documents import VirtualAccount, VirtualAccountApplication, VirtualAccountGrant
 from src.virtual_storage.services.support import new_id, stamp, write_audit
 
 MIGRATION_PURPOSE = "系统迁移：历史引导账号迁入，未经人工申请或审核"
@@ -48,12 +48,21 @@ async def plan_legacy_account(public_id: str, owner_user_id: str = "", owner_use
   existing = await VirtualAccountApplication.find_one(VirtualAccountApplication.account_id == account.account_id)
   if existing is None:
     existing = await VirtualAccountApplication.find_one(VirtualAccountApplication.public_account_id == public_id)
+  owner_id = (owner_user_id or "").strip()
+  owner_name = (owner_username or "").strip()
+  grant = None
+  if owner_id:
+    grant = await VirtualAccountGrant.find_one({
+      "account_id": account.account_id,
+      "user_id": owner_id,
+    })
   plan = {
     "public_account_id": public_id,
     "account_id": account.account_id,
     "home_region": account.home_region,
     "application_id": account.application_id,
     "existing_application": bool(existing),
+    "owner_grant_exists": bool(grant),
     "credential_version": account.credential_version,
     "would_write": False,
     "blocked": None,
@@ -66,13 +75,17 @@ async def plan_legacy_account(public_id: str, owner_user_id: str = "", owner_use
     if existing.status != "approved" or existing.init_status != "active":
       plan["blocked"] = "已有申请不是已生效的迁入记录，停止"
       return plan
+    if existing.purpose != MIGRATION_PURPOSE:
+      plan["blocked"] = "已有申请不是系统迁入记录，停止"
+      return plan
     if blocked:
-      plan["blocked"] = None
       plan["would_write"] = False
       return plan
-    if existing.owner_user_id != owner_user_id.strip() or existing.owner_username != owner_username.strip():
+    if existing.owner_user_id != owner_id or existing.owner_username != owner_name:
       plan["blocked"] = "已有迁入申请的归属不同，停止"
       return plan
+    plan["application_id"] = existing.application_id
+    plan["would_write"] = grant is None
     return plan
   plan["blocked"] = blocked
   plan["would_write"] = blocked is None
@@ -93,6 +106,16 @@ async def migrate_legacy_account(
     plan["dry_run"] = True
     return plan
   account = await _account(plan["public_account_id"])
+  if plan["existing_application"]:
+    await _ensure_owner_grant(account.account_id, owner_user_id.strip(), owner_username.strip())
+    if account.application_id != plan["application_id"]:
+      account.application_id = plan["application_id"]
+      account.updated_at = stamp()
+      await account.save()
+    plan["would_write"] = False
+    plan["owner_grant_exists"] = True
+    plan["dry_run"] = False
+    return plan
   before_hash = account.management_credential_hash
   before_id = account.account_id
   item = VirtualAccountApplication(
@@ -127,6 +150,7 @@ async def migrate_legacy_account(
   await account.save()
   if account.management_credential_hash != before_hash or account.account_id != before_id:
     raise MigrationStopped("迁移改动了账号身份或密钥，已停止")
+  await _ensure_owner_grant(account.account_id, owner_user_id.strip(), owner_username.strip())
   await write_audit(
     account_id=account.account_id,
     tenant_id="",
@@ -138,5 +162,21 @@ async def migrate_legacy_account(
   )
   plan["would_write"] = False
   plan["application_id"] = item.application_id
+  plan["owner_grant_exists"] = True
   plan["dry_run"] = False
   return plan
+
+
+async def _ensure_owner_grant(account_id: str, user_id: str, username: str) -> bool:
+  existing = await VirtualAccountGrant.find_one({"account_id": account_id, "user_id": user_id})
+  if existing is not None:
+    return False
+  grant = VirtualAccountGrant(
+    grant_id=new_id("grt"),
+    account_id=account_id,
+    user_id=user_id,
+    username=username,
+    created_at=stamp(),
+  )
+  await grant.insert()
+  return True

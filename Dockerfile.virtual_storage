@@ -3,6 +3,13 @@ FROM python:3.12.10-bookworm
 ARG VCS_REF=unknown
 ARG IMAGE_VERSION=dev
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# Build-time only. These names are excluded from the committed image config.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
 
 LABEL org.opencontainers.image.title="Storagent Virtual Storage" \
       org.opencontainers.image.revision="${VCS_REF}" \
