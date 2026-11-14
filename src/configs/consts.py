@@ -17,6 +17,7 @@ preset_permissions = {
     "children": [
       "user_manage",
       "application_manage",
+      "virtual_account_review",
       "application_quota_manage",
       "region_manage",
       "storage_operations_manage",
@@ -70,6 +71,11 @@ preset_permissions = {
   "storage_operations_manage": {
     "name": "存储运维管理",
     "description": "拥有复制、集群健康及运维操作权限",
+    "children": []
+  },
+  "virtual_account_review": {
+    "name": "虚拟账号审核",
+    "description": "批准或拒绝虚拟账号申请，不能读取账号密钥",
     "children": []
   }
 }

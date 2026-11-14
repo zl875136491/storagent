@@ -24,6 +24,7 @@ from src.modules.diagnostics.route import router as diagnostics_router
 from src.modules.capacity.route import router as capacity_router
 from src.modules.etcd.route import router as etcd_router
 from src.modules.celery.route import router as celery_router
+from src.modules.virtual_console.bridge import router as virtual_console_router
 
 # 在 main.py 中调用后, 会将所有 API 路由注册到 FastAPI 应用实例中
 def register_api(app: FastAPI):
@@ -38,6 +39,7 @@ def register_api(app: FastAPI):
   api_router = APIRouter(prefix=API_V1_PREFIX)
   
   api_router.include_router(public_router, tags=["公共模块"], prefix="/public")
+  api_router.include_router(virtual_console_router, tags=["虚拟账号控制台"])
   api_router.include_router(auth_router, tags=["认证模块"], prefix="/auth")
   api_router.include_router(storage_router, tags=["存储模块"], prefix="/storage")
   api_router.include_router(files_router, tags=["文件模块"], prefix="/files")

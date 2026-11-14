@@ -92,6 +92,8 @@ class ApplicationResponse(BaseModel):
   quota_usage_ratio: float = Field(default=0.0, ge=0)
   quota_usage_updated_at: datetime | None = None
   domains: list[str] = Field(default_factory=list)
+  virtual_account: bool = False
+  virtual_account_name: str = ""
   author: SimpleUserResponse
 
 
