@@ -18,6 +18,17 @@ pipeline {
         DOCKERFILE_PATH = 'Dockerfile'
         TEST_IMAGE = 'python:3.12.10-bookworm'
         PYPI_INDEX_URL = 'https://pypi.tuna.tsinghua.edu.cn/simple'
+        // One outbound proxy for pip and image builds. Both spellings are set
+        // because pip, curl, and Docker do not agree on case. Direct hosts stay
+        // off the proxy; values are not written into the runtime image.
+        OUTBOUND_PROXY = 'http://proxy.1oa.com.cn:3128'
+        DIRECT_HOSTS = 'localhost,127.0.0.1,::1,10.17.158.118,10.17.158.156,10.41.102.223,10.32.129.241,10.17.158.115,10.8.136.107,10.31.133.207,.1oa.com.cn'
+        HTTP_PROXY = "${OUTBOUND_PROXY}"
+        HTTPS_PROXY = "${OUTBOUND_PROXY}"
+        http_proxy = "${OUTBOUND_PROXY}"
+        https_proxy = "${OUTBOUND_PROXY}"
+        NO_PROXY = "${DIRECT_HOSTS}"
+        no_proxy = "${DIRECT_HOSTS}"
     }
 
     stages {
@@ -69,6 +80,12 @@ pipeline {
                         --env PYTHONDONTWRITEBYTECODE=1 \
                         --env PIP_DISABLE_PIP_VERSION_CHECK=1 \
                         --env "PIP_INDEX_URL=$PYPI_INDEX_URL" \
+                        --env "HTTP_PROXY=$HTTP_PROXY" \
+                        --env "HTTPS_PROXY=$HTTPS_PROXY" \
+                        --env "http_proxy=$http_proxy" \
+                        --env "https_proxy=$https_proxy" \
+                        --env "NO_PROXY=$NO_PROXY" \
+                        --env "no_proxy=$no_proxy" \
                         --env LOG_PATH=/tmp/storagent-logs \
                         "$TEST_IMAGE" \
                         bash -c '
@@ -94,11 +111,22 @@ pipeline {
                         --build-arg "VCS_REF=$GIT_COMMIT" \
                         --build-arg "IMAGE_VERSION=$IMAGE_TAG" \
                         --build-arg "SOURCE_URL=$SOURCE_URL" \
+                        --build-arg "PIP_INDEX_URL=$PYPI_INDEX_URL" \
+                        --build-arg "HTTP_PROXY=$HTTP_PROXY" \
+                        --build-arg "HTTPS_PROXY=$HTTPS_PROXY" \
+                        --build-arg "http_proxy=$http_proxy" \
+                        --build-arg "https_proxy=$https_proxy" \
+                        --build-arg "NO_PROXY=$NO_PROXY" \
+                        --build-arg "no_proxy=$no_proxy" \
                         --tag "$IMAGE_REF" \
                         .
 
                     test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE_REF")" = "$GIT_COMMIT"
                     test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.component" }}' "$IMAGE_REF")" = 'backend'
+                    if docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$IMAGE_REF" | grep -Eiq '^(HTTP_PROXY|HTTPS_PROXY|http_proxy|https_proxy|NO_PROXY|no_proxy)='; then
+                        echo 'Proxy settings leaked into the runtime image environment.' >&2
+                        exit 1
+                    fi
                 '''
             }
         }
@@ -128,6 +156,8 @@ pipeline {
                         }
                         trap cleanup_registry_session EXIT HUP INT TERM
 
+                        # Harbor is on the direct list and is reached without the outbound proxy.
+                        unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
                         printf '%s' "$INFRA_HARBOR_PSW" | \
                             docker login "$HARBOR" --username "$INFRA_HARBOR_USR" --password-stdin >/dev/null
                         unset INFRA_HARBOR_USR INFRA_HARBOR_PSW
