@@ -9,9 +9,7 @@ from fastapi.responses import JSONResponse, Response
 
 from src.virtual_storage.api.routes import install_error_handler, router
 from src.virtual_storage.core.database import close_virtual_storage_db, init_virtual_storage_db
-from src.virtual_storage.core.exception import InfrastructureError
 from src.virtual_storage.core.minio_gateway import MinioGateway
-from src.virtual_storage.services.accounts import create_account
 from src.virtual_storage.settings import get_settings
 from src.utils.logger import setup_logging
 
@@ -25,16 +23,6 @@ async def lifespan(app: FastAPI):
   settings = get_settings()
   if settings.minio_endpoint:
     app.state.gateway.ensure_bucket(settings.minio_bucket)
-  if settings.bootstrap:
-    if not settings.bootstrap_app_name or not settings.bootstrap_credential:
-      raise InfrastructureError("引导账号缺少名称或管理凭据")
-    await create_account(
-      app_name=settings.bootstrap_app_name,
-      display_name=settings.bootstrap_display_name,
-      credential=settings.bootstrap_credential,
-      quota_bytes=settings.bootstrap_quota_bytes,
-      quota_objects=settings.bootstrap_quota_objects,
-    )
   yield
   await close_virtual_storage_db()
 

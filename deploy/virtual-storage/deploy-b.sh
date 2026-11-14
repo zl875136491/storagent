@@ -28,7 +28,6 @@ VS_MINIO_ACCESS_KEY=
 VS_MINIO_SECRET_KEY=
 VS_MINIO_BUCKET=vs-pool-v1
 VS_REQUIRE_HTTPS=true
-VS_BOOTSTRAP=false
 VS_CELERY_BROKER_URL=mongodb://vs_api:${API_PASS}@10.32.12.110:27018/storagent_vs_broker?authSource=admin&replicaSet=vsrs
 VS_QUEUE_PREFIX=storagent-vs
 VS_PROTOCOL_VERSION=1
@@ -46,7 +45,6 @@ VS_MINIO_ACCESS_KEY=
 VS_MINIO_SECRET_KEY=
 VS_MINIO_BUCKET=vs-pool-v1
 VS_REQUIRE_HTTPS=true
-VS_BOOTSTRAP=false
 VS_CELERY_BROKER_URL=mongodb://vs_worker:${WORKER_PASS}@10.32.12.110:27018/storagent_vs_broker?authSource=admin&replicaSet=vsrs
 VS_QUEUE_PREFIX=storagent-vs
 VS_PROTOCOL_VERSION=1

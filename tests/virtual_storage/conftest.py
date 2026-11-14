@@ -24,7 +24,6 @@ os.environ["VS_REGION"] = os.environ.get("VS_TEST_REGION", "nuc-docker-a")
 os.environ["VS_HOME_REGION"] = os.environ["VS_REGION"]
 os.environ["VS_HOME_BASE_URL"] = ""
 os.environ["VS_REQUIRE_HTTPS"] = "false"
-os.environ["VS_BOOTSTRAP"] = "false"
 os.environ["VS_CELERY_BROKER_URL"] = ""
 os.environ["VS_MINIO_ENDPOINT"] = os.environ["VS_TEST_MINIO_ENDPOINT"]
 os.environ["VS_MINIO_ACCESS_KEY"] = os.environ["VS_TEST_MINIO_ACCESS_KEY"]

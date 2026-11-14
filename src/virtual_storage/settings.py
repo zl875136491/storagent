@@ -35,12 +35,6 @@ class VSSettings:
   delivery_window_seconds: int
   key_ttl_seconds: int
   lease_seconds: int
-  bootstrap: bool
-  bootstrap_app_name: str
-  bootstrap_display_name: str
-  bootstrap_credential: str
-  bootstrap_quota_bytes: int
-  bootstrap_quota_objects: int
   queue_prefix: str
   protocol_version: str
   celery_broker_url: str
@@ -79,12 +73,6 @@ def get_settings() -> VSSettings:
       delivery_window_seconds=_int("VS_DELIVERY_WINDOW_SECONDS", 600),
       key_ttl_seconds=_int("VS_KEY_TTL_SECONDS", 30 * 24 * 3600),
       lease_seconds=_int("VS_LEASE_SECONDS", 300),
-      bootstrap=_bool("VS_BOOTSTRAP", False),
-      bootstrap_app_name=os.getenv("VS_BOOTSTRAP_APP_NAME", "").strip(),
-      bootstrap_display_name=os.getenv("VS_BOOTSTRAP_DISPLAY_NAME", "虚拟存储账号").strip(),
-      bootstrap_credential=os.getenv("VS_BOOTSTRAP_CREDENTIAL", ""),
-      bootstrap_quota_bytes=_int("VS_BOOTSTRAP_QUOTA_BYTES", 10 * 1024 ** 3),
-      bootstrap_quota_objects=_int("VS_BOOTSTRAP_QUOTA_OBJECTS", 100000),
       queue_prefix=os.getenv("VS_QUEUE_PREFIX", "storagent-vs").strip(),
       protocol_version=os.getenv("VS_PROTOCOL_VERSION", "1").strip(),
       celery_broker_url=os.getenv("VS_CELERY_BROKER_URL", "").strip(),
