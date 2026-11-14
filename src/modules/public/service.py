@@ -122,7 +122,7 @@ async def _validate_application_name(name: str) -> None:
     if char.isalnum() or char == "-":
       continue
     else:
-      raise CustomException(ErrorDesc.INVALID_PARAMS, "应用别名只能包含连字符和字母数字")
+      raise CustomException(ErrorDesc.INVALID_PARAMS, "APPID只能包含连字符和字母数字")
   if name.strip().lower() == settings.OBJECT_ARCHIVE_BUCKET.strip().lower():
     raise CustomException(
       ErrorDesc.INVALID_PARAMS,
