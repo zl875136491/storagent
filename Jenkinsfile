@@ -21,14 +21,10 @@ pipeline {
         // One outbound proxy for pip and image builds. Both spellings are set
         // because pip, curl, and Docker do not agree on case. Direct hosts stay
         // off the proxy; values are not written into the runtime image.
+        // Jenkins stores environment names case-insensitively, so the shell
+        // exports both spellings itself. Defining both here would drop one.
         OUTBOUND_PROXY = 'http://proxy.1oa.com.cn:3128'
         DIRECT_HOSTS = 'localhost,127.0.0.1,::1,10.17.158.118,10.17.158.156,10.41.102.223,10.32.129.241,10.17.158.115,10.8.136.107,10.31.133.207,.1oa.com.cn'
-        HTTP_PROXY = "${OUTBOUND_PROXY}"
-        HTTPS_PROXY = "${OUTBOUND_PROXY}"
-        http_proxy = "${OUTBOUND_PROXY}"
-        https_proxy = "${OUTBOUND_PROXY}"
-        NO_PROXY = "${DIRECT_HOSTS}"
-        no_proxy = "${DIRECT_HOSTS}"
     }
 
     stages {
@@ -73,6 +69,12 @@ pipeline {
             steps {
                 sh '''#!/usr/bin/env bash
                     set -Eeuo pipefail
+                    export HTTP_PROXY="$OUTBOUND_PROXY"
+                    export HTTPS_PROXY="$OUTBOUND_PROXY"
+                    export http_proxy="$OUTBOUND_PROXY"
+                    export https_proxy="$OUTBOUND_PROXY"
+                    export NO_PROXY="$DIRECT_HOSTS"
+                    export no_proxy="$DIRECT_HOSTS"
                     docker run --rm \
                         --platform linux/amd64 \
                         --volume "$WORKSPACE:/workspace:ro" \
@@ -104,6 +106,12 @@ pipeline {
             steps {
                 sh '''#!/usr/bin/env bash
                     set -Eeuo pipefail
+                    export HTTP_PROXY="$OUTBOUND_PROXY"
+                    export HTTPS_PROXY="$OUTBOUND_PROXY"
+                    export http_proxy="$OUTBOUND_PROXY"
+                    export https_proxy="$OUTBOUND_PROXY"
+                    export NO_PROXY="$DIRECT_HOSTS"
+                    export no_proxy="$DIRECT_HOSTS"
                     docker build \
                         --provenance=false \
                         --platform linux/amd64 \
