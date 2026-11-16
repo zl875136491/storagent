@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>虚拟存储控制台</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; max-width: 52rem; }
+    label { display: block; margin-top: 0.75rem; }
+    input { width: 100%; padding: 0.4rem; }
+    button { margin-top: 0.8rem; }
+    pre { background: #f4f4f4; padding: 0.8rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>虚拟存储控制台</h1>
+  <p>当前没有可用的 OIDC 身份源配置。登录使用账号管理凭据，只通过 HTTPS 提交，明文 Key 只在本次响应中显示。</p>
+  <label>应用名 <input id="app" /></label>
+  <label>管理凭据 <input id="credential" type="password" /></label>
+  <button id="login">登录</button>
+  <h2>新建租户</h2>
+  <label>外部租户 ID <input id="external" /></label>
+  <label>逻辑名 <input id="name" /></label>
+  <label>字节配额 <input id="bytes" value="1048576" /></label>
+  <label>对象配额 <input id="objects" value="100" /></label>
+  <button id="create">创建</button>
+  <pre id="out"></pre>
+  <script>
+    let credential = "";
+    let appName = "";
+    const out = document.getElementById("out");
+    function show(value) { out.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2); }
+    document.getElementById("login").onclick = async () => {
+      appName = document.getElementById("app").value;
+      credential = document.getElementById("credential").value;
+      const response = await fetch("/console/session", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({app_name: appName, credential})
+      });
+      show(await response.json());
+    };
+    document.getElementById("create").onclick = async () => {
+      const response = await fetch(`/api/virtual-storage/v1/accounts/${encodeURIComponent(appName)}/tenants`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + credential,
+          "Idempotency-Key": crypto.randomUUID()
+        },
+        body: JSON.stringify({
+          external_tenant_id: document.getElementById("external").value,
+          logical_name: document.getElementById("name").value,
+          quota_bytes: Number(document.getElementById("bytes").value),
+          quota_objects: Number(document.getElementById("objects").value)
+        })
+      });
+      show(await response.json());
+      credential = document.getElementById("credential").value;
+    };
+  </script>
+</body>
+</html>
