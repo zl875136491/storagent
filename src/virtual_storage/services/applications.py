@@ -69,6 +69,44 @@ def application_view(item: VirtualAccountApplication) -> dict:
   }
 
 
+def _aware(value):
+  if value.tzinfo is None:
+    from datetime import timezone
+    return value.replace(tzinfo=timezone.utc)
+  return value
+
+
+def _client_secret_query(account: VirtualAccount) -> dict:
+  return {
+    "account_id": account.account_id,
+    "key_id": "client-secret",
+    "idempotency_key": f"v{int(account.credential_version or 1)}",
+  }
+
+
+async def client_secret_delivery_state(item: VirtualAccountApplication) -> str:
+  """只描述账号管理密钥的交付窗口。租户 API 密钥记录不算。"""
+  if item.init_status != "active" or not item.account_id:
+    return "missing"
+  account = await VirtualAccount.find_one(VirtualAccount.account_id == item.account_id)
+  if account is None:
+    return "missing"
+  delivery = await KeyDelivery.find_one(_client_secret_query(account))
+  if delivery is None:
+    return "missing"
+  if _aware(delivery.window_ends_at) <= utc_now():
+    return "expired"
+  return "open"
+
+
+async def application_state(item: VirtualAccountApplication) -> dict:
+  view = application_view(item)
+  view["client_secret_delivery"] = await client_secret_delivery_state(item)
+  for secret_field in ("encrypted_key", "management_credential_hash", "management_credential_hint", "client_secret", "subject_hash"):
+    view.pop(secret_field, None)
+  return view
+
+
 def _require_revision(item: VirtualAccountApplication, if_match: str) -> None:
   if str(if_match or "").strip() != str(item.revision):
     raise PreconditionError("申请已被他人更新")
@@ -127,14 +165,14 @@ async def create_application(
     if existing is not None:
       if existing.request_fingerprint != fingerprint:
         raise ConflictError("同一个 Idempotency-Key 对应了不同的申请内容", "IDEMPOTENCY_CONFLICT")
-      return application_view(existing)
+      return await application_state(existing)
   own = await VirtualAccountApplication.find_one({
     "owner_subject": subject,
     "public_account_id": public_id,
     "status": "submitted",
   })
   if own is not None:
-    return application_view(own)
+    return await application_state(own)
   if await _name_taken(public_id):
     raise ConflictError("account id 已被占用", "ACCOUNT_ID_TAKEN")
   item = VirtualAccountApplication(
@@ -157,7 +195,7 @@ async def create_application(
     await item.insert()
   except DuplicateKeyError as exc:
     raise ConflictError("account id 已被占用", "ACCOUNT_ID_TAKEN") from exc
-  return application_view(item)
+  return await application_state(item)
 
 
 async def _visible(application_id: str, user_id: str, username: str, reviewer: bool) -> VirtualAccountApplication:
@@ -189,11 +227,12 @@ async def list_applications(
     query = {"status": "submitted"}
   total = await VirtualAccountApplication.find(query).count()
   rows = await VirtualAccountApplication.find(query).sort("-created_at").skip((page - 1) * page_size).limit(page_size).to_list()
-  return {"items": [application_view(row) for row in rows], "page": page, "page_size": page_size, "total": total}
+  items = [await application_state(row) for row in rows]
+  return {"items": items, "page": page, "page_size": page_size, "total": total}
 
 
 async def get_application(application_id: str, user_id: str, username: str, reviewer: bool) -> dict:
-  return application_view(await _visible(application_id, user_id, username, reviewer))
+  return await application_state(await _visible(application_id, user_id, username, reviewer))
 
 
 async def withdraw_application(application_id: str, user_id: str, username: str, if_match: str) -> dict:
@@ -208,7 +247,7 @@ async def withdraw_application(application_id: str, user_id: str, username: str,
   item.revision += 1
   item.updated_at = stamp()
   await item.save()
-  return application_view(item)
+  return await application_state(item)
 
 
 async def approve_application(
@@ -246,7 +285,7 @@ async def approve_application(
       "self_review": actor_id == item.owner_subject or actor_id == item.owner_user_id,
     },
   )
-  return application_view(item)
+  return await application_state(item)
 
 
 async def reject_application(application_id: str, if_match: str, reason: str) -> dict:
@@ -264,7 +303,7 @@ async def reject_application(application_id: str, if_match: str, reason: str) ->
   item.revision += 1
   item.updated_at = stamp()
   await item.save()
-  return application_view(item)
+  return await application_state(item)
 
 
 async def _open_delivery(account: VirtualAccount, secret: str, session=None) -> None:
@@ -353,7 +392,7 @@ async def advance_application(application_id: str) -> dict:
   if item.status != "approved":
     raise ConflictError("只有已批准的申请可以初始化", "APPLICATION_NOT_APPROVED")
   if item.init_status == "active":
-    return application_view(item)
+    return await application_state(item)
   if item.init_status not in {"", "pending", "failed", "initializing"}:
     raise ConflictError("当前不能初始化", "INIT_NOT_ALLOWED")
   item.init_status = "initializing"
@@ -371,9 +410,9 @@ async def advance_application(application_id: str) -> dict:
       fresh.revision += 1
       fresh.updated_at = stamp()
       await fresh.save()
-      return application_view(fresh)
+      return await application_state(fresh)
   fresh = await VirtualAccountApplication.find_one(VirtualAccountApplication.application_id == application_id)
-  return application_view(fresh)
+  return await application_state(fresh)
 
 
 async def advance_pending() -> int:
@@ -423,20 +462,11 @@ async def deliver_secret(public_id: str, user_id: str, username: str, is_admin: 
     raise ConsoleForbiddenError("不能领取该账号的密钥")
   if item.init_status != "active":
     raise NotReadyError("账号尚未初始化完成")
-  delivery = await KeyDelivery.find_one({
-    "account_id": account.account_id,
-    "key_id": "client-secret",
-    "idempotency_key": f"v{account.credential_version}",
-  })
+  delivery = await KeyDelivery.find_one(_client_secret_query(account))
   if delivery is None:
-    raise NotReadyError("密钥交付窗口不存在")
-  now = utc_now()
-  ends = delivery.window_ends_at
-  if ends.tzinfo is None:
-    from datetime import timezone
-    ends = ends.replace(tzinfo=timezone.utc)
-  if ends <= now:
-    raise NotReadyError("密钥交付窗口已结束，请在管理页重新生成")
+    raise NotReadyError("没有可领取的管理密钥，请重新生成密钥")
+  if _aware(delivery.window_ends_at) <= utc_now():
+    raise NotReadyError("管理密钥交付窗口已结束，请重新生成密钥")
   return {
     "public_account_id": account.public_account_id or account.app_name,
     "client_secret": decrypt_delivery(delivery.encrypted_key),

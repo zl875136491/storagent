@@ -189,11 +189,19 @@ async def delete_grant(body: dict, user: User = Depends(get_current_user)):
 
 def _match_headers(if_match: str | None, idempotency_key: str | None) -> dict:
   headers = {}
-  if if_match:
+  if if_match is not None and if_match != "":
     headers["If-Match"] = if_match
   if idempotency_key:
     headers["Idempotency-Key"] = idempotency_key
   return headers
+
+
+def _revision_match(body: dict | None) -> dict:
+  """保留修订号 0。缺少修订号时不发送 If-Match，由服务端拒绝而不是当成 0。"""
+  payload = body or {}
+  if "revision" not in payload or payload.get("revision") is None:
+    return _match_headers(None, None)
+  return _match_headers(str(payload.get("revision")), None)
 
 
 @router.post("/virtual-account-applications")
@@ -321,7 +329,7 @@ async def rotate_virtual_account_secret(public_id: str, body: dict, user: User =
     admin=await user_is_admin(user),
     user=user,
     body=body or {},
-    extra_headers=_match_headers(str(body.get("revision") or ""), None),
+    extra_headers=_revision_match(body or {}),
   )
 
 
