@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from src.virtual_storage.core.exception import InvalidCredentialError, VirtualStorageError, to_http_exception
+from src.virtual_storage.core.exception import InvalidCredentialError, ValidationError, VirtualStorageError, to_http_exception
 from src.virtual_storage.core.minio_gateway import MinioGateway
 from src.virtual_storage.core.security import issue_session, read_session, subject_hash
 from src.virtual_storage.services.accounts import account_view, authenticate_management, get_account
@@ -47,6 +47,93 @@ def _bearer(authorization: str | None) -> str:
   if not authorization or not authorization.lower().startswith("bearer "):
     raise InvalidCredentialError("需要 Authorization: Bearer 管理凭据")
   return authorization.split(" ", 1)[1].strip()
+
+
+def _safe_request_id(raw: str | None) -> str:
+  """生成或验证请求ID，确保安全性。"""
+  import uuid
+  if not raw:
+    return f"REQ-{uuid.uuid4().hex[:16].upper()}"
+  safe = "".join(c for c in raw if c.isprintable() and ord(c) < 127)[:64]
+  return safe if safe else f"REQ-{uuid.uuid4().hex[:16].upper()}"
+
+
+def _validate_create_tenant_body(body: dict) -> dict:
+  """校验创建租户请求体，返回经过校验和类型转换的字段。"""
+  if not isinstance(body, dict):
+    raise ValidationError("请求体必须是 JSON 对象", "INVALID_REQUEST_BODY")
+  
+  required_fields = ["external_tenant_id", "logical_name", "quota_bytes", "quota_objects"]
+  missing = [f for f in required_fields if f not in body]
+  if missing:
+    raise ValidationError(f"缺少必填字段: {', '.join(missing)}", "MISSING_REQUIRED_FIELDS")
+  
+  try:
+    external_tenant_id = body["external_tenant_id"]
+    logical_name = body["logical_name"]
+    
+    if not isinstance(external_tenant_id, str):
+      raise ValidationError("external_tenant_id 必须是字符串", "INVALID_EXTERNAL_TENANT_ID")
+    if not isinstance(logical_name, str):
+      raise ValidationError("logical_name 必须是字符串", "INVALID_LOGICAL_NAME")
+    
+    external_tenant_id = external_tenant_id.strip()
+    logical_name = logical_name.strip()
+    
+    if not external_tenant_id:
+      raise ValidationError("external_tenant_id 不能为空", "INVALID_EXTERNAL_TENANT_ID")
+    if not logical_name:
+      raise ValidationError("logical_name 不能为空", "INVALID_LOGICAL_NAME")
+    
+    quota_bytes_raw = body["quota_bytes"]
+    quota_objects_raw = body["quota_objects"]
+    
+    if isinstance(quota_bytes_raw, bool) or not isinstance(quota_bytes_raw, (int, float)):
+      raise ValidationError("quota_bytes 必须是整数", "INVALID_QUOTA_BYTES")
+    if isinstance(quota_objects_raw, bool) or not isinstance(quota_objects_raw, (int, float)):
+      raise ValidationError("quota_objects 必须是整数", "INVALID_QUOTA_OBJECTS")
+    
+    try:
+      quota_bytes = int(quota_bytes_raw)
+      if quota_bytes != quota_bytes_raw and not isinstance(quota_bytes_raw, int):
+        raise ValidationError("quota_bytes 必须是整数", "INVALID_QUOTA_BYTES")
+    except (ValueError, OverflowError):
+      raise ValidationError("quota_bytes 必须是整数", "INVALID_QUOTA_BYTES")
+    
+    try:
+      quota_objects = int(quota_objects_raw)
+      if quota_objects != quota_objects_raw and not isinstance(quota_objects_raw, int):
+        raise ValidationError("quota_objects 必须是整数", "INVALID_QUOTA_OBJECTS")
+    except (ValueError, OverflowError):
+      raise ValidationError("quota_objects 必须是整数", "INVALID_QUOTA_OBJECTS")
+    
+    key_ttl_seconds = body.get("key_ttl_seconds")
+    if key_ttl_seconds is not None:
+      if isinstance(key_ttl_seconds, bool) or not isinstance(key_ttl_seconds, (int, float)):
+        raise ValidationError("key_ttl_seconds 必须是整数", "INVALID_KEY_TTL")
+      try:
+        key_ttl_seconds = int(key_ttl_seconds)
+        if key_ttl_seconds < 0:
+          raise ValidationError("key_ttl_seconds 不能为负数", "INVALID_KEY_TTL")
+      except (ValueError, OverflowError):
+        raise ValidationError("key_ttl_seconds 必须是整数", "INVALID_KEY_TTL")
+    
+    tenant_credential = body.get("tenant_credential")
+    if tenant_credential is not None and not isinstance(tenant_credential, str):
+      raise ValidationError("tenant_credential 必须是字符串", "INVALID_TENANT_CREDENTIAL")
+    
+    return {
+      "external_tenant_id": external_tenant_id,
+      "logical_name": logical_name,
+      "quota_bytes": quota_bytes,
+      "quota_objects": quota_objects,
+      "key_ttl_seconds": key_ttl_seconds,
+      "tenant_credential": tenant_credential or None,
+    }
+  except ValidationError:
+    raise
+  except Exception as e:
+    raise ValidationError(f"请求体格式错误: {str(e)}", "INVALID_REQUEST_BODY")
 
 
 def _management_secret(request: Request, authorization: str | None) -> str:
@@ -202,25 +289,37 @@ async def post_tenant(
   request: Request,
   authorization: str | None = Header(default=None),
   idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+  x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
 ):
+  request_id = _safe_request_id(x_request_id)
+  request.state.request_id = request_id
+  
   if not idempotency_key:
     raise HTTPException(status_code=400, detail={"error_code": "IDEMPOTENCY_REQUIRED", "message": "缺少 Idempotency-Key"})
   credential = _bearer(authorization)
-  body = await request.json()
+  
+  try:
+    body = await request.json()
+  except Exception:
+    raise ValidationError("请求体必须是有效的 JSON", "INVALID_JSON")
+  
+  validated = _validate_create_tenant_body(body)
+  
   created = await create_tenant(
     app_name=app_name,
     credential=credential,
     idempotency_key=idempotency_key,
-    external_tenant_id=body["external_tenant_id"],
-    logical_name=body["logical_name"],
-    quota_bytes=int(body["quota_bytes"]),
-    quota_objects=int(body["quota_objects"]),
-    key_ttl_seconds=body.get("key_ttl_seconds"),
-    tenant_credential=body.get("tenant_credential") or None,
+    external_tenant_id=validated["external_tenant_id"],
+    logical_name=validated["logical_name"],
+    quota_bytes=validated["quota_bytes"],
+    quota_objects=validated["quota_objects"],
+    key_ttl_seconds=validated["key_ttl_seconds"],
+    tenant_credential=validated["tenant_credential"],
   )
   from src.virtual_storage.workers.queue import enqueue_scan
   enqueue_scan()
-  return created
+  
+  return JSONResponse(content=created, headers={"X-Request-Id": request_id})
 
 
 @router.get("/api/virtual-storage/v1/accounts/{app_name}/tenants/{tenant_id}")
@@ -839,14 +938,45 @@ async def console_rotate_secret(
 
 
 def install_error_handler(app):
+  from loguru import logger
+  
+  def _get_request_id(request: Request) -> str:
+    if hasattr(request.state, "request_id"):
+      return request.state.request_id
+    return _safe_request_id(request.headers.get("X-Request-Id"))
+  
   @app.exception_handler(VirtualStorageError)
-  async def _handle(_request, exc: VirtualStorageError):
-    return JSONResponse(status_code=exc.status_code, content=to_http_exception(exc).detail)
+  async def _handle(request: Request, exc: VirtualStorageError):
+    request_id = _get_request_id(request)
+    logger.error(f"VirtualStorageError: {exc.error_code} - {exc.message} [request_id={request_id}]")
+    return JSONResponse(
+      status_code=exc.status_code,
+      content=to_http_exception(exc).detail,
+      headers={"X-Request-Id": request_id}
+    )
 
   from pymongo.errors import OperationFailure
 
   @app.exception_handler(OperationFailure)
-  async def _write_conflict(_request, exc: OperationFailure):
+  async def _write_conflict(request: Request, exc: OperationFailure):
+    request_id = _get_request_id(request)
+    logger.error(f"MongoDB OperationFailure: code={exc.code} [request_id={request_id}]")
     if exc.code == 112:
-      return JSONResponse(status_code=409, content={"error_code": "WRITE_CONFLICT", "message": "并发写入冲突，请重试"})
-    return JSONResponse(status_code=500, content={"error_code": "DATABASE_WRITE_FAILED", "message": "数据库写入失败"})
+      content = {"error_code": "WRITE_CONFLICT", "message": "并发写入冲突，请重试"}
+    else:
+      content = {"error_code": "DATABASE_WRITE_FAILED", "message": "数据库写入失败"}
+    return JSONResponse(
+      status_code=409 if exc.code == 112 else 500,
+      content=content,
+      headers={"X-Request-Id": request_id}
+    )
+  
+  @app.exception_handler(Exception)
+  async def _generic(request: Request, exc: Exception):
+    request_id = _get_request_id(request)
+    logger.exception(f"Unhandled exception [request_id={request_id}]")
+    return JSONResponse(
+      status_code=500,
+      content={"error_code": "INTERNAL_SERVER_ERROR", "message": "内部服务器错误"},
+      headers={"X-Request-Id": request_id}
+    )

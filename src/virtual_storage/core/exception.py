@@ -57,6 +57,11 @@ class InvalidCredentialError(VirtualStorageError):
     super().__init__(message, "INVALID_CREDENTIAL", 401)
 
 
+class ValidationError(VirtualStorageError):
+  def __init__(self, message: str, error_code: str = "VALIDATION_ERROR"):
+    super().__init__(message, error_code, 422)
+
+
 class ConflictError(VirtualStorageError):
   def __init__(self, message: str, error_code: str = "CONFLICT"):
     super().__init__(message, error_code, 409)
