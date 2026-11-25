@@ -92,11 +92,11 @@ POST /api/virtual-storage/v1/accounts/{account_id}/tenants
   - 10 MB = `10485760`
   - 1 GB = `1073741824`
   - 20 GB = `21474836480`
-  - 1 TB = `1099511627776`（最大限制）
+  - 1 TB = `1099511627776`
 
 - **`quota_objects`（个数）**：
   - 直接填写对象数量上限
-  - 最大限制：`100000000`（1 亿）
+  - 示例：`10000`（一万个对象）
 
 **示例请求体**：
 
@@ -109,7 +109,10 @@ POST /api/virtual-storage/v1/accounts/{account_id}/tenants
 }
 ```
 
-**注意**：示例仅供参考，不代表实际可用配额或默认值。实际分配需遵循账号剩余配额。
+**注意**：
+- 示例仅供参考，不代表实际可用配额或默认值
+- 实际分配需遵循账号剩余配额，超额会返回 `409 QUOTA_EXCEEDED`
+- 系统对配额值本身不设置硬性上限（由账号可用配额和业务合同约束）
 
 ## 4. 账号可分配配额与并发变化
 
@@ -204,13 +207,15 @@ Authorization: Bearer <access_token>
 | 409 | `QUOTA_EXCEEDED` | 账号可用配额不足 |
 | 409 | `CONFLICT` | `external_tenant_id` 或 `logical_name` 冲突 |
 | 409 | `IDEMPOTENCY_MISMATCH` | 幂等键相同但请求体不同 |
-| 422 | `MISSING_REQUIRED_FIELDS` | 缺少必填字段 |
-| 422 | `INVALID_QUOTA_BYTES` | `quota_bytes` 格式或范围错误 |
-| 422 | `INVALID_QUOTA_OBJECTS` | `quota_objects` 格式或范围错误 |
-| 422 | `INVALID_EXTERNAL_TENANT_ID` | `external_tenant_id` 为空或无效 |
-| 422 | `INVALID_LOGICAL_NAME` | `logical_name` 为空或无效 |
+| 422 | `MISSING_REQUIRED_FIELDS` | 缺少必填字段，消息中列出缺失的字段名 |
+| 422 | `INVALID_QUOTA_BYTES` | `quota_bytes` 必须是整数（拒绝字符串、布尔值、浮点数等） |
+| 422 | `INVALID_QUOTA_OBJECTS` | `quota_objects` 必须是整数（拒绝字符串、布尔值、浮点数等） |
+| 422 | `INVALID_EXTERNAL_TENANT_ID` | `external_tenant_id` 必须是非空字符串（拒绝空字符串、空白字符串、非字符串类型） |
+| 422 | `INVALID_LOGICAL_NAME` | `logical_name` 必须是非空字符串（拒绝空字符串、空白字符串、非字符串类型） |
 | 422 | `INVALID_JSON` | 请求体不是有效的 JSON |
-| 422 | `VALIDATION_ERROR` | 其他请求体格式错误 |
+| 422 | `INVALID_REQUEST_BODY` | 请求体必须是 JSON 对象（拒绝 JSON 数组、null、非对象类型） |
+| 422 | `INVALID_KEY_TTL` | `key_ttl_seconds` 必须是非负整数 |
+| 422 | `INVALID_TENANT_CREDENTIAL` | `tenant_credential` 必须是字符串 |
 
 ### 服务器错误 (5xx)
 
@@ -222,11 +227,16 @@ Authorization: Bearer <access_token>
 
 ### 请求 ID 关联
 
-- 客户端可在请求头中提供 `X-Request-Id`
-- 错误响应的响应头会回显该 `X-Request-Id`
+- 客户端**可选**在请求头中提供 `X-Request-Id`，建议使用业务唯一标识（如 `REQ-{timestamp}-{random}`）
+- 如果未提供，服务器自动生成格式为 `REQ-{16位十六进制}` 的请求 ID
+- **所有响应**（成功和错误）的响应头都包含 `X-Request-Id`
+- 服务器对恶意或超长请求 ID 进行安全过滤（移除控制字符，截断至 64 字符）
+- 日志记录异常时包含请求 ID，但**不记录**请求正文、token 等敏感信息
 - 用于在日志中关联请求与错误，便于问题排查
 
-**错误响应示例**：
+**错误响应格式**：
+
+所有错误响应的 JSON 体包含两个固定字段：
 
 ```json
 {
@@ -239,7 +249,10 @@ Authorization: Bearer <access_token>
 
 ```
 X-Request-Id: REQ-20261125-0F919C2E
+Content-Type: application/json
 ```
+
+**成功响应**也包含 `X-Request-Id` 响应头。
 
 ## 8. 密钥日志脱敏与轮换影响
 

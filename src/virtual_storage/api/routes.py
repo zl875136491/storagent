@@ -49,50 +49,74 @@ def _bearer(authorization: str | None) -> str:
   return authorization.split(" ", 1)[1].strip()
 
 
+def _safe_request_id(raw: str | None) -> str:
+  """生成或验证请求ID，确保安全性。"""
+  import uuid
+  if not raw:
+    return f"REQ-{uuid.uuid4().hex[:16].upper()}"
+  safe = "".join(c for c in raw if c.isprintable() and ord(c) < 127)[:64]
+  return safe if safe else f"REQ-{uuid.uuid4().hex[:16].upper()}"
+
+
 def _validate_create_tenant_body(body: dict) -> dict:
   """校验创建租户请求体，返回经过校验和类型转换的字段。"""
+  if not isinstance(body, dict):
+    raise ValidationError("请求体必须是 JSON 对象", "INVALID_REQUEST_BODY")
+  
   required_fields = ["external_tenant_id", "logical_name", "quota_bytes", "quota_objects"]
   missing = [f for f in required_fields if f not in body]
   if missing:
     raise ValidationError(f"缺少必填字段: {', '.join(missing)}", "MISSING_REQUIRED_FIELDS")
   
   try:
-    external_tenant_id = str(body["external_tenant_id"]).strip()
-    logical_name = str(body["logical_name"]).strip()
+    external_tenant_id = body["external_tenant_id"]
+    logical_name = body["logical_name"]
+    
+    if not isinstance(external_tenant_id, str):
+      raise ValidationError("external_tenant_id 必须是字符串", "INVALID_EXTERNAL_TENANT_ID")
+    if not isinstance(logical_name, str):
+      raise ValidationError("logical_name 必须是字符串", "INVALID_LOGICAL_NAME")
+    
+    external_tenant_id = external_tenant_id.strip()
+    logical_name = logical_name.strip()
     
     if not external_tenant_id:
       raise ValidationError("external_tenant_id 不能为空", "INVALID_EXTERNAL_TENANT_ID")
     if not logical_name:
       raise ValidationError("logical_name 不能为空", "INVALID_LOGICAL_NAME")
     
+    quota_bytes_raw = body["quota_bytes"]
+    quota_objects_raw = body["quota_objects"]
+    
+    if isinstance(quota_bytes_raw, bool) or not isinstance(quota_bytes_raw, (int, float)):
+      raise ValidationError("quota_bytes 必须是整数", "INVALID_QUOTA_BYTES")
+    if isinstance(quota_objects_raw, bool) or not isinstance(quota_objects_raw, (int, float)):
+      raise ValidationError("quota_objects 必须是整数", "INVALID_QUOTA_OBJECTS")
+    
     try:
-      quota_bytes = int(body["quota_bytes"])
-    except (ValueError, TypeError):
+      quota_bytes = int(quota_bytes_raw)
+      if quota_bytes != quota_bytes_raw and not isinstance(quota_bytes_raw, int):
+        raise ValidationError("quota_bytes 必须是整数", "INVALID_QUOTA_BYTES")
+    except (ValueError, OverflowError):
       raise ValidationError("quota_bytes 必须是整数", "INVALID_QUOTA_BYTES")
     
     try:
-      quota_objects = int(body["quota_objects"])
-    except (ValueError, TypeError):
+      quota_objects = int(quota_objects_raw)
+      if quota_objects != quota_objects_raw and not isinstance(quota_objects_raw, int):
+        raise ValidationError("quota_objects 必须是整数", "INVALID_QUOTA_OBJECTS")
+    except (ValueError, OverflowError):
       raise ValidationError("quota_objects 必须是整数", "INVALID_QUOTA_OBJECTS")
-    
-    if quota_bytes < 0:
-      raise ValidationError("quota_bytes 不能为负数", "INVALID_QUOTA_BYTES")
-    if quota_objects < 0:
-      raise ValidationError("quota_objects 不能为负数", "INVALID_QUOTA_OBJECTS")
-    
-    if quota_bytes > 1099511627776:
-      raise ValidationError("quota_bytes 超出最大限制 (1TiB)", "QUOTA_BYTES_TOO_LARGE")
-    if quota_objects > 100000000:
-      raise ValidationError("quota_objects 超出最大限制 (1亿)", "QUOTA_OBJECTS_TOO_LARGE")
     
     key_ttl_seconds = body.get("key_ttl_seconds")
     if key_ttl_seconds is not None:
+      if isinstance(key_ttl_seconds, bool) or not isinstance(key_ttl_seconds, (int, float)):
+        raise ValidationError("key_ttl_seconds 必须是整数", "INVALID_KEY_TTL")
       try:
         key_ttl_seconds = int(key_ttl_seconds)
-      except (ValueError, TypeError):
+        if key_ttl_seconds < 0:
+          raise ValidationError("key_ttl_seconds 不能为负数", "INVALID_KEY_TTL")
+      except (ValueError, OverflowError):
         raise ValidationError("key_ttl_seconds 必须是整数", "INVALID_KEY_TTL")
-      if key_ttl_seconds < 0:
-        raise ValidationError("key_ttl_seconds 不能为负数", "INVALID_KEY_TTL")
     
     tenant_credential = body.get("tenant_credential")
     if tenant_credential is not None and not isinstance(tenant_credential, str):
@@ -267,6 +291,9 @@ async def post_tenant(
   idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
   x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
 ):
+  request_id = _safe_request_id(x_request_id)
+  request.state.request_id = request_id
+  
   if not idempotency_key:
     raise HTTPException(status_code=400, detail={"error_code": "IDEMPOTENCY_REQUIRED", "message": "缺少 Idempotency-Key"})
   credential = _bearer(authorization)
@@ -292,9 +319,7 @@ async def post_tenant(
   from src.virtual_storage.workers.queue import enqueue_scan
   enqueue_scan()
   
-  if x_request_id:
-    return JSONResponse(content=created, headers={"X-Request-Id": x_request_id})
-  return created
+  return JSONResponse(content=created, headers={"X-Request-Id": request_id})
 
 
 @router.get("/api/virtual-storage/v1/accounts/{app_name}/tenants/{tenant_id}")
@@ -913,22 +938,45 @@ async def console_rotate_secret(
 
 
 def install_error_handler(app):
+  from loguru import logger
+  
+  def _get_request_id(request: Request) -> str:
+    if hasattr(request.state, "request_id"):
+      return request.state.request_id
+    return _safe_request_id(request.headers.get("X-Request-Id"))
+  
   @app.exception_handler(VirtualStorageError)
   async def _handle(request: Request, exc: VirtualStorageError):
-    headers = {}
-    request_id = request.headers.get("X-Request-Id")
-    if request_id:
-      headers["X-Request-Id"] = request_id
-    return JSONResponse(status_code=exc.status_code, content=to_http_exception(exc).detail, headers=headers)
+    request_id = _get_request_id(request)
+    logger.error(f"VirtualStorageError: {exc.error_code} - {exc.message} [request_id={request_id}]")
+    return JSONResponse(
+      status_code=exc.status_code,
+      content=to_http_exception(exc).detail,
+      headers={"X-Request-Id": request_id}
+    )
 
   from pymongo.errors import OperationFailure
 
   @app.exception_handler(OperationFailure)
   async def _write_conflict(request: Request, exc: OperationFailure):
-    headers = {}
-    request_id = request.headers.get("X-Request-Id")
-    if request_id:
-      headers["X-Request-Id"] = request_id
+    request_id = _get_request_id(request)
+    logger.error(f"MongoDB OperationFailure: code={exc.code} [request_id={request_id}]")
     if exc.code == 112:
-      return JSONResponse(status_code=409, content={"error_code": "WRITE_CONFLICT", "message": "并发写入冲突，请重试"}, headers=headers)
-    return JSONResponse(status_code=500, content={"error_code": "DATABASE_WRITE_FAILED", "message": "数据库写入失败"}, headers=headers)
+      content = {"error_code": "WRITE_CONFLICT", "message": "并发写入冲突，请重试"}
+    else:
+      content = {"error_code": "DATABASE_WRITE_FAILED", "message": "数据库写入失败"}
+    return JSONResponse(
+      status_code=409 if exc.code == 112 else 500,
+      content=content,
+      headers={"X-Request-Id": request_id}
+    )
+  
+  @app.exception_handler(Exception)
+  async def _generic(request: Request, exc: Exception):
+    request_id = _get_request_id(request)
+    logger.exception(f"Unhandled exception [request_id={request_id}]")
+    return JSONResponse(
+      status_code=500,
+      content={"error_code": "INTERNAL_SERVER_ERROR", "message": "内部服务器错误"},
+      headers={"X-Request-Id": request_id}
+    )
