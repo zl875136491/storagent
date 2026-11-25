@@ -2,14 +2,15 @@
 
 本文档说明虚拟存储账号和租户 API 的调用规范、参数要求、错误处理及密钥管理注意事项。
 
-## 1. 账号 ID 与 App ID
+## 1. 账号标识符说明
 
-- **账号 ID (account_id)**：虚拟账号的唯一标识符，作为 API 路径参数使用
-  - 示例：`/api/virtual-storage/v1/accounts/{account_id}/tenants`
-  - 账号 ID 同时也是 OAuth 2.0 的 `client_id`
+虚拟存储账号有多个标识符，用于不同场景：
 
-- **App ID (app_name)**：用于向后兼容的别名，与账号 ID 指向同一资源
-  - 在某些遗留 API 中可能以 `app_name` 命名，但实质等同于 `account_id`
+- **内部 account_id**：数据库内部标识（格式如 `acct_xxx`），不对外暴露
+- **app_name**：业务名称，API 路径参数，示例：`/api/virtual-storage/v1/accounts/{app_name}/tenants`
+- **public_account_id**：公开账号 ID，OAuth 2.0 的 `client_id`，可能与 `app_name` 相同或不同
+
+**重要**：API 路径参数 `app_name` 与客户端请求头 `X-App-Id` 是不同层次的概念，不可混淆
 
 ## 2. OAuth 管理凭据与租户 API Key 的职责
 
@@ -18,11 +19,11 @@
 **用途**：用于账号级别的管理操作
 
 **使用场景**：
-- 获取 access token：`POST /oauth2/token`，使用 HTTP Basic 认证
-- 刷新 token：`POST /oauth2/refresh`，使用 HTTP Basic 认证
-- 创建租户：`POST /api/virtual-storage/v1/accounts/{account_id}/tenants`
-- 查询租户列表：`GET /api/virtual-storage/v1/accounts/{account_id}/tenants`
-- 管理租户配额：`PATCH /api/virtual-storage/v1/accounts/{account_id}/tenants/{tenant_id}`
+- 获取 access token：`POST /oauth2/token`，`grant_type=client_credentials`，HTTP Basic 认证
+- 刷新 token：`POST /oauth2/refresh`，`grant_type=refresh_token`，HTTP Basic 认证
+- 创建租户：`POST /api/virtual-storage/v1/accounts/{app_name}/tenants`
+- 查询租户列表：`GET /api/virtual-storage/v1/accounts/{app_name}/tenants`
+- 管理租户配额：`PATCH /api/virtual-storage/v1/accounts/{app_name}/tenants/{tenant_id}`
 - 颁发/撤销租户 API Key
 
 **认证方式**：
@@ -30,16 +31,17 @@
 Authorization: Bearer <access_token>
 ```
 
-**Token 有效期**：
-- Access token：1 小时
-- Refresh token：7 天，每次刷新会更换
+**Token 有效期**（来源：`src/virtual_storage/settings.py`）：
+- Access token：默认 3600 秒（1 小时），可通过 `VS_ACCESS_TOKEN_SECONDS` 配置
+- Refresh token：默认 604800 秒（7 天），可通过 `VS_REFRESH_TOKEN_SECONDS` 配置
+- 每次刷新 refresh token 会更换
 
-**密钥安全**：
-- 管理凭据在 Stor 管理页面可重新生成
-- 重新生成后，旧密钥、旧 access token 和旧 refresh token **立即失效**
+**密钥轮换**（来源：`docs/virtual-storage/OAUTH_APPS.md`）：
+- 密钥可在 Stor 管理页面重新生成
+- 重新生成后，旧 `client_secret`、旧 access token 和旧 refresh token **立即失效**
 - 请妥善保管 `client_secret`，不得写入日志或提交到版本控制
 
-### 租户 API Key (`vst_*`)
+### 租户 API Key
 
 **用途**：租户级别的对象存储操作
 
@@ -49,13 +51,13 @@ Authorization: Bearer <access_token>
 - 读取对象：`GET /api/virtual-storage/v1/tenants/{tenant_id}/objects/{object_key}`
 - 删除对象：`DELETE /api/virtual-storage/v1/tenants/{tenant_id}/objects/{object_key}`
 
-**认证方式**：
+**认证方式**（来源：`src/virtual_storage/api/routes.py`）：
 ```
-X-API-Key: vst_xxxxxxxxxxxxx
+X-API-Key: <tenant_api_key>
 ```
 
-**Key 特性**：
-- 租户 API Key 以 `vst_` 前缀开头
+**Key 特性**（来源：`src/virtual_storage/services/support.py`）：
+- 租户 API Key 格式：`vst_` + 43 字符 URL-safe base64
 - 创建租户时自动颁发，可通过管理接口额外颁发或撤销
 - 撤销后该 Key 立即失效，不影响同一租户的其他 Key
 
@@ -83,36 +85,37 @@ POST /api/virtual-storage/v1/accounts/{account_id}/tenants
 | `logical_name` | string | 是 | 租户逻辑名称，账号内唯一 |
 | `quota_bytes` | integer | 是 | 存储配额，单位：**字节 (Bytes)** |
 | `quota_objects` | integer | 是 | 对象数量配额，单位：**个数** |
-| `key_ttl_seconds` | integer | 否 | 租户 Key 的有效期（秒），不提供时使用系统默认值 |
-| `tenant_credential` | string | 否 | 自定义租户凭据，不提供时系统自动生成 |
+| `key_ttl_seconds` | integer | 否 | 租户 Key 的有效期（秒），不提供时使用系统默认值（`VS_KEY_TTL_SECONDS`，默认 30 天） |
+| `tenant_credential` | string | 否 | 自定义租户凭据（高级功能，需业务合同支持） |
 
 ### 配额单位与示例
 
 - **`quota_bytes`（字节）**：
-  - 10 MB = `10485760`
-  - 1 GB = `1073741824`
-  - 20 GB = `21474836480`
-  - 1 TB = `1099511627776`
+  - 10 MiB = `10485760`
+  - 100 MiB = `104857600`
+  - 1 GiB = `1073741824`
+  - 1 TiB = `1099511627776`
 
 - **`quota_objects`（个数）**：
   - 直接填写对象数量上限
-  - 示例：`10000`（一万个对象）
+  - 示例：`1000`（一千个对象）
 
-**示例请求体**：
+**示例请求体**（仅示例，不代表实际执行）：
 
 ```json
 {
   "external_tenant_id": "APP-20261125-D6555CD6",
   "logical_name": "weekly-report-test",
-  "quota_bytes": 21474836480,
-  "quota_objects": 10000
+  "quota_bytes": 104857600,
+  "quota_objects": 1000
 }
 ```
 
 **注意**：
-- 示例仅供参考，不代表实际可用配额或默认值
+- **以上示例仅供参考格式，不保证可用配额**
 - 实际分配需遵循账号剩余配额，超额会返回 `409 QUOTA_EXCEEDED`
 - 系统对配额值本身不设置硬性上限（由账号可用配额和业务合同约束）
+- 配额可以为 0（表示不限制或暂不分配）
 
 ## 4. 账号可分配配额与并发变化
 
@@ -130,27 +133,36 @@ POST /api/virtual-storage/v1/accounts/{account_id}/tenants
 - 多个并发请求创建租户时，系统保证配额不会超额分配
 - 账号配额可在 Stor 管理页面调整，调整后立即生效
 
-**配额查询**：
+**配额查询**（来源：`src/virtual_storage/services/accounts.py`）：
 
 ```http
-GET /api/virtual-storage/v1/accounts/{account_id}
+GET /api/virtual-storage/v1/accounts/{app_name}
 Authorization: Bearer <access_token>
 ```
 
-响应示例：
+响应字段（实际字段名）：
 
 ```json
 {
-  "account_id": "acc_xxx",
-  "quota_bytes": 107374182400,
-  "quota_objects": 100000,
+  "account_id": "acct_xxx",
+  "app_name": "app_xxx",
+  "quota_bytes_total": 107374182400,
+  "quota_bytes_allocated": 0,
+  "quota_bytes_used": 1234567,
   "quota_bytes_reserved": 53687091200,
-  "quota_objects_reserved": 50000
+  "quota_bytes_trashed": 0,
+  "quota_objects_total": 100000,
+  "quota_objects_allocated": 0,
+  "quota_objects_used": 10,
+  "quota_objects_reserved": 50000,
+  "quota_objects_trashed": 0
 }
 ```
 
-- `quota_bytes_reserved`：已分配给租户的总字节数
-- 可用配额 = `quota_bytes - quota_bytes_reserved`
+- `quota_bytes_total`：账号总配额
+- `quota_bytes_reserved`：已预留（如正在上传）的字节数
+- `quota_bytes_allocated`：已分配给租户的字节数
+- 可用配额计算需结合 `total`, `allocated`, `used`, `reserved`, `trashed`
 
 ## 5. 唯一性约束
 
@@ -207,7 +219,7 @@ Authorization: Bearer <access_token>
 | 409 | `QUOTA_EXCEEDED` | 账号可用配额不足 |
 | 409 | `CONFLICT` | `external_tenant_id` 或 `logical_name` 冲突 |
 | 409 | `IDEMPOTENCY_MISMATCH` | 幂等键相同但请求体不同 |
-| 422 | `MISSING_REQUIRED_FIELDS` | 缺少必填字段，消息中列出缺失的字段名 |
+| 422 | `MISSING_REQUIRED_FIELDS` | 缺少必填字段，`message` 中列出缺失的字段名 |
 | 422 | `INVALID_QUOTA_BYTES` | `quota_bytes` 必须是整数（拒绝字符串、布尔值、浮点数等） |
 | 422 | `INVALID_QUOTA_OBJECTS` | `quota_objects` 必须是整数（拒绝字符串、布尔值、浮点数等） |
 | 422 | `INVALID_EXTERNAL_TENANT_ID` | `external_tenant_id` 必须是非空字符串（拒绝空字符串、空白字符串、非字符串类型） |
@@ -227,16 +239,18 @@ Authorization: Bearer <access_token>
 
 ### 请求 ID 关联
 
+**适用范围**：本节描述的请求 ID 处理仅适用于 **虚拟存储租户创建接口** (`POST /api/virtual-storage/v1/accounts/{app_name}/tenants`) 及其错误处理。其他接口（如 OAuth、框架 404/405 等）的请求 ID 行为可能不同。
+
 - 客户端**可选**在请求头中提供 `X-Request-Id`，建议使用业务唯一标识（如 `REQ-{timestamp}-{random}`）
 - 如果未提供，服务器自动生成格式为 `REQ-{16位十六进制}` 的请求 ID
-- **所有响应**（成功和错误）的响应头都包含 `X-Request-Id`
+- **创建租户接口**的所有响应（成功和错误）都包含 `X-Request-Id` 响应头
 - 服务器对恶意或超长请求 ID 进行安全过滤（移除控制字符，截断至 64 字符）
-- 日志记录异常时包含请求 ID，但**不记录**请求正文、token 等敏感信息
+- 日志记录虚拟存储异常时包含请求 ID，但**不记录**请求正文、token 等敏感信息
 - 用于在日志中关联请求与错误，便于问题排查
 
-**错误响应格式**：
+**虚拟存储错误响应格式**：
 
-所有错误响应的 JSON 体包含两个固定字段：
+虚拟存储业务错误（`VirtualStorageError` 子类）的 JSON 体包含两个固定字段：
 
 ```json
 {
@@ -251,8 +265,6 @@ Authorization: Bearer <access_token>
 X-Request-Id: REQ-20261125-0F919C2E
 Content-Type: application/json
 ```
-
-**成功响应**也包含 `X-Request-Id` 响应头。
 
 ## 8. 密钥日志脱敏与轮换影响
 
@@ -363,34 +375,45 @@ Idempotency-Key: <unique_key>
 - 确认租户 ID 拼写正确
 - 确认 Key 未被撤销
 
-### Q5: Token 频繁过期
+### Q5: Token 过期或认证失败
 
 **可能原因**：
-- Access token 有效期为 1 小时
-- 未使用 refresh token 刷新
+- Access token 过期（默认 3600 秒后）
+- Refresh token 过期（默认 7 天后）
+- 账号已禁用或密钥已轮换
 
 **解决方法**：
-- 在 access token 过期前使用 refresh token 刷新
-- 在收到 `401 INVALID_CREDENTIAL` 时自动刷新 token 并重试
+- **不要盲目重试 401 错误**：先区分是 token 过期还是账号禁用
+- Token 过期时使用 refresh token 刷新，获取新的 access token
+- Refresh token 也过期时，使用 `client_id` 和 `client_secret` 重新获取
+- 如果密钥已轮换，所有旧 token 立即失效，需使用新密钥重新认证
+- 账号禁用时不应重试，应通知管理员
 
 ## 10. API 调用最佳实践
 
 1. **使用幂等键**：所有创建操作都应提供幂等键，避免重复创建
 2. **提供请求 ID**：在请求头中提供 `X-Request-Id`，便于日志关联和问题排查
 3. **错误重试**：
-   - 5xx 错误可以重试
-   - 4xx 错误通常不应重试（除非修复了请求参数）
-   - 使用指数退避策略，避免雷击效应
+   - **写操作（如创建租户）**：
+     - 超时或 5xx 错误时，**结果可能已生效**
+     - 使用**相同幂等键 + 相同参数**重试，系统会返回已创建的结果
+     - 如果参数需要变更，**必须使用新的幂等键**
+     - 使用指数退避策略（如 1s, 2s, 4s, 8s），避免雷击效应
+   - **读操作（如查询配额）**：超时或 5xx 可直接重试
+   - **4xx 错误**：
+     - `422` 验证失败：修正参数后使用**新的幂等键**重试
+     - `409` 冲突（配额不足、名称冲突、幂等键冲突）：根据具体 `error_code` 处理，不应盲目重试
+     - `401` 认证失败：先判断是 token 过期还是账号禁用，避免无限刷新
 4. **密钥管理**：
    - 使用环境变量或密钥管理服务存储 `client_secret`
    - 定期轮换密钥，记录轮换时间
-   - 在日志中脱敏所有敏感信息
+   - 在日志中脱敏所有敏感信息（token、密钥、API Key）
 5. **配额监控**：
    - 定期查询账号配额使用情况
    - 在配额不足时提前告警
 6. **Token 刷新**：
    - 在 access token 过期前主动刷新
-   - 在收到 401 错误时自动重试
+   - 收到 `401` 错误时，先判断原因，不要盲目刷新
 7. **并发控制**：
    - 使用幂等键保证并发安全
    - 避免同时发起大量创建租户请求
